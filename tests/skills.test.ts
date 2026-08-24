@@ -1,0 +1,161 @@
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { auditSharedSkills } from "../src/skills/audit.js";
+
+const roots: string[] = [];
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function makeRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "agent-collab-skills-"));
+  roots.push(root);
+  return root;
+}
+
+function writeSkill(root: string, name: string, instruction: string): void {
+  const skill = join(root, name);
+  mkdirSync(skill, { recursive: true });
+  writeFileSync(join(skill, "SKILL.md"), instruction, { mode: 0o600 });
+}
+
+function collectFiles(root: string, current = root): string[] {
+  return readdirSync(current, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(current, entry.name);
+    if (entry.isDirectory()) return collectFiles(root, path);
+    return entry.isFile() ? [relative(root, path)] : [];
+  });
+}
+
+function skillHash(canonicalRoot: string, name: string): string {
+  const root = join(canonicalRoot, name);
+  const hash = createHash("sha256");
+  for (const path of collectFiles(root).sort()) {
+    hash.update(path);
+    hash.update("\0");
+    hash.update(readFileSync(join(root, path)));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+describe("BDD-2/12 canonical shared skills", () => {
+  it("resolves both agents to one canonical root with exact per-skill hashes", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const grokRoot = join(root, "grok-skills");
+    const codexRoot = join(root, "codex-skills");
+    mkdirSync(canonicalRoot);
+    writeSkill(canonicalRoot, "alpha", "# Alpha\n\nFirst contract.\n");
+    writeSkill(canonicalRoot, "beta", "# Beta\n\nSecond contract.\n");
+    symlinkSync(canonicalRoot, grokRoot, "dir");
+    symlinkSync(canonicalRoot, codexRoot, "dir");
+
+    const result = auditSharedSkills({
+      canonicalRoot,
+      agentRoots: { grok: grokRoot, codex: codexRoot },
+    });
+    const manifest = [
+      { name: "alpha", sha256: skillHash(canonicalRoot, "alpha") },
+      { name: "beta", sha256: skillHash(canonicalRoot, "beta") },
+    ];
+    expect(result).toEqual({
+      canonicalRoot: realpathSync(canonicalRoot),
+      agents: {
+        grok: { resolvedRoot: realpathSync(canonicalRoot), manifest },
+        codex: { resolvedRoot: realpathSync(canonicalRoot), manifest },
+      },
+      consistent: true,
+      brokenLinks: [],
+    });
+  });
+
+  it("publishes a canonical update to both agents with the same new exact hash", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const grokRoot = join(root, "grok-skills");
+    const codexRoot = join(root, "codex-skills");
+    mkdirSync(canonicalRoot);
+    writeSkill(canonicalRoot, "shared", "version one\n");
+    symlinkSync(canonicalRoot, grokRoot, "dir");
+    symlinkSync(canonicalRoot, codexRoot, "dir");
+    const options = { canonicalRoot, agentRoots: { grok: grokRoot, codex: codexRoot } } as const;
+    const before = auditSharedSkills(options);
+
+    writeFileSync(join(canonicalRoot, "shared", "SKILL.md"), "version two\n", { mode: 0o600 });
+    const after = auditSharedSkills(options);
+    const expected = skillHash(canonicalRoot, "shared");
+
+    expect(before.agents.grok.manifest[0]?.sha256).not.toBe(expected);
+    expect(after.agents.grok.manifest).toEqual([{ name: "shared", sha256: expected }]);
+    expect(after.agents.codex.manifest).toEqual([{ name: "shared", sha256: expected }]);
+    expect(after.consistent).toBe(true);
+  });
+
+  it("attests a valid symlinked skill and detects target-content drift", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const externalRoot = join(root, "external-skill");
+    const grokRoot = join(root, "grok-skills");
+    const codexRoot = join(root, "codex-skills");
+    mkdirSync(canonicalRoot); mkdirSync(externalRoot);
+    writeFileSync(join(externalRoot, "SKILL.md"), "version one\n", { mode: 0o600 });
+    symlinkSync(externalRoot, join(canonicalRoot, "linked"), "dir");
+    symlinkSync(canonicalRoot, grokRoot, "dir"); symlinkSync(canonicalRoot, codexRoot, "dir");
+    const options = { canonicalRoot, agentRoots: { grok: grokRoot, codex: codexRoot } } as const;
+    const before = auditSharedSkills(options);
+    expect(before.consistent).toBe(true);
+    expect(before.agents.grok.manifest.map((entry) => entry.name)).toEqual(["linked"]);
+    writeFileSync(join(externalRoot, "SKILL.md"), "version two\n", { mode: 0o600 });
+    const after = auditSharedSkills(options);
+    expect(after.consistent).toBe(true);
+    expect(after.agents.grok.manifest[0]?.sha256).not.toBe(before.agents.grok.manifest[0]?.sha256);
+  });
+
+  it("reports canonical and agent-root broken links instead of hiding them", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const grokRoot = join(root, "grok-skills");
+    const codexRoot = join(root, "codex-skills");
+    const missingSkill = join(root, "missing-skill");
+    const missingCodexRoot = join(root, "missing-codex-root");
+    mkdirSync(canonicalRoot);
+    writeSkill(canonicalRoot, "healthy", "healthy\n");
+    symlinkSync(missingSkill, join(canonicalRoot, "broken-skill"), "dir");
+    symlinkSync(canonicalRoot, grokRoot, "dir");
+    symlinkSync(missingCodexRoot, codexRoot, "dir");
+
+    const result = auditSharedSkills({
+      canonicalRoot,
+      agentRoots: { grok: grokRoot, codex: codexRoot },
+    });
+
+    expect(result.consistent).toBe(false);
+    expect(result.brokenLinks).toEqual([
+      {
+        scope: "canonical",
+        path: join(canonicalRoot, "broken-skill"),
+        target: missingSkill,
+      },
+      {
+        scope: "agent",
+        agent: "codex",
+        path: codexRoot,
+        target: missingCodexRoot,
+      },
+    ]);
+  });
+});

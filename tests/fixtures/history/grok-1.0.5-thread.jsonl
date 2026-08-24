@@ -1,0 +1,6 @@
+{"type":"system","content":"private system instruction"}
+{"type":"user","content":[{"type":"text","text":"native visible question"}]}
+{"type":"user","synthetic_reason":"environment_context","content":[{"type":"text","text":"private synthetic context"}]}
+{"type":"reasoning","id":"reasoning-1","status":"completed","summary":[{"text":"private reasoning"}],"encrypted_content":"encrypted"}
+{"type":"assistant","content":"native visible answer","model_id":"grok-4.6","reasoning_effort":"high","tool_calls":[{"id":"call-1","name":"read_file","arguments":{"path":"/private/path"}}]}
+{"type":"tool_result","tool_call_id":"call-1","content":"private tool result"}

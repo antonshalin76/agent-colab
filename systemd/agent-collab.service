@@ -1,0 +1,21 @@
+[Unit]
+Description=Grok and Codex collaboration worker
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agent-collab
+ExecStart=/usr/bin/env node %h/agent-collab/dist/cli.js worker
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=AGENT_COLLAB_STATE_DIR=%h/.local/share/agent-collab
+Environment=AGENT_COLLAB_GROK_BIN=%h/.local/bin/grok
+Environment=AGENT_COLLAB_CODEX_BIN=%h/.local/bin/codex
+Environment=AGENT_COLLAB_ALLOWED_ROOTS=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
