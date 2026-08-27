@@ -14,6 +14,7 @@ import {
 } from "../src/mcp/server.js";
 import { RunStore } from "../src/store/run-store.js";
 import { DurableWorker } from "../src/worker/durable-worker.js";
+import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
 
 const connect = async (service: CollabService) => {
   const server = createCollabMcpServer(service);
@@ -126,6 +127,7 @@ describe("stdio MCP collaboration boundary", () => {
   it("keeps sentinel secrets out of worker persistence and MCP run status", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-secret-flow-"));
     const path = join(root, "state.db");
+    initializeCurrentExecutionSchema(path);
     const secret = "sk-ant-FAKE_INTEGRATION_SECRET_123456";
     const workerStore = new RunStore(path);
     const queued = workerStore.enqueue({

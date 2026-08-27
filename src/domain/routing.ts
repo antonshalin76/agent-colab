@@ -6,7 +6,7 @@ export type Effort = "low" | "medium" | "high" | "xhigh";
 export type RequestedEffort = Effort | "max" | "ultra";
 export type ApprovalScope = "workspace-read" | "workspace-write" | "external";
 
-export const ROUTING_POLICY_VERSION = "routing-v3" as const;
+export const ROUTING_POLICY_VERSION = "routing-v4" as const;
 
 export const STAGES = [
   "coordination",
@@ -45,7 +45,7 @@ export const STAGE_POLICY = {
     baselineEffort: { grok: "high", codex: "medium" },
   },
   planning: {
-    preferredAgent: "grok",
+    preferredAgent: "codex",
     baselineEffort: { grok: "medium", codex: "medium" },
   },
   plan_audit: {
@@ -57,7 +57,7 @@ export const STAGE_POLICY = {
     baselineEffort: { grok: "xhigh", codex: "xhigh" },
   },
   prd: {
-    preferredAgent: "grok",
+    preferredAgent: "codex",
     baselineEffort: { grok: "medium", codex: "medium" },
   },
   prd_audit: {
@@ -81,11 +81,11 @@ export const STAGE_POLICY = {
     baselineEffort: { grok: "xhigh", codex: "xhigh" },
   },
   ui_ux: {
-    preferredAgent: "grok",
+    preferredAgent: "codex",
     baselineEffort: { grok: "medium", codex: "medium" },
   },
   bdd: {
-    preferredAgent: "grok",
+    preferredAgent: "codex",
     baselineEffort: { grok: "high", codex: "high" },
   },
   tdd_coding: {
@@ -101,7 +101,7 @@ export const STAGE_POLICY = {
     baselineEffort: { grok: "high", codex: "high" },
   },
   e2e_testing: {
-    preferredAgent: "grok",
+    preferredAgent: "codex",
     baselineEffort: { grok: "high", codex: "high" },
   },
   test_audit: {
@@ -245,23 +245,18 @@ export const modelForAgent = (
 
 export const providerSupportsApprovalScope = (
   agent: ActiveAgentId,
-  scope: ApprovalScope,
-): boolean => agent !== "grok" || scope !== "external";
+  _scope: ApprovalScope,
+): boolean => agent === "codex";
 
 export function selectStageAssignment(
   input: SelectStageAssignmentInput,
 ): EffortDecision {
   const policy = STAGE_POLICY[input.stage];
   const preferred = policy.preferredAgent;
-  const alternate: ActiveAgentId = preferred === "grok" ? "codex" : "grok";
-  const agent =
-    input.health[preferred] === "healthy" &&
+  const agent = input.health[preferred] === "healthy" &&
     providerSupportsApprovalScope(preferred, input.trustedInputs.approvalScope)
-      ? preferred
-      : input.health[alternate] === "healthy" &&
-          providerSupportsApprovalScope(alternate, input.trustedInputs.approvalScope)
-        ? alternate
-        : null;
+    ? preferred
+    : null;
 
   if (agent === null) throw new Error("No healthy provider is available");
 

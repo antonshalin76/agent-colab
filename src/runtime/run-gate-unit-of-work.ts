@@ -1,11 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
 import {
   createReviewPlan,
   reviewDecisionFor,
   type ReviewRole,
 } from "../domain/review.js";
+import {
+  REVIEW_VERDICT_OUTPUT_CONTRACT,
+  ReviewVerdictEnvelopeSchema,
+} from "../domain/review-verdict.js";
 import { ROUTING_POLICY_VERSION } from "../domain/routing.js";
+import { isFailoverOutcome } from "../domain/outcomes.js";
 import type {
   AgentId,
   ApprovalScope,
@@ -15,6 +21,11 @@ import type {
 } from "../domain/routing.js";
 import { sanitizeResult } from "../security/redaction.js";
 import type { ProviderHealthStore } from "./provider-health-store.js";
+import { RunStore } from "../store/run-store.js";
+import {
+  createCurrentMapLearningLaunchBinding,
+  formatMapLearningLaunchBindingContext,
+} from "../flow/map-admin.js";
 
 export type ReviewLaneStatus =
   | "queued"
@@ -25,7 +36,19 @@ export type ReviewLaneStatus =
   | "stale_artifact";
 export type ReviewTerminalStatus = "completed" | "failed" | "timed_out";
 export type ReviewRunState = "FULL_CROSS_PROVIDER" | "DEGRADED_SINGLE_PROVIDER";
-export type PersistedRoutingPolicyVersion = "routing-v2" | typeof ROUTING_POLICY_VERSION;
+export type PersistedRoutingPolicyVersion = typeof ROUTING_POLICY_VERSION;
+
+const isSemanticPass = (lane: LaneRow): boolean => {
+  if (lane.status !== "completed") return false;
+  let result: unknown;
+  try { result = lane.result === null ? null : JSON.parse(lane.result); } catch { return false; }
+  if (typeof result !== "object" || result === null || Array.isArray(result)) return false;
+  const value = result as Record<string, unknown>;
+  if (value.kind !== "success") return false;
+  const verdict = ReviewVerdictEnvelopeSchema.safeParse(value.reviewVerdict);
+  return verdict.success && verdict.data.verdict === "PASS" &&
+    verdict.data.findings.every(({ risk_level }) => risk_level === "info");
+};
 
 export interface ReviewLaneSnapshot {
   agent: AgentId;
@@ -133,23 +156,13 @@ interface LaneRow {
   terminal_at: number | null;
 }
 
-interface AttemptRow {
+interface AttemptLinkRow {
   review_id: string;
   agent: AgentId;
   role: ReviewRole;
   attempt_ordinal: number;
-  attempt_id: string;
-  status: ReviewAttemptSnapshot["status"];
-  model: EffortDecision["model"];
-  effort: "high" | "xhigh";
-  policy_version: PersistedRoutingPolicyVersion;
-  reasons: string;
-  session_id: string;
-  idempotency_key: string;
-  result: string | null;
-  error: string | null;
+  run_id: string;
   created_at: number;
-  terminal_at: number | null;
 }
 
 export interface CreateReviewBarrierInput {
@@ -166,6 +179,70 @@ export interface CreateReviewBarrierInput {
   sourceFingerprint?: string;
   changedFiles?: number;
 }
+
+export interface ExactSemanticPassReviewInput {
+  reviewId: string;
+  stageId: string;
+  artifact: Buffer;
+  approvalScope: ApprovalScope;
+  idempotencyKey: string;
+  prompts: Record<ReviewRole, string>;
+  project: string;
+  requester: AgentId;
+  sourceFingerprint: string;
+  changedFiles: number;
+}
+
+export const createReviewRunInput = (lane: LaneEnqueueDescriptor) => {
+  if (!lane.project || !lane.requester || !lane.sourceFingerprint) {
+    throw new Error("review lane lacks exact durable execution context");
+  }
+  const mapLearning = createCurrentMapLearningLaunchBinding(lane.agent);
+  return {
+    idempotencyKey: lane.idempotencyKey,
+    stage: `review:${lane.role}`,
+    priority: 5,
+    artifactHash: lane.artifactHash,
+    approvalScope: "workspace-read" as const,
+    payload: {
+      requester: lane.requester,
+      preferredAgent: lane.agent,
+      project: lane.project,
+      prompt: `${lane.prompt}\n\n${REVIEW_VERDICT_OUTPUT_CONTRACT}\n\n${formatMapLearningLaunchBindingContext(
+        mapLearning,
+      )}\n\nImmutable artifact (${lane.artifactHash}):\n${lane.artifact.toString("utf8")}`,
+      approvalScope: "workspace-read" as const,
+      allowFallback: false,
+      reviewRole: lane.role,
+      sourceFingerprint: lane.sourceFingerprint,
+      mapLearning,
+      decision: {
+        agent: lane.agent,
+        model: lane.model,
+        effort: lane.effort,
+        policyVersion: lane.policyVersion,
+        reasons: lane.reasons,
+      },
+      reviewDispatchIdentity: {
+        agent: lane.agent,
+        model: lane.model,
+        effort: lane.effort,
+        policyVersion: lane.policyVersion,
+        reasons: lane.reasons,
+        sessionId: lane.sessionId,
+        attemptId: lane.attemptId,
+        attemptOrdinal: lane.attemptOrdinal,
+        degraded: lane.degraded,
+      },
+      reviewDispatchId: lane.idempotencyKey,
+      reviewId: lane.reviewId,
+      sessionId: lane.sessionId,
+      artifactHash: lane.artifactHash,
+      reviewAttemptId: lane.attemptId,
+      reviewAttemptOrdinal: lane.attemptOrdinal,
+    },
+  };
+};
 
 interface RecordTerminalInput {
   reviewId: string;
@@ -212,90 +289,7 @@ const assertDatabaseIntegrity = (db: Database.Database): void => {
   if (violations.length > 0) throw new Error("review database foreign key check failed");
 };
 
-const migrateRoutingV2ReviewSchema = (db: Database.Database): void => {
-  const lanes = tableSchema(db, "runtime_review_lanes");
-  if (!lanes.includes("'routing-v2'") || lanes.includes("'routing-v3'")) return;
-  assertDatabaseIntegrity(db);
-  db.pragma("foreign_keys = OFF");
-  try {
-    const migrate = db.transaction(() => {
-      db.exec(`
-      CREATE TABLE runtime_review_lanes_v3 (
-        review_id TEXT NOT NULL REFERENCES runtime_review_barriers(review_id) ON DELETE CASCADE,
-        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
-        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
-        status TEXT NOT NULL CHECK (status IN ('queued', 'deferred', 'completed', 'failed', 'timed_out', 'stale_artifact')),
-        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
-        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version IN ('routing-v2', 'routing-v3')),
-        reasons TEXT NOT NULL,
-        session_id TEXT NOT NULL UNIQUE,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        prompt TEXT NOT NULL,
-        degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
-        result TEXT,
-        error TEXT,
-        terminal_at INTEGER,
-        PRIMARY KEY (review_id, agent, role)
-      );
-      INSERT INTO runtime_review_lanes_v3
-        SELECT * FROM runtime_review_lanes;
-      CREATE TABLE runtime_review_lane_attempts_v3 (
-        review_id TEXT NOT NULL,
-        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
-        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
-        attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
-        attempt_id TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL CHECK (status IN ('scheduled', 'completed', 'provider_unavailable', 'failed', 'timed_out', 'needs_reconciliation')),
-        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
-        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version IN ('routing-v2', 'routing-v3')),
-        reasons TEXT NOT NULL,
-        session_id TEXT NOT NULL UNIQUE,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        result TEXT,
-        error TEXT,
-        created_at INTEGER NOT NULL,
-        terminal_at INTEGER,
-        PRIMARY KEY (review_id, agent, role, attempt_ordinal),
-        FOREIGN KEY (review_id, agent, role)
-          REFERENCES runtime_review_lanes_v3(review_id, agent, role) ON DELETE CASCADE
-      );
-      INSERT INTO runtime_review_lane_attempts_v3
-        SELECT * FROM runtime_review_lane_attempts;
-      UPDATE runtime_review_lane_attempts_v3
-         SET status = 'needs_reconciliation',
-             error = COALESCE(error, '{"kind":"routing_policy_migration","from":"routing-v2"}'),
-             terminal_at = COALESCE(terminal_at, 0)
-       WHERE policy_version = 'routing-v2' AND status = 'scheduled';
-      UPDATE runtime_review_lanes_v3
-         SET status = 'failed',
-             error = COALESCE(error, '{"kind":"routing_policy_migration","from":"routing-v2"}'),
-             terminal_at = COALESCE(terminal_at, 0)
-       WHERE policy_version = 'routing-v2' AND status IN ('queued', 'deferred');
-      DROP INDEX IF EXISTS runtime_review_attempts_status;
-      DROP INDEX IF EXISTS runtime_review_lanes_status;
-      DROP TABLE runtime_review_lane_attempts;
-      DROP TABLE runtime_review_lanes;
-      ALTER TABLE runtime_review_lanes_v3 RENAME TO runtime_review_lanes;
-      ALTER TABLE runtime_review_lane_attempts_v3 RENAME TO runtime_review_lane_attempts;
-      CREATE INDEX runtime_review_lanes_status
-        ON runtime_review_lanes(review_id, status);
-      CREATE INDEX runtime_review_attempts_status
-        ON runtime_review_lane_attempts(review_id, agent, role, status);
-      `);
-      assertDatabaseIntegrity(db);
-    });
-    migrate.immediate();
-  } catch (error) {
-    throw error;
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
-  assertDatabaseIntegrity(db);
-};
-
-const assertFreshV3Schema = (db: Database.Database): void => {
+const assertFreshV4Schema = (db: Database.Database): void => {
   const schema = (table: string): string => {
     return tableSchema(db, table);
   };
@@ -308,30 +302,16 @@ const assertFreshV3Schema = (db: Database.Database): void => {
     !lanes.includes("'grok'") ||
     lanes.includes("'claude'") ||
     !lanes.includes("policy_version") ||
-    !lanes.includes("'routing-v3'") ||
+    !lanes.includes("policy_version = 'routing-v4'") ||
     !lanes.includes("reasons") ||
     !attempts.includes("attempt_ordinal") ||
-    !attempts.includes("policy_version")
+    !attempts.includes("run_id") ||
+    attempts.includes("policy_version") ||
+    attempts.includes("status text")
   ) {
-    throw new Error("runtime review tables require offline v1-to-v3 migration");
+    throw new Error("runtime review tables require the current routing-v4 schema");
   }
 };
-
-const attemptSnapshot = (row: AttemptRow): ReviewAttemptSnapshot => ({
-  attemptId: row.attempt_id,
-  attemptOrdinal: row.attempt_ordinal,
-  status: row.status,
-  model: row.model,
-  effort: row.effort,
-  policyVersion: row.policy_version,
-  reasons: parseReasons(row.reasons),
-  sessionId: row.session_id,
-  idempotencyKey: row.idempotency_key,
-  ...(row.result === null ? {} : { result: parseJson(row.result) }),
-  ...(row.error === null ? {} : { error: parseJson(row.error) }),
-  createdAt: row.created_at,
-  terminalAt: row.terminal_at,
-});
 
 const laneSnapshot = (row: LaneRow, attempts: ReviewAttemptSnapshot[] = []): ReviewLaneSnapshot => ({
   agent: row.agent,
@@ -351,11 +331,14 @@ const laneSnapshot = (row: LaneRow, attempts: ReviewAttemptSnapshot[] = []): Rev
   attempts,
 });
 
-export class ReviewBarrierStore {
+export class RunGateUnitOfWork {
   private readonly db: Database.Database;
+  private readonly runs: RunStore;
+  private readonly ownsDatabase: boolean;
 
-  constructor(path: string) {
-    this.db = new Database(path);
+  constructor(pathOrDatabase: string | Database.Database) {
+    this.ownsDatabase = typeof pathOrDatabase === "string";
+    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
@@ -364,81 +347,14 @@ export class ReviewBarrierStore {
        WHERE type = 'table' AND name IN ('runtime_review_barriers', 'runtime_review_lanes')
        LIMIT 1
     `).get();
-    if (existing !== undefined) {
-      try {
-        assertDatabaseIntegrity(this.db);
-        migrateRoutingV2ReviewSchema(this.db);
-        assertFreshV3Schema(this.db);
-        assertDatabaseIntegrity(this.db);
-      } catch (error) {
-        this.db.close();
-        throw error;
-      }
-    }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS runtime_review_barriers (
-        review_id TEXT PRIMARY KEY,
-        stage_id TEXT NOT NULL,
-        artifact BLOB NOT NULL,
-        artifact_hash TEXT NOT NULL,
-        approval_scope TEXT NOT NULL CHECK (approval_scope = 'workspace-read'),
-        idempotency_key TEXT NOT NULL,
-        run_state TEXT NOT NULL CHECK (run_state IN ('FULL_CROSS_PROVIDER', 'DEGRADED_SINGLE_PROVIDER')),
-        created_at INTEGER NOT NULL,
-        project TEXT,
-        requester TEXT CHECK (requester IS NULL OR requester IN ('grok', 'codex')),
-        source_fingerprint TEXT
-        ,changed_files INTEGER NOT NULL DEFAULT 0 CHECK (changed_files >= 0)
-      );
-      CREATE TABLE IF NOT EXISTS runtime_review_lanes (
-        review_id TEXT NOT NULL REFERENCES runtime_review_barriers(review_id) ON DELETE CASCADE,
-        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
-        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
-        status TEXT NOT NULL CHECK (status IN ('queued', 'deferred', 'completed', 'failed', 'timed_out', 'stale_artifact')),
-        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
-        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version IN ('routing-v2', 'routing-v3')),
-        reasons TEXT NOT NULL,
-        session_id TEXT NOT NULL UNIQUE,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        prompt TEXT NOT NULL,
-        degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
-        result TEXT,
-        error TEXT,
-        terminal_at INTEGER,
-        PRIMARY KEY (review_id, agent, role)
-      );
-      CREATE INDEX IF NOT EXISTS runtime_review_lanes_status
-        ON runtime_review_lanes(review_id, status);
-      CREATE TABLE IF NOT EXISTS runtime_review_lane_attempts (
-        review_id TEXT NOT NULL,
-        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
-        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
-        attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
-        attempt_id TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL CHECK (status IN ('scheduled', 'completed', 'provider_unavailable', 'failed', 'timed_out', 'needs_reconciliation')),
-        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
-        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version IN ('routing-v2', 'routing-v3')),
-        reasons TEXT NOT NULL,
-        session_id TEXT NOT NULL UNIQUE,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        result TEXT,
-        error TEXT,
-        created_at INTEGER NOT NULL,
-        terminal_at INTEGER,
-        PRIMARY KEY (review_id, agent, role, attempt_ordinal),
-        FOREIGN KEY (review_id, agent, role)
-          REFERENCES runtime_review_lanes(review_id, agent, role) ON DELETE CASCADE
-      );
-      CREATE INDEX IF NOT EXISTS runtime_review_attempts_status
-        ON runtime_review_lane_attempts(review_id, agent, role, status);
-    `);
     try {
-      assertFreshV3Schema(this.db);
+      if (existing === undefined) throw new Error("review gate requires migration-owned schema");
       assertDatabaseIntegrity(this.db);
+      assertFreshV4Schema(this.db);
+      assertDatabaseIntegrity(this.db);
+      this.runs = new RunStore(this.db);
     } catch (error) {
-      this.db.close();
+      if (this.ownsDatabase) this.db.close();
       throw error;
     }
   }
@@ -463,14 +379,59 @@ export class ReviewBarrierStore {
     `).all(reviewId) as LaneRow[];
   }
 
-  private attemptRows(reviewId: string, agent?: AgentId, role?: ReviewRole): AttemptRow[] {
-    return this.db.prepare(`
-      SELECT review_id,agent,role,attempt_ordinal,attempt_id,status,model,effort,policy_version,
-             reasons,session_id,idempotency_key,result,error,created_at,terminal_at
+  private attemptsFor(reviewId: string, agent?: AgentId, role?: ReviewRole): ReviewAttemptSnapshot[] {
+    const links = this.db.prepare(`
+      SELECT review_id,agent,role,attempt_ordinal,run_id,created_at
         FROM runtime_review_lane_attempts
        WHERE review_id=? AND (? IS NULL OR agent=?) AND (? IS NULL OR role=?)
        ORDER BY agent,role,attempt_ordinal
-    `).all(reviewId, agent ?? null, agent ?? null, role ?? null, role ?? null) as AttemptRow[];
+    `).all(reviewId, agent ?? null, agent ?? null, role ?? null, role ?? null) as AttemptLinkRow[];
+    return links.map((link) => {
+      const run = this.runs.get(link.run_id);
+      if (!run) throw new Error("review attempt references a missing run");
+      const payload = run.payload ?? {};
+      const identity = payload.reviewDispatchIdentity as Record<string, unknown> | undefined;
+      const decision = payload.decision as Record<string, unknown> | undefined;
+      if (!identity || !decision || typeof identity.attemptId !== "string" ||
+          typeof identity.sessionId !== "string" || !Array.isArray(decision.reasons)) {
+        throw new Error("review attempt run has an invalid immutable identity");
+      }
+      const envelope = run.result && typeof run.result === "object"
+        ? run.result as Record<string, unknown>
+        : null;
+      const providerResult = envelope?.providerResult && typeof envelope.providerResult === "object"
+        ? envelope.providerResult as Record<string, unknown>
+        : null;
+      const effect = envelope?.effect && typeof envelope.effect === "object"
+        ? envelope.effect as Record<string, unknown>
+        : null;
+      const unavailable = isFailoverOutcome(providerResult?.kind);
+      const status: ReviewAttemptSnapshot["status"] = run.status === "needs_reconciliation"
+        ? "needs_reconciliation"
+        : run.status === "completed"
+          ? unavailable ? "provider_unavailable" : "completed"
+          : run.status === "failed" || run.status === "cancelled"
+            ? "failed"
+            : "scheduled";
+      const terminalAt = Number.isSafeInteger(effect?.terminalAt) ? Number(effect!.terminalAt) : null;
+      return {
+        attemptId: identity.attemptId,
+        attemptOrdinal: link.attempt_ordinal,
+        status,
+        model: decision.model as EffortDecision["model"],
+        effort: decision.effort as "high" | "xhigh",
+        policyVersion: decision.policyVersion as PersistedRoutingPolicyVersion,
+        reasons: decision.reasons as EffortReason[],
+        sessionId: identity.sessionId,
+        idempotencyKey: run.idempotencyKey,
+        ...(status === "completed" && providerResult ? { result: providerResult } : {}),
+        ...(status !== "scheduled" && status !== "completed" && providerResult
+          ? { error: providerResult }
+          : {}),
+        createdAt: link.created_at,
+        terminalAt,
+      };
+    });
   }
 
   private snapshot(row: ReviewRow): ReviewBarrierSnapshot {
@@ -485,7 +446,7 @@ export class ReviewBarrierStore {
       createdAt: row.created_at,
       lanes: this.laneRows(row.review_id).map((lane) => laneSnapshot(
         lane,
-        this.attemptRows(row.review_id, lane.agent, lane.role).map(attemptSnapshot),
+        this.attemptsFor(row.review_id, lane.agent, lane.role),
       )),
       ...(row.project === null ? {} : { project: row.project }),
       ...(row.requester === null ? {} : { requester: row.requester }),
@@ -497,6 +458,15 @@ export class ReviewBarrierStore {
   get(reviewId: string): ReviewBarrierSnapshot | null {
     const row = this.reviewRow(reviewId);
     return row === undefined ? null : this.snapshot(row);
+  }
+
+  private enqueueActiveReviewRuns(row: ReviewRow): void {
+    for (const lane of this.snapshot(row).lanes.filter(({ status }) => status === "queued")) {
+      const attempt = lane.attempts.at(-1);
+      if (attempt?.status === "scheduled") {
+        this.runs.enqueueExact(createReviewRunInput(this.descriptorForAttempt(row, lane, attempt)));
+      }
+    }
   }
 
   create(input: CreateReviewBarrierInput): ReviewBarrierSnapshot {
@@ -522,6 +492,7 @@ export class ReviewBarrierStore {
         ) {
           throw new Error(`Immutable review conflict: ${input.reviewId}`);
         }
+        this.enqueueActiveReviewRuns(existing);
         return snapshot;
       }
 
@@ -563,9 +534,8 @@ export class ReviewBarrierStore {
       `);
       const insertAttempt = this.db.prepare(`
         INSERT INTO runtime_review_lane_attempts
-          (review_id,agent,role,attempt_ordinal,attempt_id,status,model,effort,policy_version,
-           reasons,session_id,idempotency_key,result,error,created_at,terminal_at)
-        VALUES (?,?,?,?,?,'scheduled',?,?,?,?,?,?,NULL,NULL,?,NULL)
+          (review_id,agent,role,attempt_ordinal,run_id,created_at)
+        VALUES (?,?,?,?,?,?)
       `);
       for (const lane of [...plan.activeLanes, ...plan.deferredLanes]) {
         const active = activeKeys.has(lane.idempotencyKey);
@@ -584,18 +554,35 @@ export class ReviewBarrierStore {
           lane.degraded ? 1 : 0,
         );
         if (active) {
+          const descriptor: LaneEnqueueDescriptor = {
+            reviewId: input.reviewId,
+            stageId: input.stageId,
+            agent: lane.agent,
+            role: lane.role,
+            artifact: Buffer.from(artifact),
+            artifactHash,
+            approvalScope: input.approvalScope,
+            model: lane.model,
+            effort: lane.effort as "high" | "xhigh",
+            policyVersion: lane.policyVersion,
+            reasons: lane.reasons,
+            sessionId: lane.sessionId,
+            idempotencyKey: lane.idempotencyKey,
+            prompt: lane.prompt,
+            degraded: lane.degraded,
+            attemptId: randomUUID(),
+            attemptOrdinal: 0,
+            ...(input.project ? { project: input.project } : {}),
+            ...(input.requester ? { requester: input.requester } : {}),
+            ...(input.sourceFingerprint ? { sourceFingerprint: input.sourceFingerprint } : {}),
+          };
+          const run = this.runs.enqueueExact(createReviewRunInput(descriptor));
           insertAttempt.run(
             input.reviewId,
             lane.agent,
             lane.role,
             0,
-            randomUUID(),
-            lane.model,
-            lane.effort,
-            lane.policyVersion,
-            JSON.stringify(lane.reasons),
-            lane.sessionId,
-            lane.idempotencyKey,
+            run.id,
             input.createdAt,
           );
         }
@@ -607,11 +594,11 @@ export class ReviewBarrierStore {
     return create.immediate();
   }
 
-  private descriptor(review: ReviewRow, lane: ReviewLaneSnapshot): LaneEnqueueDescriptor {
-    const attempt = lane.attempts.at(-1);
-    if (!attempt || attempt.status !== "scheduled") {
-      throw new Error("Review lane has no scheduled attempt");
-    }
+  private descriptorForAttempt(
+    review: ReviewRow,
+    lane: ReviewLaneSnapshot,
+    attempt: ReviewAttemptSnapshot,
+  ): LaneEnqueueDescriptor {
     if (attempt.policyVersion !== ROUTING_POLICY_VERSION) {
       throw new Error("Historical review attempt requires reconciliation before enqueue");
     }
@@ -639,6 +626,14 @@ export class ReviewBarrierStore {
     };
   }
 
+  private descriptor(review: ReviewRow, lane: ReviewLaneSnapshot): LaneEnqueueDescriptor {
+    const attempt = lane.attempts.at(-1);
+    if (!attempt || attempt.status !== "scheduled") {
+      throw new Error("Review lane has no scheduled attempt");
+    }
+    return this.descriptorForAttempt(review, lane, attempt);
+  }
+
   enqueueDescriptors(reviewId: string): LaneEnqueueDescriptor[] {
     const review = this.reviewRow(reviewId);
     if (review === undefined) throw new Error(`Unknown review: ${reviewId}`);
@@ -662,9 +657,9 @@ export class ReviewBarrierStore {
          WHERE review_id = ? AND agent = ? AND role = ?
       `).get(input.reviewId, input.agent, input.role) as LaneRow | undefined;
       if (existing === undefined) throw new Error("Unknown review lane");
-      const attempts = this.attemptRows(input.reviewId, input.agent, input.role);
+      const attempts = this.attemptsFor(input.reviewId, input.agent, input.role);
       const activeAttempt = attempts.at(-1);
-      if (!activeAttempt || activeAttempt.attempt_id !== input.attemptId) {
+      if (!activeAttempt || activeAttempt.attemptId !== input.attemptId) {
         throw new Error("Review result does not match the active attempt");
       }
       if (TERMINAL.has(existing.status)) {
@@ -676,12 +671,9 @@ export class ReviewBarrierStore {
         ) {
           throw new Error("Review lane terminal state conflict");
         }
-        return laneSnapshot(existing);
+        return laneSnapshot(existing, attempts);
       }
       if (existing.status !== "queued") throw new Error("Deferred review lane is not active");
-      if (activeAttempt.status !== "scheduled") {
-        throw new Error("Review result does not match the active attempt");
-      }
       const changed = this.db.prepare(`
         UPDATE runtime_review_lanes
            SET status = ?, result = ?, error = ?, terminal_at = ?
@@ -696,18 +688,13 @@ export class ReviewBarrierStore {
         input.role,
       ).changes;
       if (changed !== 1) throw new Error("Review lane terminal CAS failed");
-      this.db.prepare(`UPDATE runtime_review_lane_attempts
-        SET status=?,result=?,error=?,terminal_at=?
-        WHERE attempt_id=? AND status='scheduled'`).run(
-          input.status, result, error, input.terminalAt, input.attemptId,
-        );
       const updated = this.db.prepare(`
         SELECT review_id, agent, role, status, model, effort, policy_version, reasons, session_id,
                idempotency_key, prompt, degraded, result, error, terminal_at
           FROM runtime_review_lanes
          WHERE review_id = ? AND agent = ? AND role = ?
       `).get(input.reviewId, input.agent, input.role) as LaneRow;
-      return laneSnapshot(updated, this.attemptRows(input.reviewId, input.agent, input.role).map(attemptSnapshot));
+      return laneSnapshot(updated, this.attemptsFor(input.reviewId, input.agent, input.role));
     });
     return update.immediate();
   }
@@ -720,25 +707,32 @@ export class ReviewBarrierStore {
     error: unknown;
     terminalAt: number;
   }): ReviewLaneSnapshot {
-    const error = JSON.stringify(sanitizeResult(input.error));
     return this.db.transaction(() => {
       const lane = this.laneRows(input.reviewId).find(
         (candidate) => candidate.agent === input.agent && candidate.role === input.role,
       );
       if (!lane) throw new Error("Unknown review lane");
-      const attempt = this.attemptRows(input.reviewId, input.agent, input.role)
-        .find((candidate) => candidate.attempt_id === input.attemptId);
+      const attempts = this.attemptsFor(input.reviewId, input.agent, input.role);
+      const attempt = attempts.find((candidate) => candidate.attemptId === input.attemptId);
       if (!attempt) throw new Error("Unknown review attempt");
-      if (attempt.status === "provider_unavailable") {
-        return laneSnapshot(lane, this.attemptRows(input.reviewId, input.agent, input.role).map(attemptSnapshot));
+      const latest = attempts.at(-1);
+      if (latest?.attemptId !== input.attemptId) {
+        if (attempt.status === "provider_unavailable") {
+          return laneSnapshot(lane, attempts);
+        }
+        throw new Error("provider failure does not match the active review attempt");
       }
-      if (lane.status !== "queued" || attempt.status !== "scheduled") {
+      if (attempt.status !== "provider_unavailable" ||
+          !isDeepStrictEqual(attempt.error, sanitizeResult(input.error)) ||
+          attempt.terminalAt !== input.terminalAt) {
+        throw new Error("provider failure lacks exact durable run evidence");
+      }
+      if (lane.status === "deferred") {
+        return laneSnapshot(lane, attempts);
+      }
+      if (lane.status !== "queued") {
         throw new Error("Review attempt is not active");
       }
-      const changed = this.db.prepare(`UPDATE runtime_review_lane_attempts
-        SET status='provider_unavailable',error=?,terminal_at=?
-        WHERE attempt_id=? AND status='scheduled'`).run(error, input.terminalAt, input.attemptId).changes;
-      if (changed !== 1) throw new Error("Review attempt terminal CAS failed");
       this.db.prepare(`UPDATE runtime_review_lanes
         SET status='deferred',result=NULL,error=NULL,terminal_at=NULL
         WHERE review_id=? AND agent=? AND role=? AND status='queued'`)
@@ -746,78 +740,96 @@ export class ReviewBarrierStore {
       const updated = this.laneRows(input.reviewId).find(
         (candidate) => candidate.agent === input.agent && candidate.role === input.role,
       )!;
-      return laneSnapshot(updated, this.attemptRows(input.reviewId, input.agent, input.role).map(attemptSnapshot));
+      return laneSnapshot(updated, this.attemptsFor(input.reviewId, input.agent, input.role));
     }).immediate();
   }
 
   attempts(reviewId: string, agent: AgentId, role: ReviewRole): ReviewAttemptSnapshot[] {
-    return this.attemptRows(reviewId, agent, role).map(attemptSnapshot);
-  }
-
-  markAttemptNeedsReconciliation(input: {
-    reviewId: string;
-    agent: AgentId;
-    role: ReviewRole;
-    attemptId: string;
-    at: number;
-  }): ReviewAttemptSnapshot {
-    const changed = this.db.prepare(`UPDATE runtime_review_lane_attempts
-      SET status='needs_reconciliation',terminal_at=?
-      WHERE review_id=? AND agent=? AND role=? AND attempt_id=? AND status='scheduled'`).run(
-        input.at, input.reviewId, input.agent, input.role, input.attemptId,
-      ).changes;
-    const attempt = this.attemptRows(input.reviewId, input.agent, input.role)
-      .find((row) => row.attempt_id === input.attemptId);
-    if (!attempt || (changed !== 1 && attempt.status !== "needs_reconciliation")) {
-      throw new Error("review attempt cannot enter reconciliation");
-    }
-    return attemptSnapshot(attempt);
-  }
-
-  resolveAttemptReconciliation(input: {
-    reviewId: string;
-    agent: AgentId;
-    role: ReviewRole;
-    attemptId: string;
-    status: "completed" | "failed";
-    evidence: unknown;
-    at: number;
-  }): ReviewLaneSnapshot {
-    const encoded = JSON.stringify(sanitizeResult(input.evidence));
-    return this.db.transaction(() => {
-      const latest = this.attemptRows(input.reviewId, input.agent, input.role).at(-1);
-      if (!latest || latest.attempt_id !== input.attemptId || latest.status !== "needs_reconciliation") {
-        throw new Error("review attempt is not awaiting reconciliation");
-      }
-      const result = input.status === "completed" ? encoded : null;
-      const error = input.status === "failed" ? encoded : null;
-      const attemptChanged = this.db.prepare(`UPDATE runtime_review_lane_attempts
-        SET status=?,result=?,error=?,terminal_at=?
-        WHERE attempt_id=? AND status='needs_reconciliation'`).run(
-          input.status, result, error, input.at, input.attemptId,
-        ).changes;
-      const laneChanged = this.db.prepare(`UPDATE runtime_review_lanes
-        SET status=?,result=?,error=?,terminal_at=?
-        WHERE review_id=? AND agent=? AND role=? AND status='queued'`).run(
-          input.status, result, error, input.at, input.reviewId, input.agent, input.role,
-        ).changes;
-      if (attemptChanged !== 1 || laneChanged !== 1) throw new Error("review reconciliation CAS failed");
-      const lane = this.laneRows(input.reviewId).find(
-        (row) => row.agent === input.agent && row.role === input.role,
-      )!;
-      return laneSnapshot(lane, this.attemptRows(input.reviewId, input.agent, input.role).map(attemptSnapshot));
-    }).immediate();
+    return this.attemptsFor(reviewId, agent, role);
   }
 
   barrier(reviewId: string): { satisfied: boolean; terminalCount: number; requiredCount: number } {
     if (this.reviewRow(reviewId) === undefined) throw new Error(`Unknown review: ${reviewId}`);
     const lanes = this.laneRows(reviewId);
     const terminalCount = lanes.filter((lane) => TERMINAL.has(lane.status)).length;
+    const review = this.reviewRow(reviewId)!;
     return {
-      satisfied: lanes.length > 0 && terminalCount === lanes.length,
+      satisfied: lanes.length > 0 && lanes.every((lane) =>
+        isSemanticPass(lane) && this.hasExactRunnerEvidence(review, laneSnapshot(
+          lane,
+          this.attemptsFor(reviewId, lane.agent, lane.role),
+        ))
+      ),
       terminalCount,
       requiredCount: lanes.length,
     };
+  }
+
+  assertExactSemanticPass(input: ExactSemanticPassReviewInput): ReviewBarrierSnapshot {
+    const review = this.get(input.reviewId);
+    const artifactHash = createHash("sha256").update(input.artifact).digest("hex");
+    if (
+      !review ||
+      review.stageId !== input.stageId ||
+      review.artifactHash !== artifactHash ||
+      !review.artifact.equals(input.artifact) ||
+      review.approvalScope !== input.approvalScope ||
+      review.idempotencyKey !== input.idempotencyKey ||
+      review.project !== input.project ||
+      review.requester !== input.requester ||
+      review.sourceFingerprint !== input.sourceFingerprint ||
+      review.changedFiles !== input.changedFiles ||
+      review.lanes.length !== 4 ||
+      review.lanes.some((lane) => lane.prompt !== input.prompts[lane.role]) ||
+      this.barrier(input.reviewId).satisfied !== true
+    ) {
+      throw new Error(`review barrier is not an exact four-lane semantic PASS: ${input.reviewId}`);
+    }
+    return review;
+  }
+
+  private hasExactRunnerEvidence(review: ReviewRow, lane: ReviewLaneSnapshot): boolean {
+    const attempt = lane.attempts.at(-1);
+    if (!attempt || attempt.status !== "completed" || lane.status !== "completed") return false;
+    const run = this.runs.getByIdempotencyKey(attempt.idempotencyKey);
+    if (!run || !run.launched || run.status !== "completed" || run.attemptCount <= 0) return false;
+    const launch = typeof run.launchInfo === "object" && run.launchInfo !== null
+      ? run.launchInfo as Record<string, unknown>
+      : null;
+    const payload = run.payload ?? {};
+    const envelope = typeof run.result === "object" && run.result !== null
+      ? run.result as Record<string, unknown>
+      : null;
+    const providerResult = envelope && typeof envelope.providerResult === "object" &&
+      envelope.providerResult !== null ? envelope.providerResult as Record<string, unknown> : null;
+    const effect = envelope && typeof envelope.effect === "object" && envelope.effect !== null
+      ? envelope.effect as Record<string, unknown>
+      : null;
+    let expected: ReturnType<typeof createReviewRunInput>;
+    try {
+      expected = createReviewRunInput(this.descriptorForAttempt(review, lane, attempt));
+    } catch {
+      return false;
+    }
+    return (
+      (envelope?.domainEffect === "pending" || envelope?.domainEffect === "applying" ||
+        envelope?.domainEffect === "applied") &&
+      launch?.phase === "started" && Number.isSafeInteger(launch.pid) && Number(launch.pid) > 0 &&
+      launch.agent === lane.agent && launch.model === attempt.model && launch.effort === attempt.effort &&
+      launch.policyVersion === attempt.policyVersion && launch.sessionId === attempt.sessionId &&
+      run.idempotencyKey === expected.idempotencyKey && run.stage === expected.stage &&
+      run.priority === expected.priority && run.artifactHash === expected.artifactHash &&
+      run.approvalScope === expected.approvalScope && isDeepStrictEqual(run.payload, expected.payload) &&
+      payload.reviewId === review.review_id && payload.reviewRole === lane.role &&
+      payload.reviewAttemptId === attempt.attemptId &&
+      payload.reviewAttemptOrdinal === attempt.attemptOrdinal &&
+      payload.sessionId === attempt.sessionId && payload.sourceFingerprint === review.source_fingerprint &&
+      effect?.type === "review" && effect.reviewId === review.review_id &&
+      effect.attemptId === attempt.attemptId && effect.role === lane.role &&
+      effect.agent === lane.agent && effect.resultKind === "success" &&
+      providerResult?.kind === "success" && providerResult.agent === lane.agent &&
+      isDeepStrictEqual(providerResult, lane.result)
+    );
   }
 
   deferredReviewIds(agent: AgentId): string[] {
@@ -829,7 +841,6 @@ export class ReviewBarrierStore {
   activateDeferred(input: {
     reviewId: string;
     agent: AgentId;
-    currentArtifactHash: string;
     currentSourceFingerprint?: string;
     now: number;
     providerHealth: ProviderHealthStore;
@@ -839,13 +850,8 @@ export class ReviewBarrierStore {
   } {
     const review = this.reviewRow(input.reviewId);
     if (review === undefined) throw new Error(`Unknown review: ${input.reviewId}`);
-    const deferred = this.laneRows(input.reviewId).filter(
-      (lane) => lane.agent === input.agent && lane.status === "deferred",
-    );
-    if (deferred.length === 0) return { status: "none", lanes: [] };
-
-    if (review.artifact_hash !== input.currentArtifactHash ||
-        (review.source_fingerprint !== null && review.source_fingerprint !== input.currentSourceFingerprint)) {
+    if (review.source_fingerprint !== null &&
+        review.source_fingerprint !== input.currentSourceFingerprint) {
       this.db.prepare(`
         UPDATE runtime_review_lanes
            SET status = 'stale_artifact', terminal_at = ?
@@ -858,11 +864,14 @@ export class ReviewBarrierStore {
     }
 
     const activate = this.db.transaction(() => {
+      const deferred = this.laneRows(input.reviewId).filter(
+        (lane) => lane.agent === input.agent && lane.status === "deferred",
+      );
+      const descriptors: LaneEnqueueDescriptor[] = [];
       for (const lane of deferred) {
-        const attempts = this.attemptRows(input.reviewId, lane.agent, lane.role);
+        const attempts = this.attemptsFor(input.reviewId, lane.agent, lane.role);
         const latest = attempts.at(-1);
-        if (latest?.status === "scheduled") continue;
-        const attemptOrdinal = (latest?.attempt_ordinal ?? -1) + 1;
+        const attemptOrdinal = (latest?.attemptOrdinal ?? -1) + 1;
         const decision = reviewDecisionFor(lane.agent, lane.role, {
           attemptOrdinal,
           artifactBytes: review.artifact.length,
@@ -872,34 +881,53 @@ export class ReviewBarrierStore {
         const idempotencyKey = attemptOrdinal === 0
           ? lane.idempotency_key
           : `${review.idempotency_key}:${lane.agent}:${lane.role}:attempt:${attemptOrdinal}`;
-        this.db.prepare(`INSERT INTO runtime_review_lane_attempts
-          (review_id,agent,role,attempt_ordinal,attempt_id,status,model,effort,policy_version,
-           reasons,session_id,idempotency_key,result,error,created_at,terminal_at)
-          VALUES (?,?,?,?,?,'scheduled',?,?,?,?,?,?,NULL,NULL,?,NULL)`).run(
-            input.reviewId, lane.agent, lane.role, attemptOrdinal, randomUUID(), decision.model,
-            decision.effort, decision.policyVersion, JSON.stringify(decision.reasons), sessionId,
-            idempotencyKey, input.now,
-          );
-        this.db.prepare(`UPDATE runtime_review_lanes
+        const claimed = this.db.prepare(`UPDATE runtime_review_lanes
           SET model=?,effort=?,policy_version=?,reasons=?,session_id=?,idempotency_key=?,degraded=1
           WHERE review_id=? AND agent=? AND role=? AND status='deferred'`).run(
             decision.model, decision.effort, decision.policyVersion, JSON.stringify(decision.reasons),
             sessionId, idempotencyKey, input.reviewId, lane.agent, lane.role,
+          ).changes;
+        if (claimed !== 1) continue;
+        const descriptor: LaneEnqueueDescriptor = {
+          reviewId: review.review_id,
+          stageId: review.stage_id,
+          agent: lane.agent,
+          role: lane.role,
+          artifact: Buffer.from(review.artifact),
+          artifactHash: review.artifact_hash,
+          approvalScope: review.approval_scope,
+          model: decision.model,
+          effort: decision.effort as "high" | "xhigh",
+          policyVersion: decision.policyVersion,
+          reasons: decision.reasons,
+          sessionId,
+          idempotencyKey,
+          prompt: lane.prompt,
+          degraded: true,
+          attemptId: randomUUID(),
+          attemptOrdinal,
+          ...(review.project === null ? {} : { project: review.project }),
+          ...(review.requester === null ? {} : { requester: review.requester }),
+          ...(review.source_fingerprint === null ? {} : { sourceFingerprint: review.source_fingerprint }),
+        };
+        const run = this.runs.enqueueExact(createReviewRunInput(descriptor));
+        this.db.prepare(`INSERT INTO runtime_review_lane_attempts
+          (review_id,agent,role,attempt_ordinal,run_id,created_at)
+          VALUES (?,?,?,?,?,?)`).run(
+            input.reviewId, lane.agent, lane.role, attemptOrdinal, run.id, input.now,
           );
+        descriptors.push(descriptor);
       }
-      return this.snapshot(review).lanes
-        .filter((lane) => lane.agent === input.agent && lane.status === "deferred")
-        .map((lane) => this.descriptor(review, lane));
+      this.db.prepare(`UPDATE runtime_review_lanes SET status='queued'
+        WHERE review_id=? AND agent=? AND status='deferred'`).run(input.reviewId, input.agent);
+      return descriptors;
     });
-    return { status: "activated", lanes: activate.immediate() };
-  }
-
-  confirmDeferredEnqueued(reviewId: string, agent: AgentId): number {
-    return this.db.prepare(`UPDATE runtime_review_lanes SET status='queued'
-      WHERE review_id=? AND agent=? AND status='deferred'`).run(reviewId, agent).changes;
+    const lanes = activate.immediate();
+    return lanes.length === 0 ? { status: "none", lanes } : { status: "activated", lanes };
   }
 
   close(): void {
-    this.db.close();
+    this.runs.close();
+    if (this.ownsDatabase) this.db.close();
   }
 }

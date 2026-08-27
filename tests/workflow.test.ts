@@ -12,45 +12,14 @@ import {
   transitionCollaborationRun,
   type CollaborationRun,
 } from "../src/workflow/workflow.js";
+import {
+  createCurrentMapLearningLaunchBinding,
+  formatMapLearningLaunchBindingContext,
+} from "../src/flow/map-admin.js";
 
-const artifactHash = "f1b2c3d4-artifact-sha";
-const approvalScope = "workspace-read" as const;
-const handoffEvidence = {
-  checkpoint: {
-    artifactHash,
-    headSha: "git-head-123",
-    diffHash: "diff-sha-456",
-    changedFiles: ["src/owned.ts"],
-    testEvidence: [{ command: "npm test -- owned", exitCode: 0 }],
-    sourceSessionId: "grok-session-a",
-    approvals: [
-      {
-        approvalId: "approval-workspace-read-1",
-        grantedBy: "user",
-        scope: approvalScope,
-        grantedAt: 1_756_000_000_000,
-      },
-    ],
-    nextAction: {
-      kind: "continue_stage" as const,
-      stageId: "stage-a",
-      instruction: "Continue from the verified checkpoint without widening scope",
-    },
-  },
-  worktreeLease: {
-    path: "/repo/worktree-task-9",
-    leaseId: "lease-task-9-a",
-    holder: "grok" as const,
-    fencingToken: 7,
-  },
-};
-const observedWorktree = {
-  artifactHash,
-  headSha: handoffEvidence.checkpoint.headSha,
-  diffHash: handoffEvidence.checkpoint.diffHash,
-  leaseId: handoffEvidence.worktreeLease.leaseId,
-  fencingToken: handoffEvidence.worktreeLease.fencingToken,
-};
+const artifactHash = "f".repeat(64);
+const codexLearning = createCurrentMapLearningLaunchBinding("codex");
+const learningContext = formatMapLearningLaunchBindingContext(codexLearning);
 
 const stage = (id: string, kind: Stage) => ({
   id,
@@ -60,93 +29,84 @@ const stage = (id: string, kind: Stage) => ({
   artifactHash,
   artifactBytes: 1_024,
   changedFiles: 2,
-  approvalScope,
+  approvalScope: "workspace-read" as const,
   idempotencyKey: `task-9:${id}:${artifactHash}`,
+  project: "/tmp/agent-collab-workflow",
+  prompt: `${learningContext}\n\nexecute ${id}`,
+  requester: "codex" as const,
+  mapLearning: codexLearning,
 });
 
 const makeRun = (
   health: ProviderHealthSnapshot = { grok: "healthy", codex: "healthy" },
   origin: ActiveAgentId = "codex",
-) =>
-  createCollaborationRun({
-    taskId: "task-9",
-    origin,
-    health,
-    stages: [stage("stage-a", "planning"), stage("stage-b", "planning")],
-  });
+) => createCollaborationRun({
+  taskId: "task-9",
+  origin,
+  health,
+  stages: [stage("stage-a", "planning"), stage("stage-b", "planning")],
+});
 
 const completeCoordination = (run: CollaborationRun): CollaborationRun => {
   const coordination = run.stages[0]!;
-  expect(coordination).toMatchObject({ kind: "coordination", systemGenerated: true });
   const active = transitionCollaborationRun(run, {
     type: "BEGIN_STAGE",
     stageId: coordination.id,
+    now: 0,
+    eventId: "begin:coordination",
   });
-  expect(active.activeStage?.id).toBe(coordination.id);
   return transitionCollaborationRun(active, {
     type: "COMPLETE_STAGE",
     stageId: coordination.id,
     resultHash: "coordination-result",
+    eventId: "complete:coordination",
   });
 };
 
-const begin = (run: CollaborationRun, stageId = "stage-a") =>
-  transitionCollaborationRun(completeCoordination(run), { type: "BEGIN_STAGE", stageId });
+const beginPlanning = (run = makeRun()): CollaborationRun =>
+  transitionCollaborationRun(completeCoordination(run), {
+    type: "BEGIN_STAGE",
+    stageId: "stage-a",
+    now: 0,
+    eventId: "begin:stage-a",
+  });
 
 afterEach(() => vi.useRealTimers());
 
-describe("v2 origin-neutral coordination", () => {
+describe("routing-v4 Codex stage ownership", () => {
   it.each(["grok", "codex"] as const)(
-    "inserts exactly one Codex-preferred coordination stage for %s origin",
+    "inserts one Codex-owned coordination stage for %s origin",
     (origin) => {
       const run = makeRun(undefined, origin);
-
-      expect(run.origin).toBe(origin);
       expect(run.policyVersion).toBe(ROUTING_POLICY_VERSION);
       expect(run.stages.map((item) => item.kind)).toEqual([
         "coordination",
         "planning",
         "planning",
       ]);
-      expect(run.stages[0]).toMatchObject({
-        systemGenerated: true,
-        role: "coordinator",
-        approvalScope: "workspace-read",
-        artifactBytes: 1_024,
-        changedFiles: 2,
-      });
-      expect(run.stages[0]).not.toHaveProperty("approvalReference");
-
-      const premature = transitionCollaborationRun(run, {
-        type: "BEGIN_STAGE",
-        stageId: "stage-a",
-      });
-      expect(premature).toMatchObject({
-        status: "blocked_stage_order",
-        blockedReason: "coordination_required",
-        activeStage: null,
-      });
-
       const coordinated = completeCoordination(run);
       expect(coordinated.dispatches[0]?.assignment).toMatchObject({
         agent: "codex",
         model: "gpt-5.6-sol",
         effort: "medium",
-        policyVersion: ROUTING_POLICY_VERSION,
+        policyVersion: "routing-v4",
         reasons: ["stage_baseline:coordination:medium"],
         attemptOrdinal: 0,
+        degraded: false,
       });
       const planning = transitionCollaborationRun(coordinated, {
         type: "BEGIN_STAGE",
         stageId: "stage-a",
+        now: 1,
       });
       expect(planning.activeStage?.assignment).toMatchObject({
-        agent: "grok",
-        model: "grok-4.6",
+        agent: "codex",
+        model: "gpt-5.6-sol",
         effort: "medium",
-        policyVersion: ROUTING_POLICY_VERSION,
+        policyVersion: "routing-v4",
         reasons: ["stage_baseline:planning:medium"],
         attemptOrdinal: 0,
+        degraded: false,
       });
     },
   );
@@ -161,52 +121,44 @@ describe("v2 origin-neutral coordination", () => {
     expect(run.stages).toHaveLength(1);
     expect(run.stages[0]?.systemGenerated).toBeUndefined();
   });
-});
 
-describe("v2 startup probing and initial fallback", () => {
-  it("starts both providers as probing and computes a fresh Grok fallback decision", () => {
-    const probing = createCollaborationRun({
-      taskId: "startup-probe-task",
-      origin: "codex",
-      stages: [stage("first-coordination", "coordination")],
+  it("does not let Grok health substitute for an unavailable Codex owner", () => {
+    const run = createCollaborationRun({
+      taskId: "blocked-owner",
+      origin: "grok",
+      health: { grok: "healthy", codex: "unavailable" },
+      stages: [stage("coordination", "coordination")],
     });
-    expect(probing.health).toEqual({ grok: "probing", codex: "probing" });
-
-    const waiting = transitionCollaborationRun(probing, {
+    const blocked = transitionCollaborationRun(run, {
       type: "BEGIN_STAGE",
-      stageId: "first-coordination",
+      stageId: "coordination",
+      now: 0,
     });
-    expect(waiting).toMatchObject({
+    expect(blocked).toMatchObject({
       status: "blocked_no_provider",
-      pendingStageId: "first-coordination",
+      blockedReason: "codex_stage_owner_unavailable",
+      pendingStageId: "coordination",
       activeStage: null,
     });
+    expect(blocked.dispatches).toEqual([]);
+  });
 
-    const fallback = transitionCollaborationRun(waiting, {
-      type: "STARTUP_PROBES_COMPLETED",
-      eventId: "startup-probes:first-coordination",
-      results: {
-        grok: { health: "healthy" },
-        codex: { health: "unavailable", failure: "model_mismatch" },
-      },
-      at: 0,
-    });
-    expect(fallback.activeStage?.assignment).toMatchObject({
+  it("ignores a Grok provider outcome for a Codex-owned attempt", () => {
+    const running = beginPlanning();
+    const next = transitionCollaborationRun(running, {
+      type: "PROVIDER_OUTCOME",
+      eventId: "forged:grok",
       agent: "grok",
-      model: "grok-4.6",
-      effort: "xhigh",
-      reasons: ["stage_baseline:coordination:high", "degraded_fallback"],
-      attemptOrdinal: 0,
-      degraded: true,
+      outcome: { kind: "network_timeout" },
+      now: 10,
     });
-    expect(fallback.activeStage?.assignment.sessionId).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
-    );
-    expect(fallback.dispatches).toHaveLength(1);
+    expect(next.activeStage).toEqual(running.activeStage);
+    expect(next.failedAttempts).toEqual([]);
+    expect(next.processedEventIds).toContain("forged:grok");
   });
 });
 
-describe("v2 per-attempt failover decisions", () => {
+describe("routing-v4 outcome and recovery boundaries", () => {
   it.each([
     "quota",
     "rate_limit",
@@ -215,72 +167,32 @@ describe("v2 per-attempt failover decisions", () => {
     "model_unavailable",
     "cli_missing",
     "auth",
-  ] as const)("recomputes and persists a new decision after eligible outcome %s", (kind) => {
-    const running = begin(makeRun());
-    const initial = structuredClone(running.activeStage!.assignment);
-    expect(initial).toMatchObject({
-      agent: "grok",
-      effort: "medium",
-      reasons: ["stage_baseline:planning:medium"],
-      attemptOrdinal: 0,
-    });
-
-    const failedOver = transitionCollaborationRun(running, {
-      type: "PROVIDER_OUTCOME",
+  ] as const)("blocks the stage without cross-provider handoff after %s", (kind) => {
+    const running = beginPlanning();
+    const assignment = structuredClone(running.activeStage!.assignment);
+    const event = {
+      type: "PROVIDER_OUTCOME" as const,
       eventId: `outcome:${kind}`,
-      agent: "grok",
+      agent: "codex" as const,
       outcome: { kind },
-      handoffEvidence,
-      observedWorktree,
-    });
+      now: 100,
+    };
+    const blocked = transitionCollaborationRun(running, event);
+    const duplicate = transitionCollaborationRun(blocked, event);
 
-    expect(failedOver.status).toBe("running");
-    expect(failedOver.activeStage?.assignment.sessionId).not.toBe(initial.sessionId);
-    expect(failedOver.activeStage).toMatchObject({
-      id: "stage-a",
-      role: "stage-owner",
-      artifactHash,
-      artifactBytes: 1_024,
-      changedFiles: 2,
-      approvalScope,
-      assignment: {
-        agent: "codex",
-        model: "gpt-5.6-sol",
-        effort: "xhigh",
-        policyVersion: ROUTING_POLICY_VERSION,
-        reasons: [
-          "stage_baseline:planning:medium",
-          "degraded_fallback",
-          "retry",
-        ],
-        attemptOrdinal: 1,
-        degraded: true,
-      },
+    expect(blocked).toMatchObject({
+      status: "blocked_no_provider",
+      blockedReason: "codex_stage_owner_unavailable",
+      pendingStageId: "stage-a",
+      activeStage: null,
+      health: { codex: "unavailable" },
+      recovery: { attempt: 0, nextRetryAt: 1_100 },
     });
-    expect(failedOver.failedAttempts).toEqual([
-      expect.objectContaining({
-        stageId: "stage-a",
-        assignment: initial,
-        outcome: { kind },
-      }),
+    expect(blocked.failedAttempts).toEqual([
+      expect.objectContaining({ stageId: "stage-a", assignment, outcome: { kind } }),
     ]);
-    expect(failedOver.dispatches.filter((item) => item.stageId === "stage-a")).toEqual([
-      expect.objectContaining({ assignment: initial }),
-      expect.objectContaining({ assignment: failedOver.activeStage!.assignment }),
-    ]);
-    expect(failedOver.handoffs[0]).toMatchObject({
-      eventId: `outcome:${kind}`,
-      from: "grok",
-      to: "codex",
-      approvalScope,
-      evidence: handoffEvidence,
-      releasedLease: handoffEvidence.worktreeLease,
-      acquiredLease: {
-        ...handoffEvidence.worktreeLease,
-        holder: "codex",
-        fencingToken: 8,
-      },
-    });
+    expect(blocked.dispatches.filter((item) => item.stageId === "stage-a")).toHaveLength(1);
+    expect(duplicate).toEqual(blocked);
   });
 
   it.each([
@@ -289,183 +201,52 @@ describe("v2 per-attempt failover decisions", () => {
     "safety_denial",
     "permission_denial",
     "user_cancelled",
-  ] as const)("does not bypass terminal outcome %s", (kind) => {
-    const running = begin(makeRun());
+  ] as const)("keeps %s terminal and never dispatches a replacement", (kind) => {
+    const running = beginPlanning();
     const stopped = transitionCollaborationRun(running, {
       type: "PROVIDER_OUTCOME",
-      eventId: `outcome:${kind}`,
-      agent: "grok",
-      outcome: { kind },
-      handoffEvidence,
-      observedWorktree,
-    });
-
-    expect(stopped.activeStage?.assignment.agent).toBe("grok");
-    expect(stopped.handoffs).toHaveLength(0);
-    expect(stopped.terminalOutcome).toEqual({ kind });
-  });
-
-  it("applies the same failover event idempotently", () => {
-    const event = {
-      type: "PROVIDER_OUTCOME" as const,
-      eventId: "outcome:one",
-      agent: "grok" as const,
-      outcome: { kind: "rate_limit" as const },
-      handoffEvidence,
-      observedWorktree,
-    };
-    const first = transitionCollaborationRun(begin(makeRun()), event);
-    const duplicate = transitionCollaborationRun(first, event);
-
-    expect(duplicate).toEqual(first);
-    expect(duplicate.handoffs).toHaveLength(1);
-    expect(duplicate.failedAttempts).toHaveLength(1);
-  });
-
-  it("preserves pinned decisions through serialization without changing prior evidence", () => {
-    const running = begin(makeRun());
-    const initial = structuredClone(running.activeStage!.assignment);
-    const failedOver = transitionCollaborationRun(running, {
-      type: "PROVIDER_OUTCOME",
-      eventId: "outcome:serialized",
-      agent: "grok",
-      outcome: { kind: "overload" },
-      handoffEvidence,
-      observedWorktree,
-    });
-    const restored = restoreCollaborationRun(serializeCollaborationRun(failedOver));
-
-    expect(restored).toEqual(failedOver);
-    expect(restored.activeStage?.assignment.sessionId).toBe(failedOver.activeStage?.assignment.sessionId);
-    expect(restored.policyVersion).toBe(ROUTING_POLICY_VERSION);
-    expect(restored.dispatches.find((item) => item.assignment.attemptId === initial.attemptId))
-      ?.toMatchObject({ assignment: initial });
-    expect(restored.activeStage?.assignment.attemptId).not.toBe(initial.attemptId);
-  });
-
-  it("does not create another attempt for a repeated BEGIN_STAGE", () => {
-    const running = begin(makeRun());
-    const duplicate = transitionCollaborationRun(running, {
-      type: "BEGIN_STAGE",
-      stageId: "stage-a",
-    });
-
-    expect(duplicate).toEqual(running);
-    expect(duplicate.dispatches.filter((item) => item.stageId === "stage-a"))
-      .toHaveLength(1);
-  });
-});
-
-describe("v2 durable blocking and recovery", () => {
-  const retryPolicy = {
-    baseDelayMs: 1_000,
-    maxDelayMs: 4_000,
-    maxAttempts: 4,
-  };
-
-  const blockedPlanning = () => {
-    let run = completeCoordination(makeRun());
-    run = transitionCollaborationRun(run, {
-      type: "PROVIDER_HEALTH_CHANGED",
-      agent: "grok",
-      health: "unavailable",
-    });
-    run = transitionCollaborationRun(run, {
-      type: "PROVIDER_HEALTH_CHANGED",
+      eventId: `terminal:${kind}`,
       agent: "codex",
-      health: "unavailable",
+      outcome: { kind },
+      now: 100,
     });
-    return transitionCollaborationRun(run, {
+    expect(stopped.status).toBe("terminal_outcome");
+    expect(stopped.terminalOutcome).toEqual({ kind });
+    expect(stopped.dispatches).toEqual(running.dispatches);
+  });
+
+  it("updates health without implicitly restarting a blocked stage", () => {
+    const unavailable = makeRun({ grok: "healthy", codex: "unavailable" });
+    const blocked = transitionCollaborationRun(unavailable, {
       type: "BEGIN_STAGE",
-      stageId: "stage-a",
+      stageId: unavailable.stages[0]!.id,
       now: 0,
     });
-  };
-
-  it("does not increment attemptOrdinal when no launch occurred", () => {
-    const blocked = blockedPlanning();
-    expect(blocked).toMatchObject({
+    const healthy = transitionCollaborationRun(blocked, {
+      type: "PROVIDER_HEALTH_CHANGED",
+      agent: "codex",
+      health: "healthy",
+    });
+    expect(healthy).toMatchObject({
       status: "blocked_no_provider",
-      pendingStageId: "stage-a",
+      pendingStageId: unavailable.stages[0]!.id,
       activeStage: null,
-      failedAttempts: [],
-    });
-
-    let restored = restoreCollaborationRun(serializeCollaborationRun(blocked));
-    restored = transitionCollaborationRun(restored, {
-      type: "PROVIDER_HEALTH_CHANGED",
-      agent: "codex",
-      health: "healthy",
-    });
-    const resumed = transitionCollaborationRun(restored, {
-      type: "RETRY_STAGE_BOUNDARY",
-      stageId: "stage-a",
-    });
-    expect(resumed.activeStage?.assignment).toMatchObject({
-      agent: "codex",
-      effort: "high",
-      reasons: ["stage_baseline:planning:medium", "degraded_fallback"],
-      attemptOrdinal: 0,
     });
   });
 
-  it("uses bounded exponential backoff and never spins before the deadline", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    let blocked = createCollaborationRun({
-      ...makeRun(),
-      retryPolicy,
-      stages: makeRun().stages.filter((item) => !item.systemGenerated),
+  it("restarts exactly once after Codex is healthy and the retry deadline is due", () => {
+    const run = createCollaborationRun({
+      taskId: "retry-once",
+      origin: "grok",
+      health: { grok: "healthy", codex: "unavailable" },
+      stages: [stage("coordination", "coordination")],
     });
-    blocked = completeCoordination(blocked);
-    blocked = transitionCollaborationRun(blocked, { type: "PROVIDER_HEALTH_CHANGED", agent: "grok", health: "unavailable" });
-    blocked = transitionCollaborationRun(blocked, { type: "PROVIDER_HEALTH_CHANGED", agent: "codex", health: "unavailable" });
-    blocked = transitionCollaborationRun(blocked, { type: "BEGIN_STAGE", stageId: "stage-a", now: 0 });
-    expect(blocked.recovery).toMatchObject({ attempt: 0, nextRetryAt: 1_000 });
-
-    const beforeDeadline = serializeCollaborationRun(blocked);
-    for (let now = 0; now < 1_000; now += 10) {
-      blocked = transitionCollaborationRun(blocked, {
-        type: "RECOVERY_TIMER_FIRED",
-        eventId: `early:${now}`,
-        now,
-      });
-    }
-    expect(serializeCollaborationRun(blocked)).toBe(beforeDeadline);
-
-    const scheduledAt: number[] = [blocked.recovery!.nextRetryAt!];
-    for (const now of [1_000, 3_000, 7_000, 11_000]) {
-      blocked = transitionCollaborationRun(blocked, {
-        type: "RECOVERY_TIMER_FIRED",
-        eventId: `due:${now}`,
-        now,
-      });
-      if (blocked.recovery?.nextRetryAt !== null) scheduledAt.push(blocked.recovery!.nextRetryAt);
-    }
-
-    const delays = scheduledAt.slice(1).map((at, index) => at - scheduledAt[index]!);
-    expect(delays.every((delay) => delay <= retryPolicy.maxDelayMs)).toBe(true);
-    expect(blocked).toMatchObject({
-      status: "blocked_retry_exhausted",
-      activeStage: null,
-      recovery: { attempt: retryPolicy.maxAttempts, nextRetryAt: null },
+    let blocked = transitionCollaborationRun(run, {
+      type: "BEGIN_STAGE",
+      stageId: "coordination",
+      now: 0,
     });
-
-    const recoveredAfterExhaustion = transitionCollaborationRun(blocked, {
-      type: "PROVIDER_HEALTH_CHANGED",
-      agent: "codex",
-      health: "healthy",
-    });
-    expect(recoveredAfterExhaustion).toMatchObject({
-      status: "running",
-      pendingStageId: null,
-      activeStage: { id: "stage-a", assignment: { agent: "codex" } },
-    });
-  });
-
-  it("dispatches a recovered fallback exactly once", () => {
-    let restored = blockedPlanning();
-    restored = transitionCollaborationRun(restored, {
+    blocked = transitionCollaborationRun(blocked, {
       type: "PROVIDER_HEALTH_CHANGED",
       agent: "codex",
       health: "healthy",
@@ -475,154 +256,162 @@ describe("v2 durable blocking and recovery", () => {
       eventId: "retry:1000",
       now: 1_000,
     };
-    const recovered = transitionCollaborationRun(restored, due);
+    const recovered = transitionCollaborationRun(blocked, due);
     const duplicate = transitionCollaborationRun(recovered, due);
-
-    expect(recovered.activeStage?.assignment.attemptOrdinal).toBe(0);
-    expect(recovered.dispatches.filter((item) => item.stageId === "stage-a")).toHaveLength(1);
+    expect(recovered.activeStage?.assignment).toMatchObject({
+      agent: "codex",
+      attemptOrdinal: 0,
+    });
+    expect(recovered.dispatches).toHaveLength(1);
     expect(duplicate).toEqual(recovered);
+  });
+
+  it("uses bounded exponential retry and stays blocked after exhaustion", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const run = createCollaborationRun({
+      taskId: "bounded-retry",
+      origin: "codex",
+      health: { grok: "healthy", codex: "unavailable" },
+      retryPolicy: { baseDelayMs: 1_000, maxDelayMs: 4_000, maxAttempts: 4 },
+      stages: [stage("coordination", "coordination")],
+    });
+    let blocked = transitionCollaborationRun(run, {
+      type: "BEGIN_STAGE",
+      stageId: "coordination",
+      now: 0,
+    });
+    const beforeDeadline = serializeCollaborationRun(blocked);
+    for (let now = 0; now < 1_000; now += 50) {
+      blocked = transitionCollaborationRun(blocked, {
+        type: "RECOVERY_TIMER_FIRED",
+        eventId: `early:${now}`,
+        now,
+      });
+    }
+    expect(serializeCollaborationRun(blocked)).toBe(beforeDeadline);
+    for (const now of [1_000, 3_000, 7_000, 11_000]) {
+      blocked = transitionCollaborationRun(blocked, {
+        type: "RECOVERY_TIMER_FIRED",
+        eventId: `due:${now}`,
+        now,
+      });
+    }
+    expect(blocked).toMatchObject({
+      status: "blocked_retry_exhausted",
+      activeStage: null,
+      recovery: { attempt: 4, nextRetryAt: null },
+    });
+    const healthOnly = transitionCollaborationRun(blocked, {
+      type: "PROVIDER_HEALTH_CHANGED",
+      agent: "codex",
+      health: "healthy",
+    });
+    expect(healthOnly.status).toBe("blocked_retry_exhausted");
+    expect(healthOnly.activeStage).toBeNull();
   });
 });
 
-describe("v2 handoff and failback boundaries", () => {
-  it("keeps the fallback owner until the next stage boundary", () => {
-    const fallbackRunning = begin(makeRun({ grok: "unavailable", codex: "healthy" }));
-    expect(fallbackRunning.activeStage?.assignment).toMatchObject({
+describe("routing-v4 persistence and stage ordering", () => {
+  it("blocks ambiguous post-launch reconciliation without synthesizing provider evidence", () => {
+    const running = beginPlanning();
+    const blocked = transitionCollaborationRun(running, {
+      type: "BROKER_RECONCILIATION_REQUIRED",
+      eventId: "run-1:reconciliation-required",
+      stageId: "stage-a",
+      runId: "run-1",
+    });
+    expect(blocked).toMatchObject({
+      status: "blocked_reconciliation",
+      blockedReason: "runner_evidence_reconciliation_required",
+      activeStage: null,
+      pendingStageId: null,
+      conflict: {
+        kind: "runner_evidence_reconciliation_required",
+        stageId: "stage-a",
+        runId: "run-1",
+        requiresNewWorkflowIdentity: true,
+      },
+    });
+    expect(transitionCollaborationRun(blocked, {
+      type: "BROKER_RECONCILIATION_REQUIRED",
+      eventId: "run-1:reconciliation-required",
+      stageId: "stage-a",
+      runId: "run-1",
+    })).toEqual(blocked);
+  });
+
+  it("terminalizes a broker rejection that occurs before a provider launch", () => {
+    const running = beginPlanning();
+    const rejected = transitionCollaborationRun(running, {
+      type: "BROKER_DISPATCH_REJECTED",
+      eventId: "run-2:dispatch-rejected",
+      stageId: "stage-a",
+      runId: "run-2",
+      reason: "invalid_request",
+    });
+    expect(rejected).toMatchObject({
+      status: "terminal_outcome",
+      terminalOutcome: { kind: "invalid_request" },
+      blockedReason: "broker_dispatch_rejected_before_launch",
+      activeStage: null,
+      conflict: {
+        kind: "broker_dispatch_rejected_before_launch",
+        runId: "run-2",
+        reason: "invalid_request",
+        requiresNewWorkflowIdentity: true,
+      },
+    });
+  });
+
+  it("round-trips the exact pinned assignment and failed-attempt evidence", () => {
+    const running = beginPlanning();
+    const blocked = transitionCollaborationRun(running, {
+      type: "PROVIDER_OUTCOME",
+      eventId: "serialize:failure",
       agent: "codex",
-      effort: "high",
-      attemptOrdinal: 0,
-      degraded: true,
+      outcome: { kind: "overload" },
+      now: 10,
     });
+    expect(restoreCollaborationRun(serializeCollaborationRun(blocked))).toEqual(blocked);
+  });
 
-    const preferredRecovered = transitionCollaborationRun(fallbackRunning, {
-      type: "PROVIDER_HEALTH_CHANGED",
-      agent: "grok",
-      health: "healthy",
+  it("does not create another attempt for repeated BEGIN_STAGE", () => {
+    const running = beginPlanning();
+    const duplicate = transitionCollaborationRun(running, {
+      type: "BEGIN_STAGE",
+      stageId: "stage-a",
     });
-    expect(preferredRecovered.activeStage?.assignment.agent).toBe("codex");
+    expect(duplicate).toEqual(running);
+    expect(duplicate.dispatches.filter((item) => item.stageId === "stage-a")).toHaveLength(1);
+  });
 
-    const completed = transitionCollaborationRun(preferredRecovered, {
+  it("requires coordination before planning", () => {
+    const run = makeRun();
+    const premature = transitionCollaborationRun(run, {
+      type: "BEGIN_STAGE",
+      stageId: "stage-a",
+    });
+    expect(premature).toMatchObject({
+      status: "blocked_stage_order",
+      blockedReason: "coordination_required",
+      activeStage: null,
+    });
+  });
+
+  it("keeps Codex ownership at every stage boundary", () => {
+    const first = beginPlanning(makeRun({ grok: "unavailable", codex: "healthy" }));
+    const completed = transitionCollaborationRun(first, {
       type: "COMPLETE_STAGE",
       stageId: "stage-a",
-      resultHash: "result-stage-a",
+      resultHash: "stage-a-result",
     });
-    const next = transitionCollaborationRun(completed, {
+    const second = transitionCollaborationRun(completed, {
       type: "BEGIN_STAGE",
       stageId: "stage-b",
     });
-    expect(next.activeStage?.assignment).toMatchObject({
-      agent: "grok",
-      model: "grok-4.6",
-      effort: "medium",
-      attemptOrdinal: 0,
-      degraded: false,
-    });
-  });
-
-  it("blocks handoff on artifact conflict", () => {
-    const running = begin(makeRun());
-    const conflicted = transitionCollaborationRun(running, {
-      type: "PROVIDER_OUTCOME",
-      eventId: "outcome:conflict",
-      agent: "grok",
-      outcome: { kind: "network_timeout" },
-      handoffEvidence,
-      observedWorktree: { ...observedWorktree, artifactHash: "different-worktree-sha" },
-    });
-
-    expect(conflicted).toMatchObject({
-      status: "blocked_handoff_conflict",
-      blockedReason: "artifact_changed_since_checkpoint",
-      activeStage: { assignment: { agent: "grok" } },
-      conflict: {
-        checkpointHash: artifactHash,
-        currentArtifactHash: "different-worktree-sha",
-      },
-    });
-    expect(conflicted.handoffs).toHaveLength(0);
-    expect(conflicted.failedAttempts).toHaveLength(1);
-  });
-
-  it("blocks handoff whose nextAction targets a different stage", () => {
-    const running = begin(makeRun());
-    const conflicted = transitionCollaborationRun(running, {
-      type: "PROVIDER_OUTCOME",
-      eventId: "outcome:stale-next-action",
-      agent: "grok",
-      outcome: { kind: "network_timeout" },
-      handoffEvidence: {
-        ...handoffEvidence,
-        checkpoint: {
-          ...handoffEvidence.checkpoint,
-          nextAction: {
-            ...handoffEvidence.checkpoint.nextAction,
-            stageId: "stage-b",
-          },
-        },
-      },
-      observedWorktree,
-    });
-
-    expect(conflicted).toMatchObject({
-      status: "blocked_handoff_conflict",
-      conflict: {
-        expectedStageId: "stage-a",
-        checkpointStageId: "stage-b",
-      },
-    });
-    expect(conflicted.dispatches.filter((item) => item.stageId === "stage-a"))
-      .toHaveLength(1);
-  });
-
-  it("blocks handoff on lease or fencing conflict", () => {
-    const running = begin(makeRun());
-    const conflicted = transitionCollaborationRun(running, {
-      type: "PROVIDER_OUTCOME",
-      eventId: "outcome:lease-conflict",
-      agent: "grok",
-      outcome: { kind: "network_timeout" },
-      handoffEvidence,
-      observedWorktree: {
-        ...observedWorktree,
-        leaseId: "lease-held-by-someone-else",
-        fencingToken: 9,
-      },
-    });
-
-    expect(conflicted).toMatchObject({
-      status: "blocked_handoff_conflict",
-      blockedReason: "worktree_lease_conflict",
-      activeStage: { assignment: { agent: "grok" } },
-      conflict: {
-        expectedLeaseId: "lease-task-9-a",
-        observedLeaseId: "lease-held-by-someone-else",
-        expectedFencingToken: 7,
-        observedFencingToken: 9,
-      },
-    });
-    expect(conflicted.handoffs).toHaveLength(0);
-  });
-
-  it("never widens role, artifact, approval or idempotency authority", () => {
-    const running = begin(makeRun());
-    const failedOver = transitionCollaborationRun(running, {
-      type: "PROVIDER_OUTCOME",
-      eventId: "outcome:authority",
-      agent: "grok",
-      outcome: { kind: "overload" },
-      handoffEvidence,
-      observedWorktree,
-    });
-
-    expect(failedOver.activeStage).toMatchObject({
-      role: running.activeStage?.role,
-      artifactRef: running.activeStage?.artifactRef,
-      artifactHash: running.activeStage?.artifactHash,
-      artifactBytes: running.activeStage?.artifactBytes,
-      changedFiles: running.activeStage?.changedFiles,
-      approvalScope: running.activeStage?.approvalScope,
-      idempotencyKey: running.activeStage?.idempotencyKey,
-    });
-    expect(JSON.stringify(failedOver)).not.toMatch(/bypass|workspace-write|full-access/i);
+    expect(first.activeStage?.assignment.agent).toBe("codex");
+    expect(second.activeStage?.assignment.agent).toBe("codex");
+    expect(second.dispatches.every(({ assignment }) => assignment.agent === "codex")).toBe(true);
   });
 });

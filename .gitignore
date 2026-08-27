@@ -8,3 +8,11 @@ coverage/
 *.db
 *.db-shm
 *.db-wal
+# map:update-runtime — local automatic-update state; never commit.
+.map/update-state.json
+.map/update.lock
+.map/provider-refresh.lock
+.map/installer.lock
+.map/gitignore.lock
+# Local MAP learning registry and SQLite coordination state; never review or commit as source.
+.map/agent-collab-admin/

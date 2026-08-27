@@ -5,7 +5,7 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=%h/agent-collab
-ExecStart=/usr/bin/env node %h/agent-collab/dist/cli.js worker
+ExecStart=/usr/bin/env node %h/agent-collab/scripts/agent-collab-launcher.mjs worker
 Restart=on-failure
 RestartSec=3
 UMask=0077

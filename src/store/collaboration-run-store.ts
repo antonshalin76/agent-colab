@@ -16,11 +16,19 @@ export interface WorkflowDispatch {
   workflowId: string;
   dispatch: DispatchRecord;
   stage: ActiveStage;
-  handoff?: CollaborationRun["handoffs"][number];
 }
 
+export type PendingWorkflowDispatch =
+  | { dispatchId: string; workflowId: string; value: WorkflowDispatch }
+  | { dispatchId: string; workflowId: string; error: string };
+
 interface WorkflowRow { state_json: string; version: number }
-interface OutboxRow { dispatch_id: string; workflow_id: string; payload_json: string }
+interface OutboxRow {
+  dispatch_id: string;
+  workflow_id: string;
+  payload_json: string;
+  terminal_reason?: string | null;
+}
 
 const immutableWorkflowInput = (run: CollaborationRun) => sanitizeResult({
   taskId: run.taskId,
@@ -32,34 +40,58 @@ const immutableWorkflowInput = (run: CollaborationRun) => sanitizeResult({
 
 export class CollaborationRunStore {
   private readonly db: Database.Database;
+  private readonly ownsDatabase: boolean;
 
-  constructor(path: string) {
-    this.db = new Database(path);
+  constructor(pathOrDatabase: string | Database.Database) {
+    this.ownsDatabase = typeof pathOrDatabase === "string";
+    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS collaboration_runs (
-        workflow_id TEXT PRIMARY KEY,
-        state_json TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS collaboration_dispatch_outbox (
-        dispatch_id TEXT PRIMARY KEY,
-        workflow_id TEXT NOT NULL REFERENCES collaboration_runs(workflow_id) ON DELETE CASCADE,
-        payload_json TEXT NOT NULL,
-        published_at INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS collaboration_outbox_pending
-        ON collaboration_dispatch_outbox(published_at, dispatch_id);
-    `);
+    const outboxColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(collaboration_dispatch_outbox)").all() as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    const runColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(collaboration_runs)").all() as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    const index = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='index' AND name='collaboration_outbox_pending'",
+    ).get();
+    if (!["workflow_id", "state_json", "version", "updated_at"].every((column) => runColumns.has(column)) ||
+        !["dispatch_id", "workflow_id", "payload_json", "published_at", "terminal_reason"]
+          .every((column) => outboxColumns.has(column)) || index === undefined) {
+      if (this.ownsDatabase) this.db.close();
+      throw new Error("collaboration store requires current migration-owned schema");
+    }
+    const legacy = this.db.prepare("SELECT state_json FROM collaboration_runs ORDER BY workflow_id")
+      .all() as Array<{ state_json: string }>;
+    if (legacy.some(({ state_json }) => {
+      const state = JSON.parse(state_json) as { policyVersion?: unknown };
+      return state.policyVersion !== "routing-v4";
+    })) {
+      if (this.ownsDatabase) this.db.close();
+      throw new Error("collaboration runs require offline routing-v4 migration");
+    }
   }
 
   get(workflowId: string): CollaborationRun | null {
     const row = this.db.prepare("SELECT state_json,version FROM collaboration_runs WHERE workflow_id=?")
       .get(workflowId) as WorkflowRow | undefined;
     return row ? restoreCollaborationRun(row.state_json) : null;
+  }
+
+  assertReplayCompatible(workflowId: string, run: CollaborationRun): CollaborationRun | null {
+    const existing = this.get(workflowId);
+    if (!existing) return null;
+    if (existing.status === "blocked_policy_upgrade") {
+      throw new Error("routing policy upgrade requires a new workflow identity");
+    }
+    if (!isDeepStrictEqual(immutableWorkflowInput(existing), immutableWorkflowInput(run))) {
+      throw new Error("workflow id conflicts with immutable collaboration input");
+    }
+    return existing;
   }
 
   recoverable(): Array<{ workflowId: string; state: CollaborationRun }> {
@@ -80,15 +112,11 @@ export class CollaborationRunStore {
         assignment: structuredClone(dispatch.assignment),
       };
       const dispatchId = `${workflowId}:dispatch:${before.dispatches.length + offset}`;
-      const handoff = dispatch.handoffEventId
-        ? next.handoffs.find((item) => item.eventId === dispatch.handoffEventId)
-        : undefined;
       const payload = sanitizeResult({
         dispatchId,
         workflowId,
         dispatch,
         stage,
-        ...(handoff ? { handoff } : {}),
       });
       const encoded = JSON.stringify(payload);
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO collaboration_dispatch_outbox
@@ -106,15 +134,8 @@ export class CollaborationRunStore {
 
   createStartedIfAbsent(workflowId: string, run: CollaborationRun, event: WorkflowEvent, now = Date.now()): CollaborationRun {
     return this.db.transaction(() => {
-      const existing = this.db.prepare("SELECT state_json,version FROM collaboration_runs WHERE workflow_id=?")
-        .get(workflowId) as WorkflowRow | undefined;
-      if (existing) {
-        const restored = restoreCollaborationRun(existing.state_json);
-        if (!isDeepStrictEqual(immutableWorkflowInput(restored), immutableWorkflowInput(run))) {
-          throw new Error("workflow id conflicts with immutable collaboration input");
-        }
-        return restored;
-      }
+      const existing = this.assertReplayCompatible(workflowId, run);
+      if (existing) return existing;
       const sanitizedRun = sanitizeResult(run);
       const next = transitionCollaborationRun(sanitizedRun, event);
       this.db.prepare(`INSERT INTO collaboration_runs(workflow_id,state_json,version,updated_at) VALUES(?,?,1,?)`)
@@ -146,8 +167,22 @@ export class CollaborationRunStore {
 
   pendingDispatches(limit = 100): WorkflowDispatch[] {
     const rows = this.db.prepare(`SELECT dispatch_id,workflow_id,payload_json FROM collaboration_dispatch_outbox
-      WHERE published_at IS NULL ORDER BY dispatch_id LIMIT ?`).all(limit) as OutboxRow[];
+      WHERE published_at IS NULL AND terminal_reason IS NULL ORDER BY dispatch_id LIMIT ?`).all(limit) as OutboxRow[];
     return rows.map((row) => JSON.parse(row.payload_json) as WorkflowDispatch);
+  }
+
+  pendingDispatchCandidates(limit = 100): PendingWorkflowDispatch[] {
+    const rows = this.db.prepare(`SELECT dispatch_id,workflow_id,payload_json FROM collaboration_dispatch_outbox
+      WHERE published_at IS NULL AND terminal_reason IS NULL ORDER BY dispatch_id LIMIT ?`).all(limit) as OutboxRow[];
+    return rows.map((row) => {
+      try {
+        return { dispatchId: row.dispatch_id, workflowId: row.workflow_id,
+          value: JSON.parse(row.payload_json) as WorkflowDispatch };
+      } catch (error) {
+        return { dispatchId: row.dispatch_id, workflowId: row.workflow_id,
+          error: `invalid outbox payload: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    });
   }
 
   markPublished(dispatchId: string, now = Date.now()): void {
@@ -155,5 +190,40 @@ export class CollaborationRunStore {
       WHERE dispatch_id=? AND published_at IS NULL`).run(now, dispatchId);
   }
 
-  close(): void { this.db.close(); }
+  quarantineDispatch(
+    dispatch: Pick<WorkflowDispatch, "dispatchId" | "workflowId">,
+    reason: string,
+    now = Date.now(),
+  ): void {
+    this.db.transaction(() => {
+      const row = this.db.prepare("SELECT state_json,version FROM collaboration_runs WHERE workflow_id=?")
+        .get(dispatch.workflowId) as WorkflowRow | undefined;
+      if (!row) throw new Error(`Unknown workflow: ${dispatch.workflowId}`);
+      const before = restoreCollaborationRun(row.state_json);
+      const indexText = dispatch.dispatchId.slice(dispatch.dispatchId.lastIndexOf(":") + 1);
+      const index = Number(indexText);
+      const exact = Number.isSafeInteger(index) && index >= 0 &&
+        dispatch.dispatchId === `${dispatch.workflowId}:dispatch:${index}`
+        ? before.dispatches[index]
+        : undefined;
+      const stageId = exact?.stageId ?? before.activeStage?.id;
+      if (stageId) {
+        const next = transitionCollaborationRun(before, {
+          type: "BROKER_DISPATCH_REJECTED", eventId: `${dispatch.dispatchId}:outbox-quarantined`,
+          stageId, runId: dispatch.dispatchId, reason,
+        });
+        const changed = this.db.prepare(`UPDATE collaboration_runs
+          SET state_json=?,version=version+1,updated_at=? WHERE workflow_id=? AND version=?`).run(
+            serializeCollaborationRun(sanitizeResult(next)), now, dispatch.workflowId, row.version,
+          ).changes;
+        if (changed !== 1) throw new Error("Collaboration workflow CAS conflict");
+      }
+      const disposition = JSON.stringify({ kind: "outbox_dispatch_quarantined", reason });
+      this.db.prepare(`UPDATE collaboration_dispatch_outbox
+        SET published_at=COALESCE(published_at,?),terminal_reason=COALESCE(terminal_reason,?)
+        WHERE dispatch_id=?`).run(now, disposition, dispatch.dispatchId);
+    }).immediate();
+  }
+
+  close(): void { if (this.ownsDatabase) this.db.close(); }
 }

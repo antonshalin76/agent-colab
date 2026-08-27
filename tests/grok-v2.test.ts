@@ -9,14 +9,11 @@ import { adaptGrokRecord } from "../src/history/adapters.js";
 import { HistoryIndex } from "../src/history/index.js";
 import type { ActiveAgentId, HistorySourceAgent } from "../src/history/types.js";
 import { HistoryVisibilityPolicy } from "../src/history/visibility-policy.js";
-import { STAGES } from "../src/domain/routing.js";
 import {
   buildGrokCommand,
-  grokWorkspaceWriteToolAllowlist,
   normalizeGrokResult,
 } from "../src/runners/grok.js";
 import {
-  buildProviderCommand,
   type CommandSpec,
 } from "../src/runners/provider-command.js";
 
@@ -25,7 +22,6 @@ const binary = "/home/anton/.local/bin/grok";
 const sessionId = "7dc8d8a4-8c31-4d7f-bda7-cb6b60453fc1";
 const protocolVersion = "agent-collab/v2";
 const readTools = ["read_file", "grep", "list_dir"] as const;
-const writeTools = [...readTools, "run_terminal_cmd", "search_replace"] as const;
 const efforts = ["low", "medium", "high", "xhigh"] as const;
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "history");
 
@@ -75,20 +71,6 @@ function terminalResult(overrides: Record<string, unknown> = {}): string {
 }
 
 describe("BDD-8 exact provider-neutral Grok runner contract", () => {
-  it("derives a deterministic least-privilege workspace tool set from the stage", () => {
-    expect(grokWorkspaceWriteToolAllowlist("code_audit")).toEqual(readTools);
-    expect(grokWorkspaceWriteToolAllowlist("coordination")).toEqual(readTools);
-    expect(grokWorkspaceWriteToolAllowlist("planning")).toEqual(writeTools);
-    expect(grokWorkspaceWriteToolAllowlist("tdd_coding")).toEqual(writeTools);
-    expect(grokWorkspaceWriteToolAllowlist("e2e_testing")).toEqual(writeTools);
-    for (const stage of STAGES) {
-      const first = grokWorkspaceWriteToolAllowlist(stage);
-      expect(grokWorkspaceWriteToolAllowlist(stage)).toEqual(first);
-      expect(new Set(first).size).toBe(first.length);
-      expect(first.every((tool) => writeTools.includes(tool as typeof writeTools[number]))).toBe(true);
-    }
-  });
-
   it.each(efforts)("builds the exact least-privilege read command at %s effort", (effort) => {
     const command = buildGrokCommand({
       binary,
@@ -136,55 +118,6 @@ describe("BDD-8 exact provider-neutral Grok runner contract", () => {
     expect(command.args).not.toContain("--always-approve");
   });
 
-  it.each(efforts)("builds the exact approved workspace command at %s effort", (effort) => {
-    const input = {
-      binary,
-      cwd: "/repo",
-      prompt: "implement",
-      sessionId,
-      approvalScope: "workspace-write" as const,
-      approvalReference: "approval:grok-write",
-      effort,
-      toolAllowlist: writeTools,
-      timeoutMs: 90_000,
-    };
-    const expected: CommandSpec = {
-      file: binary,
-      args: [
-        "--cwd",
-        "/repo",
-        "--model",
-        "grok-4.6",
-        "--reasoning-effort",
-        effort,
-        "--prompt-file",
-        "/dev/stdin",
-        "--verbatim",
-        "--output-format",
-        "json",
-        "--session-id",
-        sessionId,
-        "--no-subagents",
-        "--disable-web-search",
-        "--deny",
-        "mcp__*",
-        "--sandbox",
-        "strict",
-        "--always-approve",
-        "--tools",
-        writeTools.join(","),
-      ],
-      cwd: "/repo",
-      stdin: "implement",
-      shell: false,
-      timeoutMs: 90_000,
-      killProcessGroup: true,
-    };
-
-    expect(buildGrokCommand(input)).toEqual(expected);
-    expect(buildProviderCommand({ agent: "grok", command: input })).toEqual(expected);
-  });
-
   it("does not mint write or external authority inside a command builder", () => {
     const base = {
       binary,
@@ -197,14 +130,13 @@ describe("BDD-8 exact provider-neutral Grok runner contract", () => {
     expect(() => buildGrokCommand({
       ...base,
       approvalScope: "workspace-write",
-      toolAllowlist: writeTools,
-    })).toThrow(/approval/i);
+      toolAllowlist: ["run_terminal_cmd"],
+    } as unknown as Parameters<typeof buildGrokCommand>[0])).toThrow(/workspace-read/i);
     expect(() => buildGrokCommand({
       ...base,
       approvalScope: "external",
       approvalReference: "approval:external",
-      toolAllowlist: writeTools,
-    })).toThrow(/scope|external/i);
+    } as unknown as Parameters<typeof buildGrokCommand>[0])).toThrow(/workspace-read/i);
   });
 
   it("accepts only terminal exact-model protocol evidence and returns visible text", () => {
@@ -215,12 +147,38 @@ describe("BDD-8 exact provider-neutral Grok runner contract", () => {
     expect(result).toEqual({
       text: "visible Grok answer",
       model: "grok-4.6",
+      providerReportedModel: "grok-4.6",
+      modelProvenance: "provider_reported_alias",
       effort: "xhigh",
       protocolVersion,
     });
     expect(JSON.stringify(result)).not.toMatch(
       /PRIVATE_THOUGHT|ENCRYPTED_REASONING|TOOL_ARGUMENT|TOOL_RESULT|RAW_RECORD/,
     );
+  });
+
+  it("prefers Grok 1.0.5 structuredOutput over concatenated per-turn text", () => {
+    const result = normalizeGrokResult(terminalResult({
+      text: `${JSON.stringify({
+        protocolVersion,
+        reasoningEffort: "xhigh",
+        visibleText: "progress",
+      })}${JSON.stringify({
+        protocolVersion,
+        reasoningEffort: "xhigh",
+        visibleText: "final",
+      })}`,
+      structuredOutput: {
+        protocolVersion,
+        reasoningEffort: "xhigh",
+        visibleText: "final",
+      },
+    }), {
+      expectedEffort: "xhigh",
+      expectedProtocolVersion: protocolVersion,
+    });
+
+    expect(result.text).toBe("final");
   });
 
   it.each([

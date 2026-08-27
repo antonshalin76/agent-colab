@@ -1,10 +1,9 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import type { Stage } from "../domain/routing.js";
 import type { CommandSpec } from "./provider-command.js";
 
 export type GrokEffort = "low" | "medium" | "high" | "xhigh";
-export type GrokApprovalScope = "workspace-read" | "workspace-write" | "external";
+export type GrokApprovalScope = "workspace-read";
 
 export interface GrokCommandInput {
   binary: string;
@@ -12,35 +11,40 @@ export interface GrokCommandInput {
   prompt: string;
   sessionId: string;
   approvalScope: GrokApprovalScope;
-  approvalReference?: string;
   effort: GrokEffort;
-  toolAllowlist?: readonly string[];
   timeoutMs: number;
 }
 
 export interface NormalizedGrokResult {
   text: string;
   model: "grok-4.6";
+  providerReportedModel: "grok-4.6" | "grok-4.6-build";
+  modelProvenance: "provider_reported_alias";
   effort: GrokEffort;
   protocolVersion: string;
+}
+export interface NormalizedGrokEvalResult extends NormalizedGrokResult {
+  visibleTextProvenance: "provider_structured" | "command_pinned_plain_text";
+  usage: GrokUsageTelemetry;
+}
+
+interface GrokUsageTelemetry {
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+  costUsd: number | null;
+  provenance: Record<
+    "inputTokens" | "cachedInputTokens" | "outputTokens" | "reasoningTokens" | "totalTokens" | "costUsd",
+    "provider_reported" | "unavailable"
+  >;
 }
 
 const DEFAULT_GROK_BINARY = join(homedir(), ".local", "bin", "grok");
 const MODEL = "grok-4.6";
+const REPORTED_MODEL_IDS = new Set([MODEL, "grok-4.6-build"]);
 const READ_TOOLS = ["read_file", "grep", "list_dir"] as const;
-const WRITE_TOOLS = ["run_terminal_cmd", "search_replace"] as const;
-const BUILTIN_TOOLS: ReadonlySet<string> = new Set([...READ_TOOLS, ...WRITE_TOOLS]);
-const MUTATING_STAGES: ReadonlySet<Stage> = new Set([
-  "planning",
-  "prd",
-  "architecture",
-  "ui_ux",
-  "bdd",
-  "tdd_coding",
-  "unit_testing",
-  "e2e_infrastructure",
-  "e2e_testing",
-]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_RESULT_BYTES = 1024 * 1024;
 const EXECUTABLE_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh"]);
@@ -51,26 +55,56 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function writeTools(input: GrokCommandInput): readonly string[] {
-  if (!input.approvalReference?.trim()) {
-    throw new Error("workspace write requires an explicit approval reference");
+function reportedNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
   }
-  const tools = input.toolAllowlist;
-  if (!tools?.length) throw new Error("workspace write requires a stage tool allowlist");
-  if (new Set(tools).size !== tools.length) throw new Error("tool allowlist contains duplicates");
-  for (const tool of tools) {
-    if (!BUILTIN_TOOLS.has(tool)) throw new Error(`tool allowlist contains unsupported built-in: ${tool}`);
-  }
-  return tools;
+  return null;
 }
 
-export function grokWorkspaceWriteToolAllowlist(stage: Stage): readonly string[] {
-  return MUTATING_STAGES.has(stage)
-    ? [...READ_TOOLS, ...WRITE_TOOLS]
-    : [...READ_TOOLS];
+function usageTelemetry(
+  source: Record<string, unknown>,
+  summary: Record<string, unknown> | null,
+  envelope: Record<string, unknown>,
+): GrokUsageTelemetry {
+  const values = {
+    inputTokens: reportedNumber(source.inputTokens, summary?.input_tokens),
+    cachedInputTokens: reportedNumber(
+      source.cacheReadInputTokens,
+      source.cachedInputTokens,
+      summary?.cache_read_input_tokens,
+    ),
+    outputTokens: reportedNumber(source.outputTokens, summary?.output_tokens),
+    reasoningTokens: reportedNumber(
+      source.reasoningTokens,
+      source.reasoningOutputTokens,
+      summary?.reasoning_tokens,
+    ),
+    totalTokens: reportedNumber(source.totalTokens, summary?.total_tokens),
+    costUsd: reportedNumber(source.costUSD, source.costUsd, envelope.total_cost_usd),
+  };
+  return {
+    ...values,
+    provenance: {
+      inputTokens: values.inputTokens === null ? "unavailable" : "provider_reported",
+      cachedInputTokens: values.cachedInputTokens === null ? "unavailable" : "provider_reported",
+      outputTokens: values.outputTokens === null ? "unavailable" : "provider_reported",
+      reasoningTokens: values.reasoningTokens === null ? "unavailable" : "provider_reported",
+      totalTokens: values.totalTokens === null ? "unavailable" : "provider_reported",
+      costUsd: values.costUsd === null ? "unavailable" : "provider_reported",
+    },
+  };
 }
 
 export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
+  const untrusted = input as GrokCommandInput & Record<string, unknown>;
+  if (
+    input.approvalScope !== "workspace-read" ||
+    Object.hasOwn(untrusted, "approvalReference") ||
+    Object.hasOwn(untrusted, "toolAllowlist")
+  ) {
+    throw new Error("Grok command authority is fixed to workspace-read");
+  }
   if (!isAbsolute(input.binary)) throw new Error("Grok binary must be absolute");
   const trustedBinary = process.env.AGENT_COLLAB_GROK_BIN ?? DEFAULT_GROK_BINARY;
   if (input.binary !== trustedBinary) throw new Error(`Grok binary identity mismatch: ${input.binary}`);
@@ -81,12 +115,6 @@ export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
   if (!UUID.test(input.sessionId)) throw new Error("Grok session id must be a fresh UUIDv4");
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
     throw new Error("Grok timeout must be a positive integer");
-  }
-  if (input.approvalScope === "external") {
-    throw new Error("external scope is not a supported Grok command sandbox");
-  }
-  if (input.approvalScope === "workspace-read" && input.toolAllowlist !== undefined) {
-    throw new Error("read scope uses the fixed least-privilege tool allowlist");
   }
 
   const args = [
@@ -108,24 +136,14 @@ export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
     "--deny",
     "mcp__*",
   ];
-  if (input.approvalScope === "workspace-read") {
-    args.push(
-      "--sandbox",
-      "strict",
-      "--permission-mode",
-      "dontAsk",
-      "--tools",
-      READ_TOOLS.join(","),
-    );
-  } else {
-    args.push(
-      "--sandbox",
-      "strict",
-      "--always-approve",
-      "--tools",
-      writeTools(input).join(","),
-    );
-  }
+  args.push(
+    "--sandbox",
+    "strict",
+    "--permission-mode",
+    "dontAsk",
+    "--tools",
+    READ_TOOLS.join(","),
+  );
   return {
     file: input.binary,
     args,
@@ -139,8 +157,26 @@ export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
 
 export function normalizeGrokResult(
   stdout: string,
-  expected: { expectedEffort: GrokEffort; expectedProtocolVersion: string },
-): NormalizedGrokResult {
+  expected: {
+    expectedEffort: GrokEffort;
+    expectedProtocolVersion: string;
+    includeUsage: true;
+    allowPlainVisibleText?: boolean;
+  },
+): NormalizedGrokEvalResult;
+export function normalizeGrokResult(
+  stdout: string,
+  expected: { expectedEffort: GrokEffort; expectedProtocolVersion: string; includeUsage?: false },
+): NormalizedGrokResult;
+export function normalizeGrokResult(
+  stdout: string,
+  expected: {
+    expectedEffort: GrokEffort;
+    expectedProtocolVersion: string;
+    includeUsage?: boolean;
+    allowPlainVisibleText?: boolean;
+  },
+): NormalizedGrokResult | NormalizedGrokEvalResult {
   if (Buffer.byteLength(stdout, "utf8") > MAX_RESULT_BYTES) {
     throw new Error("Grok result exceeds the bounded parser limit");
   }
@@ -157,14 +193,30 @@ export function normalizeGrokResult(
     throw new Error("Grok result has an error or nonterminal stop reason");
   }
   const usage = record(envelope.modelUsage);
-  if (!usage || Object.keys(usage).length !== 1 || !record(usage[MODEL])) {
+  const reportedModels = usage ? Object.keys(usage) : [];
+  const providerReportedModel = reportedModels[0];
+  const modelUsage = usage && providerReportedModel ? record(usage[providerReportedModel]) : null;
+  if (!usage || reportedModels.length !== 1 || !providerReportedModel
+      || !REPORTED_MODEL_IDS.has(providerReportedModel) || !modelUsage) {
     throw new Error("model identity mismatch: expected grok-4.6 modelUsage");
   }
-  let payload: Record<string, unknown> | null;
-  try {
-    payload = record(JSON.parse(envelope.text));
-  } catch {
-    throw new Error("malformed Grok visible result parse");
+  let payload = record(envelope.structuredOutput);
+  let visibleTextProvenance: NormalizedGrokEvalResult["visibleTextProvenance"] =
+    "provider_structured";
+  if (payload === null) {
+    try {
+      payload = record(JSON.parse(envelope.text));
+    } catch {
+      if (!expected.allowPlainVisibleText || !envelope.text.trim()) {
+        throw new Error("malformed Grok visible result parse");
+      }
+      payload = {
+        protocolVersion: expected.expectedProtocolVersion,
+        reasoningEffort: expected.expectedEffort,
+        visibleText: envelope.text,
+      };
+      visibleTextProvenance = "command_pinned_plain_text";
+    }
   }
   if (!payload || payload.protocolVersion !== expected.expectedProtocolVersion) {
     throw new Error("Grok protocol mismatch");
@@ -175,10 +227,19 @@ export function normalizeGrokResult(
   if (typeof payload.visibleText !== "string" || !payload.visibleText.trim()) {
     throw new Error("incomplete Grok result: missing visible text");
   }
-  return {
+  const base: NormalizedGrokResult = {
     text: payload.visibleText,
     model: MODEL,
+    providerReportedModel: providerReportedModel as "grok-4.6" | "grok-4.6-build",
+    modelProvenance: "provider_reported_alias",
     effort: expected.expectedEffort,
     protocolVersion: expected.expectedProtocolVersion,
   };
+  return expected.includeUsage
+    ? {
+      ...base,
+      visibleTextProvenance,
+      usage: usageTelemetry(modelUsage, record(envelope.usage), envelope),
+    }
+    : base;
 }

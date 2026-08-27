@@ -19,6 +19,7 @@ export const TERMINAL_OUTCOMES = [
 ] as const;
 
 export type OutcomeKind = (typeof FAILOVER_OUTCOMES)[number] | (typeof TERMINAL_OUTCOMES)[number];
+export type FailoverOutcomeKind = (typeof FAILOVER_OUTCOMES)[number];
 export interface ProviderOutcome {
   kind: OutcomeKind;
 }
@@ -26,8 +27,11 @@ export interface ProviderOutcome {
 const FAILOVER_SET: ReadonlySet<string> = new Set(FAILOVER_OUTCOMES);
 const TERMINAL_SET: ReadonlySet<string> = new Set(TERMINAL_OUTCOMES);
 
+export const isFailoverOutcome = (kind: unknown): kind is FailoverOutcomeKind =>
+  typeof kind === "string" && FAILOVER_SET.has(kind);
+
 export function classifyOutcome(outcome: ProviderOutcome) {
-  if (FAILOVER_SET.has(outcome.kind)) {
+  if (isFailoverOutcome(outcome.kind)) {
     return { failoverEligible: true, countsAgainstProvider: true } as const;
   }
   if (TERMINAL_SET.has(outcome.kind)) {

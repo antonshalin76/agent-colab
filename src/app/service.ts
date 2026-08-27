@@ -7,17 +7,32 @@ import { HistoryIndex } from "../history/index.js";
 import { buildHistoryContext } from "../history/context.js";
 import { HistoryVisibilityPolicy } from "../history/visibility-policy.js";
 import type { CollabService, DelegateInput, ReviewInput, SearchInput } from "../mcp/server.js";
-import { createCollaborationRun } from "../workflow/workflow.js";
+import { createCollaborationRun, type StageDefinition } from "../workflow/workflow.js";
 import { preferredAgentForStage, routeStage, stageRequiresReadOnly } from "../domain/routing.js";
 import { RunStore } from "../store/run-store.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
+import { executionAuthorityConsumerKey, snapshotFromBinding } from "../flow/execution-snapshot.js";
 import { defaultAllowedProjectRoots, ProjectPolicy } from "../security/project-policy.js";
 import { ProviderHealthStore } from "../runtime/provider-health-store.js";
-import { ReviewBarrierStore } from "../runtime/review-barrier-store.js";
+import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
 import { CollaborationRuntime } from "../runtime/collaboration-runtime.js";
 import { redactSensitive } from "../security/redaction.js";
 import { auditSharedSkills } from "../skills/audit.js";
+import {
+  createCurrentMapLearningLaunchBinding,
+  formatMapLearningLaunchBindingContext,
+  MapControlPlane,
+  type MapLearningEvidenceInput,
+  type MapLearningEvidenceReconciliation,
+  type MapLearningBytesInput,
+} from "../flow/map-admin.js";
+import {
+  mapAdmissionGates,
+  mapAdmissionReviewExpectation,
+  mapProfileSha256,
+  type MapAdmissionProof,
+} from "../flow/map-admission.js";
 
 const walk = (root: string, suffix: string): string[] => {
   if (!existsSync(root)) return [];
@@ -115,8 +130,9 @@ export const grokWorkspaceMemoryDirectory = (project: string, userRoot = homedir
 
 export class LocalCollabService implements CollabService {
   readonly runs: RunStore; readonly history: HistoryIndex; readonly approvals: ApprovalLedger;
-  readonly providers: ProviderHealthStore; readonly reviews: ReviewBarrierStore;
+  readonly providers: ProviderHealthStore; readonly reviews: RunGateUnitOfWork;
   readonly runtime: CollaborationRuntime;
+  private readonly mapControl: MapControlPlane;
   private readonly projects: ProjectPolicy;
   private readonly sharedSkillsRoot = join(homedir(), ".agents", "skills");
   private readonly agentSkillRoots: Readonly<Record<"grok" | "codex", string>>;
@@ -128,7 +144,8 @@ export class LocalCollabService implements CollabService {
     if (historyDatabase !== ":memory:") chmodSync(historyDatabase, 0o600);
     this.approvals = new ApprovalLedger(stateDatabase);
     this.providers = new ProviderHealthStore(stateDatabase, { cooldownMs: 60_000 });
-    this.reviews = new ReviewBarrierStore(stateDatabase);
+    this.reviews = new RunGateUnitOfWork(stateDatabase);
+    this.mapControl = new MapControlPlane(stateDatabase);
     this.runtime = new CollaborationRuntime(stateDatabase);
     this.projects = new ProjectPolicy(options?.allowedRoots ?? defaultAllowedProjectRoots());
     this.agentSkillRoots = options?.agentSkillRoots ?? {
@@ -163,11 +180,11 @@ export class LocalCollabService implements CollabService {
     }
     return buildHistoryContext({ rows });
   }
-  private authorize(project: string, scope: "workspace-read" | "workspace-write" | "external", reference?: string,
+  private assertAuthorized(project: string, scope: "workspace-read" | "workspace-write" | "external", reference?: string,
     consumerKey?: string): void {
     if (scope === "workspace-read") return;
     if (!reference) throw new Error(`${scope} requires a durable approval reference`);
-    const result = this.approvals.validateAndConsume({ reference, project, scope,
+    const result = this.approvals.validate({ reference, project, scope,
       ...(consumerKey ? { consumerKey } : {}) });
     if (!result.allowed) throw new Error(`approval denied: ${result.reason}`);
   }
@@ -177,6 +194,77 @@ export class LocalCollabService implements CollabService {
       agentRoots: this.agentSkillRoots,
     });
     if (!audit.consistent) throw new Error("shared skill manifest is unavailable or divergent");
+  }
+  private reviewRuns(reviewId: string, requester: "grok" | "codex") {
+    return this.reviews.enqueueDescriptors(reviewId)
+      .map((lane) => {
+        if (lane.requester !== requester) {
+          throw new Error("review requester changed before durable enqueue");
+        }
+        const run = this.runs.getByIdempotencyKey(lane.idempotencyKey);
+        if (!run) throw new Error("atomic review run is missing");
+        return run;
+      });
+  }
+  closeMapLearning(input: MapLearningBytesInput) {
+    return this.mapControl.closeLearning(input);
+  }
+  recordMapLearningEvidence(input: MapLearningEvidenceInput) {
+    return this.mapControl.recordLearningEvidence(input);
+  }
+  inspectMapLearningEvidenceClaim(id: string) {
+    return this.mapControl.inspectLearningEvidenceClaim(id);
+  }
+  reconcileMapLearningEvidenceClaim(id: string, input: MapLearningEvidenceReconciliation) {
+    return this.mapControl.reconcileLearningEvidenceClaim(id, input);
+  }
+  private ensureMapAdmission(
+    input: DelegateInput,
+    project: string,
+    workflow: ReturnType<typeof createCollaborationRun>,
+  ) {
+    const target = this.runtime.reviewTarget(workflow, input.idempotencyKey);
+    const snapshot = snapshotFromBinding(target.binding);
+    const profile = snapshot.mapProfile;
+    const source = snapshot.workspace;
+    const gates = mapAdmissionGates(input.stage);
+    if (gates.length === 0) return { satisfied: true, profile, gates: [] };
+    const health = routingHealth(this.providers.snapshot());
+    const snapshots = gates.map((gate) => {
+      const expectation = mapAdmissionReviewExpectation({
+        project,
+        targetStageId: input.idempotencyKey,
+        gate,
+        artifact: target.bytes,
+        sourceFingerprint: source.fingerprint,
+        changedFiles: source.changedFiles.length,
+      });
+      this.reviews.create({
+        ...expectation,
+        health,
+        createdAt: Date.now(),
+      });
+      const { reviewId } = expectation;
+      const runs = this.reviewRuns(reviewId, "codex");
+      return { name: gate.name, reviewId, barrier: this.reviews.barrier(reviewId), runIds: runs.map((run) => run.id) };
+    });
+    return {
+      satisfied: snapshots.every(({ barrier }) => barrier.satisfied),
+      profile,
+      gates: snapshots,
+      proof: {
+        schemaVersion: "map-admission/v1",
+        targetStageId: input.idempotencyKey,
+        targetSha256: target.binding.snapshotSha256,
+        sourceFingerprint: source.fingerprint,
+        mapProfileSha256: mapProfileSha256(profile),
+        gates: snapshots.map(({ name, reviewId }, index) => ({
+          name,
+          stageId: gates[index]!.stageId,
+          reviewId,
+        })),
+      } satisfies MapAdmissionProof,
+    };
   }
   async delegate(input: DelegateInput) {
     this.assertSharedSkills();
@@ -191,27 +279,57 @@ export class LocalCollabService implements CollabService {
     if (redactSensitive(input.artifactContent) !== input.artifactContent) {
       throw new Error("delegated artifact contains credential material and cannot be persisted exactly");
     }
+    if (redactSensitive(input.prompt) !== input.prompt) {
+      throw new Error("delegated prompt contains credential material and cannot be persisted exactly");
+    }
     const policyOwner = preferredAgentForStage(input.stage);
-    if (input.preferredAgent && input.preferredAgent !== policyOwner) throw new Error(`routing policy requires ${policyOwner} for ${input.stage}`);
+    if (input.preferredAgent && input.preferredAgent !== policyOwner) {
+      throw new Error(`routing policy requires ${policyOwner} for ${input.stage}`);
+    }
     const persistedInputKey = scopedIdempotencyKey(project, input.idempotencyKey);
     const existingWorkflow = this.runtime.workflows.get(persistedInputKey);
+    const workspace = captureWorkspaceFingerprint(project);
+    const mapLearning = createCurrentMapLearningLaunchBinding("codex");
+    const workflowPrompt = `${input.stage === "planning" ? "MAP control plane: use the installed map-plan contract before proposing implementation.\n\n" : ""}${formatMapLearningLaunchBindingContext(mapLearning)}\n\n${input.prompt}\n\nImmutable artifact (${input.artifactHash}):\n${input.artifactContent}`;
     const taskId = input.taskId ?? input.idempotencyKey.split(":")[0] ?? input.idempotencyKey;
     const workflowTaskId = scopedIdempotencyKey(project, taskId);
     const providerSnapshot = this.providers.snapshot();
     const health = routingHealth(providerSnapshot);
-    const workspace = captureWorkspaceFingerprint(project);
+    const targetStage: StageDefinition = { id: input.idempotencyKey, kind: input.stage,
+      role: input.stage === "coordination" ? "coordinator" as const : "stage-owner" as const,
+      artifactRef: `artifact:${input.artifactHash}`, artifactHash: input.artifactHash,
+      artifactBytes: artifact.length, changedFiles: workspace.changedFiles.length,
+      approvalScope: input.approvalScope, idempotencyKey: persistedInputKey,
+      project, prompt: workflowPrompt, requester: input.requester,
+      sourceFingerprint: workspace.fingerprint, mapLearning };
+    if (input.approvalScope !== "workspace-read") {
+      targetStage.authorizationConsumerKey = executionAuthorityConsumerKey(persistedInputKey, targetStage);
+    }
     const workflow = createCollaborationRun({
       taskId: workflowTaskId, origin: input.requester, health,
-      stages: [{ id: input.idempotencyKey, kind: input.stage, role: input.stage === "coordination" ? "coordinator" : "stage-owner",
-        artifactRef: `artifact:${input.artifactHash}`, artifactHash: input.artifactHash,
-        artifactBytes: artifact.length, changedFiles: workspace.changedFiles.length,
-        approvalScope: input.approvalScope, idempotencyKey: persistedInputKey,
-        project, prompt: `${input.prompt}\n\nImmutable artifact (${input.artifactHash}):\n${input.artifactContent}`,
-        requester: input.requester,
-        ...(input.approvalReference ? { approvalReference: input.approvalReference } : {}) }],
+      stages: [targetStage],
     });
-    if (!existingWorkflow) this.authorize(project, input.approvalScope, input.approvalReference, persistedInputKey);
-    const state = this.runtime.createAndStart(persistedInputKey, workflow);
+    const candidate = this.runtime.prepareCandidate(persistedInputKey, workflow);
+    if (!existingWorkflow) {
+      this.assertAuthorized(project, input.approvalScope, input.approvalReference,
+        targetStage.authorizationConsumerKey);
+    }
+    const mapAdmission = this.ensureMapAdmission(input, project, candidate);
+    if (!mapAdmission.satisfied) {
+      return {
+        runId: persistedInputKey,
+        assignedAgent: "codex",
+        status: "blocked_map_admission",
+        mapAdmission,
+      };
+    }
+    const state = this.runtime.createAndStart(
+      persistedInputKey,
+      candidate,
+      mapAdmission.proof === undefined ? [] : [mapAdmission.proof],
+      Date.now(),
+      input.approvalReference,
+    );
     this.runtime.drainDispatchOutbox(this.runs);
     const requestedStage = state.stages.find((stage) => stage.id === input.idempotencyKey)!;
     let assignedAgent = state.activeStage?.id === requestedStage.id
@@ -243,20 +361,7 @@ export class LocalCollabService implements CollabService {
       prompts: { auditor: `AUDITOR independent lane. ${safePrompt}`, critic: `CRITIC independent lane. ${safePrompt}` },
       createdAt: Date.now(), project, requester: input.requester,
       sourceFingerprint: source.fingerprint, changedFiles: source.changedFiles.length });
-    const runs = this.reviews.enqueueDescriptors(reviewId).map((lane) => this.runs.enqueueExact({
-      idempotencyKey: lane.idempotencyKey, stage: `review:${lane.role}`, priority: 5,
-      artifactHash: lane.artifactHash, approvalScope: "workspace-read",
-      payload: { requester: input.requester, preferredAgent: lane.agent, project,
-        prompt: `${lane.prompt}\n\nImmutable artifact (${lane.artifactHash}):\n${lane.artifact.toString("utf8")}`,
-        approvalScope: "workspace-read", allowFallback: false, reviewRole: lane.role,
-        decision: { agent: lane.agent, model: lane.model, effort: lane.effort,
-          policyVersion: lane.policyVersion, reasons: lane.reasons },
-        reviewDispatchIdentity: { agent: lane.agent, model: lane.model, effort: lane.effort,
-          policyVersion: lane.policyVersion, reasons: lane.reasons, sessionId: lane.sessionId,
-          attemptId: lane.attemptId, attemptOrdinal: lane.attemptOrdinal, degraded: lane.degraded },
-        reviewId, sessionId: lane.sessionId, artifactHash: lane.artifactHash,
-        reviewAttemptId: lane.attemptId, reviewAttemptOrdinal: lane.attemptOrdinal },
-    }));
+    const runs = this.reviewRuns(reviewId, input.requester);
     return { reviewId, laneCount: 4, activeLaneCount: runs.length, runState: review.runState, runIds: runs.map((lane) => lane.id) };
   }
   async runStatus(input: { runId: string }) {
@@ -311,5 +416,5 @@ export class LocalCollabService implements CollabService {
     this.history.reconcileSources({ agent: "codex", project, presentPaths: [...codexThreads, ...nativeMemoryPaths.codex] });
     return { indexed, warnings, memorySources };
   }
-  close(): void { this.history.close(); this.runs.close(); this.approvals.close(); this.providers.close(); this.reviews.close(); this.runtime.close(); }
+  close(): void { this.history.close(); this.runs.close(); this.approvals.close(); this.providers.close(); this.reviews.close(); this.mapControl.close(); this.runtime.close(); }
 }

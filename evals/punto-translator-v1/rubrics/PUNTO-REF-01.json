@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "characterized-config-behavior", "weight": 35, "hardGate": true, "command": ["bash", "-lc", "cmake -S cpp -B build-eval -DBUILD_TRAY=OFF -DCMAKE_BUILD_TYPE=Debug && cmake --build build-eval -j2 && ctest --test-dir build-eval --output-on-failure"] },
+    { "id": "single-parser-owner", "weight": 35, "hardGate": false, "evaluator": "single-config-parser-owner" },
+    { "id": "maintained-code-reduction", "weight": 20, "hardGate": false, "evaluator": "owned-surface-delta" },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

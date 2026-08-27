@@ -21,21 +21,20 @@ export interface WorktreeLease {
   expiresAt: number;
 }
 
-export interface HandoffRecord {
-  from: AgentId;
-  to: AgentId;
+export interface PolicyFenceRecord {
+  kind: "routing_policy_fence";
+  from: "grok";
+  policyVersion: "routing-v4";
   previousLeaseId: string;
   fencingToken: number;
-  evidence: unknown;
   recordedAt: number;
 }
+
+export type LeaseAuditRecord = PolicyFenceRecord;
 
 type AcquireResult =
   | { status: "acquired"; lease: WorktreeLease }
   | { status: "contended"; currentLease: WorktreeLease };
-type TransferResult =
-  | { status: "transferred"; lease: WorktreeLease; handoff: HandoffRecord }
-  | { status: "fenced"; currentFencingToken: number };
 type MutationResult =
   | { status: "renewed"; lease: WorktreeLease }
   | { status: "released" }
@@ -48,6 +47,7 @@ interface LeaseRow {
   holder: AgentId;
   fencing_token: number;
   expires_at: number;
+  authority_policy?: string;
 }
 
 interface HandoffRow {
@@ -90,7 +90,9 @@ export class WorktreeLeaseStore {
         lease_id TEXT NOT NULL,
         holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
         fencing_token INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        authority_policy TEXT NOT NULL DEFAULT 'routing-v4'
+          CHECK (authority_policy IN ('routing-v3', 'routing-v4'))
       );
       CREATE TABLE IF NOT EXISTS worktree_handoffs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,11 +103,56 @@ export class WorktreeLeaseStore {
       CREATE INDEX IF NOT EXISTS idx_worktree_handoffs_task
         ON worktree_handoffs(task_id, id);
     `);
+    const leaseColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!leaseColumns.has("authority_policy")) {
+      this.db.exec(`ALTER TABLE worktree_leases
+        ADD COLUMN authority_policy TEXT NOT NULL DEFAULT 'routing-v3'
+          CHECK (authority_policy IN ('routing-v3', 'routing-v4'))`);
+    }
+    this.fenceLegacyGrokLeases(Date.now());
     try {
       assertFreshV2Schema(this.db);
     } catch (error) {
       this.db.close();
       throw error;
+    }
+  }
+
+  private fenceLegacyGrokLeases(now: number): void {
+    this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT * FROM worktree_leases
+        WHERE holder='grok' AND authority_policy!='routing-v4'
+        ORDER BY worktree_path`).all() as LeaseRow[];
+      for (const row of rows) {
+        const fencingToken = row.fencing_token + 1;
+        const changed = this.db.prepare(`UPDATE worktree_leases
+          SET fencing_token=?,expires_at=?,authority_policy='routing-v4'
+          WHERE worktree_path=? AND lease_id=? AND holder='grok'
+            AND fencing_token=? AND authority_policy!='routing-v4'`)
+          .run(fencingToken, now, row.worktree_path, row.lease_id, row.fencing_token);
+        if (changed.changes !== 1) throw new Error("legacy Grok lease fencing conflict");
+        const event: PolicyFenceRecord = {
+          kind: "routing_policy_fence",
+          from: "grok",
+          policyVersion: "routing-v4",
+          previousLeaseId: row.lease_id,
+          fencingToken,
+          recordedAt: now,
+        };
+        this.db.prepare("INSERT INTO worktree_handoffs(task_id,recorded_at,payload) VALUES(?,?,?)")
+          .run(row.task_id, now, JSON.stringify(event));
+      }
+      this.db.prepare(`UPDATE worktree_leases SET authority_policy='routing-v4'
+        WHERE holder='codex' AND authority_policy!='routing-v4'`).run();
+    }).immediate();
+  }
+
+  private assertCodexWriter(holder: AgentId): void {
+    if (holder !== "codex") {
+      throw new Error("Grok cannot hold writer authority; Codex is the sole writer");
     }
   }
 
@@ -131,6 +178,7 @@ export class WorktreeLeaseStore {
     now: number;
     ttlMs: number;
   }): Promise<AcquireResult> {
+    this.assertCodexWriter(input.holder);
     const transaction = this.db.transaction((): AcquireResult => {
       const existing = this.row(input.worktreePath);
       if (existing !== undefined && existing.expires_at > input.now) {
@@ -147,14 +195,15 @@ export class WorktreeLeaseStore {
       this.db
         .prepare(
           `INSERT INTO worktree_leases
-             (worktree_path, task_id, lease_id, holder, fencing_token, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+             (worktree_path, task_id, lease_id, holder, fencing_token, expires_at, authority_policy)
+           VALUES (?, ?, ?, ?, ?, ?, 'routing-v4')
            ON CONFLICT(worktree_path) DO UPDATE SET
              task_id = excluded.task_id,
              lease_id = excluded.lease_id,
              holder = excluded.holder,
              fencing_token = excluded.fencing_token,
-             expires_at = excluded.expires_at`,
+             expires_at = excluded.expires_at,
+             authority_policy = excluded.authority_policy`,
         )
         .run(
           lease.worktreePath,
@@ -176,6 +225,7 @@ export class WorktreeLeaseStore {
     now: number;
     ttlMs: number;
   }): Promise<AcquireResult> {
+    this.assertCodexWriter(input.holder);
     const changed = this.db.prepare(`UPDATE worktree_leases SET expires_at=?
       WHERE worktree_path=? AND task_id=? AND lease_id=? AND holder=? AND fencing_token=?`).run(
         input.now + input.ttlMs, input.lease.worktreePath, input.taskId, input.lease.leaseId,
@@ -189,53 +239,6 @@ export class WorktreeLeaseStore {
           holder: input.holder, now: input.now, ttlMs: input.ttlMs });
   }
 
-  async transfer(input: {
-    worktreePath: string;
-    expectedLeaseId: string;
-    expectedFencingToken: number;
-    from: AgentId;
-    to: AgentId;
-    now: number;
-    ttlMs: number;
-    evidence: unknown;
-  }): Promise<TransferResult> {
-    return this.transferImmediate(input);
-  }
-
-  transferImmediate(input: {
-    worktreePath: string; expectedLeaseId: string; expectedFencingToken: number;
-    from: AgentId; to: AgentId; now: number; ttlMs: number; evidence: unknown;
-    allowAlreadyTransferred?: boolean;
-  }): TransferResult {
-    const existing = this.row(input.worktreePath);
-    if (input.allowAlreadyTransferred && existing && existing.lease_id === input.expectedLeaseId &&
-        existing.fencing_token === input.expectedFencingToken + 1 && existing.holder === input.to) {
-      return { status: "transferred", lease: toLease(existing), handoff: {
-        from: input.from, to: input.to, previousLeaseId: input.expectedLeaseId,
-        fencingToken: existing.fencing_token, evidence: structuredClone(input.evidence), recordedAt: input.now,
-      } };
-    }
-    const transaction = this.db.transaction((): TransferResult => {
-      const current = this.row(input.worktreePath);
-      if (!current || current.lease_id !== input.expectedLeaseId ||
-          current.fencing_token !== input.expectedFencingToken || current.holder !== input.from) {
-        return { status: "fenced", currentFencingToken: current?.fencing_token ?? 0 };
-      }
-      const lease = { ...toLease(current), holder: input.to, fencingToken: current.fencing_token + 1,
-        expiresAt: input.now + input.ttlMs };
-      this.db.prepare(`UPDATE worktree_leases SET holder=?,fencing_token=?,expires_at=?
-        WHERE worktree_path=? AND lease_id=? AND fencing_token=? AND holder=?`)
-        .run(lease.holder, lease.fencingToken, lease.expiresAt, input.worktreePath,
-          input.expectedLeaseId, input.expectedFencingToken, input.from);
-      const handoff = { from: input.from, to: input.to, previousLeaseId: current.lease_id,
-        fencingToken: lease.fencingToken, evidence: structuredClone(input.evidence), recordedAt: input.now };
-      this.db.prepare("INSERT INTO worktree_handoffs(task_id,recorded_at,payload) VALUES(?,?,?)")
-        .run(current.task_id, input.now, JSON.stringify(handoff));
-      return { status: "transferred", lease, handoff };
-    });
-    return transaction.immediate();
-  }
-
   async renew(input: {
     worktreePath: string;
     leaseId: string;
@@ -244,6 +247,7 @@ export class WorktreeLeaseStore {
     now: number;
     ttlMs: number;
   }): Promise<MutationResult> {
+    this.assertCodexWriter(input.holder);
     const changed = this.db
       .prepare(
         `UPDATE worktree_leases SET expires_at = ?
@@ -280,11 +284,11 @@ export class WorktreeLeaseStore {
     return { status: "released" };
   }
 
-  async listHandoffs(taskId: string): Promise<HandoffRecord[]> {
+  async listHandoffs(taskId: string): Promise<LeaseAuditRecord[]> {
     const rows = this.db
       .prepare("SELECT payload FROM worktree_handoffs WHERE task_id = ? ORDER BY id")
       .all(taskId) as HandoffRow[];
-    return rows.map((row) => JSON.parse(row.payload) as HandoffRecord);
+    return rows.map((row) => JSON.parse(row.payload) as LeaseAuditRecord);
   }
 
   close(): void {

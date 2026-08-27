@@ -1,0 +1,272 @@
+{
+  "mapify_version": "3.28.1",
+  "provider": "codex",
+  "installed_at": "2026-08-26T17:43:10Z",
+  "entries": [
+    {
+      "dest": ".agents/skills/map-check/SKILL.md",
+      "content_hash": "1e12451b2eb5f73e22506ad179002b67ae5360a8dcaffe1fe2029d3f643e40bc",
+      "template_hash": "712b126da1fff3e151addc9d9e3aa6b25b5159a85e3d5266ed27526ad1d7350a",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-efficient/SKILL.md",
+      "content_hash": "45971e579a7977ed021c7a0a53ef9b9afee0089d7624e3fecd52a2b13b19ac13",
+      "template_hash": "30eb2d94483fc15e6e809a070947a03bf42c3c20e2d7dfe5dc0d610c47f03671",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-efficient/efficient-reference.md",
+      "content_hash": "a73093384c214cd9e89e2dbb632b5d3358d17312f59a61dfcbaf23ef90e7e2d9",
+      "template_hash": "f41594d1199a4dbcde5ee1d0314fd1ca8f0cb70403b1f1945ba2a90f7749cb6d",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-explain/SKILL.md",
+      "content_hash": "42284c7ac9a8b1788865c886ca20314bf156bd33f274db5f76e4e58be36d3c38",
+      "template_hash": "01a25e11047e7e277de1f35ea2869c4db8028f3d51c051af59a98da92015a412",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-fast/SKILL.md",
+      "content_hash": "d6e3abbf4398cd5fe4f0447218ed56a034f179cb00f2cacffb49ff9e366d5deb",
+      "template_hash": "841437ff229dfc817d7cf8e233f67b32f48197ccf518a7e9f2feb9cca5669777",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-plan/SKILL.md",
+      "content_hash": "12e582854147fe01631c464de90b6cd16570cd79bc1bd6ae2047585e800298bc",
+      "template_hash": "e1e9b7a83b3314bcc5c664f5cba39bd912ba509cc8de01514e6c8d25b7e31ace",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-review/SKILL.md",
+      "content_hash": "08c56a9bbabe6701a06f77c2657f3fd5e3d3a9354bff84900d59f286bc6f3334",
+      "template_hash": "0999dfe03ebff0d1797270baf3c57735bbeb4ce441dd35b03191f1a14f0b3917",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-review/adversarial-reference.md",
+      "content_hash": "c83318ee7a481fd8d5fe32512372b0c2fb689ad7666335feb8a620b73f86533a",
+      "template_hash": "b0b9de4fed1b56fafa9160c07d6759444e639a37a805e97600311b4fa944e1d4",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-review/review-reference.md",
+      "content_hash": "7354d4d756501ce951c7ef129c643630375aa3393e0e11eb830eb36260d73bdd",
+      "template_hash": "55af535cae69628bf6e25a8dd463e7a3429735895429686abe45c4177acde70c",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-understand/SKILL.md",
+      "content_hash": "55ce86053f1100925ef801d45bc88e6b2f91fb45c8b768b13fd986025dbc3bd4",
+      "template_hash": "46e604e083f5652462d98a32a0cb5ce91bcf9c6edee00fe876ad8dd796371fee",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".agents/skills/map-upgrade/SKILL.md",
+      "content_hash": "13a6e94b72f134e6d24b338f22b494397d407817898c88f84085dc122092a90e",
+      "template_hash": "d6b87547364b52a05e50ecfc67b5187c82ec059e755ab7efccf2a49c291fce23",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/agents/decomposer.toml",
+      "content_hash": "b38bb8ee3caee4bb99102404baa4a96ee61ee6b81b8f5f32328447921d100400",
+      "template_hash": "573165bfb3de960a0f95ddbddb8842148200880331dbe047b751adf81fd409e6",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/agents/evaluator.toml",
+      "content_hash": "0496fd300d8f2df04ee633958373948f66ffde5c1455cc946917e9338bd679c2",
+      "template_hash": "d742324e6d44a6f7646995e2565455633d7a7121aedb9b60235f92632ce56660",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/agents/monitor.toml",
+      "content_hash": "5d8b70b797ec2e106d7db178cacee56614ee529de01c36f8df0e121ea3332809",
+      "template_hash": "fd41a91ac3bc39ddaa5e8159929a530d0efff297f855fa2f6a6369a64e056721",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/agents/predictor.toml",
+      "content_hash": "c79da1d10d043072fb771edab76db36ad4fd25c7442882a252d1ac9c81faa388",
+      "template_hash": "8493c7ffd872bfb63d4d3463dd99175e7d92560e085fa8f59e748614727f2175",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/agents/researcher.toml",
+      "content_hash": "f68ad680bcef4411ffe008ab8be32a54043c486a8ba6f8e42409c9ab4ed854b9",
+      "template_hash": "4492eacd893c0e1dc94b36ea0b3a7b22e67b2a99a3693f7fff308a6db4eb8c28",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/config.toml",
+      "content_hash": "f35a59459d61d561a89188ef76101f5d908173bceb0bb0dcb2c88f1e4bebd9fc",
+      "template_hash": "5a2df88fd05921ed91761f71950f33358714dddae30ca93ff4b840dbb20accab",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".codex/hooks.json",
+      "content_hash": "dba641bf9804833aa937e7f8c358e0a7455e849b15ba16b8cf96b03a97a486d8",
+      "template_hash": "",
+      "management_mode": "hooks-merge",
+      "committed": true,
+      "mapify_version": "",
+      "installed_at": ""
+    },
+    {
+      "dest": ".codex/hooks/workflow-gate.py",
+      "content_hash": "2f703ddd8aea11b979d8a4d131d2aba6cf8e69a298b54d70c5a4376fcba7f5e6",
+      "template_hash": "a1f47a680f198208f94a4c0b20df7aa74cc6ba8f4261c8e0480c134f14d87605",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/classify_scope.py",
+      "content_hash": "c086a40f2813f77753353bb3919b312688e9bc80a75ecbad4e1297c7d57f02a5",
+      "template_hash": "c086a40f2813f77753353bb3919b312688e9bc80a75ecbad4e1297c7d57f02a5",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/diagnostics.py",
+      "content_hash": "981b08c36407b6eae4bc317a57c4b37885250ac9a99dd65ceed21e2a9741ce83",
+      "template_hash": "981b08c36407b6eae4bc317a57c4b37885250ac9a99dd65ceed21e2a9741ce83",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/map_orchestrator.py",
+      "content_hash": "9eb37e56a57571867493a70e2ded54b3e8b1fc273483e21b5b45911a947cfd05",
+      "template_hash": "9eb37e56a57571867493a70e2ded54b3e8b1fc273483e21b5b45911a947cfd05",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/map_step_runner.py",
+      "content_hash": "c9c1155809289ec36beff9aa1ef4925f32f92d72d08519b96941b124ea4c84cc",
+      "template_hash": "c9c1155809289ec36beff9aa1ef4925f32f92d72d08519b96941b124ea4c84cc",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/map_utils.py",
+      "content_hash": "2eafd050864b4a62d250c9b4c7e9294561f530a7a981bdb706a607b339bd94e5",
+      "template_hash": "2eafd050864b4a62d250c9b4c7e9294561f530a7a981bdb706a607b339bd94e5",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/scrub_internal_ids.py",
+      "content_hash": "92d52343a395d0eb2ca9bebbab6a35bddb212e095808158f4a1af7b907f5a75e",
+      "template_hash": "92d52343a395d0eb2ca9bebbab6a35bddb212e095808158f4a1af7b907f5a75e",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/sofa_client.py",
+      "content_hash": "ac4376e1b278c81391982c4303cefe4558607c11ec053c67b9712a47ec981e1c",
+      "template_hash": "ac4376e1b278c81391982c4303cefe4558607c11ec053c67b9712a47ec981e1c",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/validate_spec_citations.py",
+      "content_hash": "1aba5b66566c0164d88b0637daced16667d85b8d24e5a7df4344a6c08a9a328d",
+      "template_hash": "1aba5b66566c0164d88b0637daced16667d85b8d24e5a7df4344a6c08a9a328d",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": ".map/scripts/wayfind_runner.py",
+      "content_hash": "8160363cf911fd83f0d8eccc8c535b770d16f9fbc34c5692e4c5320bfb546f7a",
+      "template_hash": "8160363cf911fd83f0d8eccc8c535b770d16f9fbc34c5692e4c5320bfb546f7a",
+      "management_mode": "full",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    },
+    {
+      "dest": "AGENTS.md",
+      "content_hash": "0de755e9ac492fd307f033411587396aa4841ea94f0238c097e4cdc085654a3d",
+      "template_hash": "a756804ab31b2bcad52500a7be9964b6a854523e62947b0cd3dab7cd8008db91",
+      "management_mode": "fenced",
+      "committed": true,
+      "mapify_version": "3.28.1",
+      "installed_at": "2026-08-26T17:43:10Z"
+    }
+  ],
+  "config_entries": [],
+  "providers": [
+    "codex"
+  ]
+}

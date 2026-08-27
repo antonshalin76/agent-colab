@@ -3,9 +3,13 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { grokWorkspaceMemoryDirectory, LocalCollabService, projectMemorySection } from "../src/app/service.js";
 import type { AttemptAssignment } from "../src/workflow/workflow.js";
+import { AgentRunner } from "../src/runners/agent-runner.js";
+import Database from "better-sqlite3";
+import { formatMapLearningLaunchBindingContext } from "../src/flow/map-admin.js";
+import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
 
 const delegatedArtifact = (artifactContent: string) => ({
   artifactContent,
@@ -16,11 +20,22 @@ const markCapabilityReady = (service: LocalCollabService): void => {
   service.providers.recordSuccess("grok", 1);
   service.providers.recordSuccess("codex", 1);
 };
-const serviceOptions = (root: string) => ({ allowedRoots: [root], agentSkillRoots: {
-  grok: join(homedir(), ".agents", "skills"), codex: join(homedir(), ".agents", "skills"),
-} });
+const serviceOptions = (root: string) => {
+  initializeCurrentExecutionSchema(join(root, "state.db"));
+  return { allowedRoots: [root], agentSkillRoots: {
+    grok: join(homedir(), ".agents", "skills"), codex: join(homedir(), ".agents", "skills"),
+  } };
+};
 
 describe("local collaboration service wiring", () => {
+  it("exposes MAP learning administration without caller-selected root or database authority", () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-map-admin-api-"));
+    const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
+    try {
+      expect(service.closeMapLearning).toHaveLength(1);
+      expect(service.recordMapLearningEvidence).toHaveLength(1);
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
   it("persists native memory-source availability in service status", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-memory-health-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
@@ -72,7 +87,7 @@ describe("local collaboration service wiring", () => {
     markCapabilityReady(service);
     try {
       await expect(service.delegate({
-        requester: "grok", stage: "planning", project, prompt: "plan",
+        requester: "grok", stage: "code_review", project, prompt: "review",
         artifactContent: "exact bytes", artifactHash: "0".repeat(64),
         approvalScope: "workspace-read", idempotencyKey: "mismatch",
       } as never)).rejects.toThrow(/artifact hash mismatch/i);
@@ -80,7 +95,7 @@ describe("local collaboration service wiring", () => {
       const artifactContent = "a".repeat(262_144);
       const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
       const delegated = await service.delegate({
-        requester: "grok", stage: "planning", project, prompt: "plan",
+        requester: "grok", stage: "code_review", project, prompt: "review",
         artifactContent, artifactHash, approvalScope: "workspace-read",
         idempotencyKey: "large-artifact",
       } as never);
@@ -92,7 +107,7 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("persists one idempotent delegated stage with fallback authority unchanged", async () => {
+  it("persists one idempotent delegated stage with fallback disabled", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-service-"));
     const project = join(root, "project");
     (await import("node:fs")).mkdirSync(project);
@@ -115,9 +130,29 @@ describe("local collaboration service wiring", () => {
       expect(service.runs.list()).toEqual([
         expect.objectContaining({
           approvalScope: "workspace-read",
-          payload: expect.objectContaining({ preferredAgent: "codex", allowFallback: true }),
+          payload: expect.objectContaining({ preferredAgent: "codex", allowFallback: false }),
         }),
       ]);
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("blocks planning itself on the exact four-lane MAP architecture gate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-planning-map-gate-"));
+    const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
+    const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
+    markCapabilityReady(service);
+    try {
+      const result = await service.delegate({ requester: "codex", stage: "planning", project,
+        prompt: "build the plan", ...delegatedArtifact("planning input"), approvalScope: "workspace-read",
+        idempotencyKey: "task:planning" });
+      expect(result).toMatchObject({ status: "blocked_map_admission", mapAdmission: {
+        satisfied: false,
+        gates: [{ name: "architecture", barrier: { requiredCount: 4, satisfied: false } }],
+      } });
+      expect(service.runtime.workflows.get(result.runId)).toBeNull();
+      expect(service.runs.list()).toHaveLength(4);
+      expect(service.runs.list().every((run) => String(run.payload?.prompt)
+        .includes('"kind":"planning"'))).toBe(true);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -127,7 +162,7 @@ describe("local collaboration service wiring", () => {
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
     markCapabilityReady(service);
     try {
-      const first = { requester: "codex" as const, taskId: "task-a", stage: "planning" as const,
+      const first = { requester: "codex" as const, taskId: "task-a", stage: "code_review" as const,
         project, prompt: "first plan", ...delegatedArtifact("planning artifact"), approvalScope: "workspace-read" as const,
         idempotencyKey: "shared-key" };
       await service.delegate(first);
@@ -170,6 +205,15 @@ describe("local collaboration service wiring", () => {
         ["codex", "critic", "codex:critic"],
       ].sort((left, right) => String(left[2]).localeCompare(String(right[2]))));
       for (const run of service.runs.list()) {
+        const binding = run.payload?.mapLearning as Parameters<
+          typeof formatMapLearningLaunchBindingContext
+        >[0];
+        expect(binding).toMatchObject({
+          schemaVersion: "map-learning-launch-binding/v1",
+          consumer: run.payload?.preferredAgent,
+        });
+        const context = formatMapLearningLaunchBindingContext(binding);
+        expect(String(run.payload?.prompt).split(context)).toHaveLength(2);
         expect(run.payload?.reviewDispatchIdentity).toEqual({
           ...(run.payload?.decision as Record<string, unknown>),
           sessionId: run.payload?.sessionId,
@@ -203,6 +247,21 @@ describe("local collaboration service wiring", () => {
         approvalScope: "workspace-read", idempotencyKey: "secret-review" }))
         .rejects.toThrow("cannot preserve its exact hash safely");
       expect(service.runs.list()).toHaveLength(0);
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects credential-bearing delegated prompts before MAP or queue side effects", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-delegate-secret-"));
+    const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
+    const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
+    markCapabilityReady(service);
+    try {
+      await expect(service.delegate({ requester: "codex", stage: "planning", project,
+        prompt: "plan with sk-ant-FAKEFAKEFAKEFAKEFAKEFAKE", ...delegatedArtifact("safe artifact"),
+        approvalScope: "workspace-read", idempotencyKey: "secret-plan" }))
+        .rejects.toThrow(/prompt contains credential material/i);
+      expect(service.runs.list()).toEqual([]);
+      expect(service.runtime.workflows.get("secret-plan")).toBeNull();
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -252,14 +311,14 @@ describe("local collaboration service wiring", () => {
     markCapabilityReady(service);
     try {
       await expect(service.delegate({
-        requester: "grok", taskId: "task-42", stage: "planning", preferredAgent: "codex",
+        requester: "grok", taskId: "task-42", stage: "code_review", preferredAgent: "grok",
         project, prompt: "plan", ...delegatedArtifact("routing artifact"), approvalScope: "workspace-read",
-        idempotencyKey: "task-42:planning",
-      })).rejects.toThrow(/routing policy requires grok/i);
+        idempotencyKey: "task-42:review",
+      })).rejects.toThrow(/routing policy requires codex/i);
       const delegated = await service.delegate({
-        requester: "grok", taskId: "task-42", stage: "planning", preferredAgent: "grok",
+        requester: "grok", taskId: "task-42", stage: "code_review", preferredAgent: "codex",
         project, prompt: "plan", ...delegatedArtifact("routing artifact"), approvalScope: "workspace-read",
-        idempotencyKey: "task-42:planning",
+        idempotencyKey: "task-42:review",
       });
       let runs = service.runs.list();
       expect(runs).toHaveLength(1);
@@ -270,19 +329,57 @@ describe("local collaboration service wiring", () => {
       expect(coordination.payload?.prompt).toContain("Immutable artifact");
       expect(coordination.payload?.prompt).toContain("routing artifact");
       expect(delegated.status).toBe("running");
-      const state = service.runtime.completeStage(
-        delegated.runId,
-        String(coordination.payload?.workflowStageId),
-        coordination.payload?.workflowDispatchIdentity as AttemptAssignment,
-        { kind: "success" },
-      );
+      const assignment = coordination.payload?.workflowDispatchIdentity as AttemptAssignment;
+      const claimedCoordination = service.runs.claimNext({
+        workerId: "w",
+        leaseMs: 30_000,
+        now: Date.now() + 1_000,
+      })!;
+      service.runs.markLaunchIntent(claimedCoordination.id, claimedCoordination.leaseToken!, {
+        agent: "codex",
+      });
+      service.runs.markLaunched(claimedCoordination.id, claimedCoordination.leaseToken!, {
+        phase: "started",
+        pid: 12345,
+        agent: "codex",
+        model: assignment.model,
+        effort: assignment.effort,
+        policyVersion: assignment.policyVersion,
+        sessionId: assignment.sessionId,
+      });
+      const receipt = {
+        schemaVersion: "runner-outcome/v1",
+        runId: claimedCoordination.id,
+        runAttemptCount: claimedCoordination.attemptCount,
+        dispatchId: claimedCoordination.idempotencyKey,
+        workflowId: delegated.runId,
+        stageId: String(coordination.payload?.workflowStageId),
+        attemptId: assignment.attemptId,
+        attemptOrdinal: assignment.attemptOrdinal,
+        agent: assignment.agent,
+        model: assignment.model,
+        policyVersion: assignment.policyVersion,
+        sessionId: assignment.sessionId,
+        resultKind: "success",
+      };
+      service.runs.commitDomainEffect({
+        id: claimedCoordination.id,
+        token: claimedCoordination.leaseToken!,
+        providerResult: { kind: "success", agent: "codex" },
+        effect: { type: "workflow", workflowId: delegated.runId,
+          stageId: String(coordination.payload?.workflowStageId), assignment,
+          agent: "codex", resultKind: "success", terminalAt: Date.now(), runnerReceipt: receipt },
+        status: "completed",
+      });
+      const state = service.runtime.recordRunnerOutcome(delegated.runId, receipt);
       expect(state.completedStageIds).toContain(coordination.payload?.workflowStageId);
       expect(service.runtime.drainDispatchOutbox(service.runs)).toBe(1);
       runs = service.runs.list();
-      const planning = runs.find((run) => run.stage === "planning")!;
-      expect(planning.payload?.preferredAgent).toBe("grok");
+      const review = runs.find((run) => run.stage === "code_review")!;
+      expect(review.payload?.preferredAgent).toBe("codex");
+      expect(review.payload?.allowFallback).toBe(false);
       const claim = service.runs.claimNext({ workerId: "w", leaseMs: 100, now: Date.now() });
-      expect(claim?.id).toBe(coordination.id);
+      expect(claim?.id).toBe(review.id);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -307,7 +404,7 @@ describe("local collaboration service wiring", () => {
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
     markCapabilityReady(service);
     try {
-      const common = { requester: "grok" as const, taskId: "same-task", stage: "planning" as const,
+      const common = { requester: "grok" as const, taskId: "same-task", stage: "code_review" as const,
         prompt: "plan", ...delegatedArtifact("same artifact"), approvalScope: "workspace-read" as const,
         idempotencyKey: "same-task:planning" };
       const a = await service.delegate({ ...common, project: projectA });
@@ -333,10 +430,207 @@ describe("local collaboration service wiring", () => {
       await expect(service.delegate(input)).rejects.toThrow(/approval denied/i);
       service.approvals.issue({ reference: "approval-write", project, scope: "workspace-write", expiresAt: Date.now() + 60_000 });
       const first = await service.delegate(input);
+      expect(first).toMatchObject({
+        status: "blocked_map_admission",
+        assignedAgent: "codex",
+        mapAdmission: {
+          satisfied: false,
+          profile: { version: "3.28.1", provider: "codex" },
+          gates: [
+            { name: "architecture", barrier: { satisfied: false, requiredCount: 4 } },
+            { name: "implementer-readiness", barrier: { satisfied: false, requiredCount: 4 } },
+          ],
+        },
+      });
+      expect(service.runtime.workflows.get(first.runId)).toBeNull();
+      expect(service.runs.list()).toHaveLength(8);
+      expect(service.runs.list().every((run) => run.approvalScope === "workspace-read")).toBe(true);
+      expect(service.runs.list().every((run) =>
+        String(run.payload?.prompt).includes("review-verdict/v1"),
+      )).toBe(true);
+      expect(service.runs.list().every((run) =>
+        String(run.payload?.prompt).includes('"schemaVersion":"map-learning-projection/v1"'),
+      )).toBe(true);
+      expect(service.approvals.validate({ reference: "approval-write", project,
+        scope: "workspace-write" })).toEqual({ allowed: true, remainingUses: 1 });
+      await expect(service.delegate({ ...input, prompt: "implement a different target" }))
+        .rejects.toThrow(/immutable review conflict/i);
       await expect(service.delegate(input)).resolves.toEqual(first);
+      if (!first.mapAdmission) throw new Error("expected blocked MAP admission evidence");
+      for (const gate of first.mapAdmission.gates) {
+        const review = service.reviews.get(gate.reviewId)!;
+        for (const lane of review.lanes) {
+          const attempt = lane.attempts.at(-1)!;
+          const run = service.runs.getByIdempotencyKey(attempt.idempotencyKey)!;
+          const claimed = service.runs.claimNext({ workerId: "map-review-test", leaseMs: 10_000,
+            now: Date.now() })!;
+          expect(claimed.id).toBe(run.id);
+          service.runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: lane.agent });
+          service.runs.markLaunched(claimed.id, claimed.leaseToken!, {
+            phase: "started", pid: 1234, agent: lane.agent, model: attempt.model,
+            effort: attempt.effort, policyVersion: attempt.policyVersion, sessionId: attempt.sessionId,
+          });
+          const providerResult = {
+            kind: "success",
+            agent: lane.agent,
+            reviewVerdict: {
+              schemaVersion: "review-verdict/v1",
+              verdict: "PASS",
+              findings: [],
+            },
+          };
+          service.runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!,
+            providerResult,
+            effect: { type: "review", reviewId: gate.reviewId, attemptId: attempt.attemptId,
+              role: lane.role, agent: lane.agent, resultKind: "success", terminalAt: Date.now() },
+            status: "completed" });
+          service.reviews.recordTerminal({
+            reviewId: gate.reviewId,
+            agent: lane.agent,
+            role: lane.role,
+            attemptId: attempt.attemptId,
+            status: "completed",
+            result: providerResult,
+            terminalAt: Date.now(),
+          });
+        }
+      }
+      await expect(service.delegate(input)).resolves.toMatchObject({ status: "running", assignedAgent: "codex" });
+      const admittedTarget = service.runtime.workflows.get(first.runId)?.stages
+        .find((stage) => stage.kind === "tdd_coding");
+      expect(admittedTarget?.executionSnapshot).toMatchObject({
+        schemaVersion: "execution-snapshot-binding/v1",
+        snapshotSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+      const active = service.runtime.workflows.get(first.runId)?.activeStage;
+      if (!active || active.kind !== "coordination") throw new Error("expected coordination before target dispatch");
+      const claimedCoordination = service.runs.claimNext({
+        workerId: "map-binding-test",
+        leaseMs: 10_000,
+        now: Date.now(),
+      });
+      if (!claimedCoordination?.leaseToken) throw new Error("expected queued coordination run");
+      service.runs.markLaunchIntent(claimedCoordination.id, claimedCoordination.leaseToken, {
+        agent: active.assignment.agent,
+      });
+      service.runs.markLaunched(claimedCoordination.id, claimedCoordination.leaseToken, {
+        phase: "started",
+        pid: 1235,
+        agent: active.assignment.agent,
+        model: active.assignment.model,
+        effort: active.assignment.effort,
+        policyVersion: active.assignment.policyVersion,
+        sessionId: active.assignment.sessionId,
+      });
+      const coordinationReceipt = {
+        schemaVersion: "runner-outcome/v1" as const,
+        runId: claimedCoordination.id,
+        runAttemptCount: claimedCoordination.attemptCount,
+        dispatchId: claimedCoordination.idempotencyKey,
+        workflowId: first.runId,
+        stageId: active.id,
+        attemptId: active.assignment.attemptId,
+        attemptOrdinal: active.assignment.attemptOrdinal,
+        agent: active.assignment.agent,
+        model: active.assignment.model,
+        policyVersion: active.assignment.policyVersion,
+        sessionId: active.assignment.sessionId,
+        resultKind: "success" as const,
+      };
+      service.runs.commitDomainEffect({
+        id: claimedCoordination.id,
+        token: claimedCoordination.leaseToken,
+        providerResult: { kind: "success", agent: "codex" },
+        effect: {
+          type: "workflow",
+          workflowId: first.runId,
+          stageId: active.id,
+          assignment: active.assignment,
+          agent: "codex",
+          resultKind: "success",
+          terminalAt: Date.now(),
+          runnerReceipt: coordinationReceipt,
+        },
+        status: "completed",
+      });
+      service.runtime.recordRunnerOutcome(first.runId, coordinationReceipt);
+      expect(service.runtime.drainDispatchOutbox(service.runs)).toBe(1);
+      const queuedTarget = service.runs.list().find((run) => run.stage === "tdd_coding");
+      expect(queuedTarget?.payload?.executionSnapshot).toEqual(admittedTarget?.executionSnapshot);
+      if (!queuedTarget) throw new Error("expected durable admitted target queue row");
+      const launch = vi.fn(() => ({
+        pid: 1236,
+        result: Promise.resolve({
+          exitCode: 0,
+          stderr: "",
+          stdout: [
+            JSON.stringify({ type: "session_meta", payload: { id: "admitted", model: "gpt-5.6-sol" } }),
+            JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant",
+              content: [{ type: "output_text", text: "admitted target" }] } }),
+          ].join("\n") + "\n",
+        }),
+        terminate: vi.fn(),
+      }));
+      const admittedRunner = new AgentRunner({
+        binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+        timeoutMs: 90_000,
+        authorizationDatabasePath: service.stateDatabase,
+        launcher: { launch },
+      });
+      const processTask = {
+        id: queuedTarget.id,
+        stage: queuedTarget.stage,
+        artifactHash: queuedTarget.artifactHash!,
+        idempotencyKey: queuedTarget.idempotencyKey,
+        approvalScope: queuedTarget.approvalScope!,
+        payload: queuedTarget.payload!,
+      };
+      await expect(admittedRunner.run(processTask)).resolves.toMatchObject({ kind: "success" });
+      const durableTamper = new Database(service.stateDatabase);
+      let originalWorkflowJson: string;
+      try {
+        const row = durableTamper.prepare("SELECT state_json FROM collaboration_runs WHERE workflow_id=?")
+          .get(first.runId) as { state_json: string };
+        originalWorkflowJson = row.state_json;
+        const forgedWorkflow = JSON.parse(row.state_json);
+        forgedWorkflow.taskId = `${forgedWorkflow.taskId}:forged`;
+        durableTamper.prepare("UPDATE collaboration_runs SET state_json=? WHERE workflow_id=?")
+          .run(JSON.stringify(forgedWorkflow), first.runId);
+        const forgedDurable = structuredClone(processTask);
+        await expect(admittedRunner.run(forgedDurable)).resolves.toMatchObject({
+          kind: "invalid_request",
+          error: expect.stringMatching(/execution snapshot.*stale|conflicts/i),
+        });
+        durableTamper.prepare("UPDATE collaboration_runs SET state_json=? WHERE workflow_id=?")
+          .run(originalWorkflowJson, first.runId);
+      } finally { durableTamper.close(); }
+      const sqlite = new Database(service.stateDatabase);
+      try {
+        sqlite.prepare(`UPDATE runtime_review_lanes SET status='failed'
+          WHERE review_id=? AND agent='grok' AND role='critic'`).run(first.mapAdmission.gates[0]!.reviewId);
+      } finally { sqlite.close(); }
+      await expect(admittedRunner.run(processTask)).resolves.toMatchObject({
+        kind: "invalid_request",
+        error: expect.stringMatching(/semantic PASS|review barrier/i),
+      });
+      const forgedPrompt = structuredClone(processTask);
+      forgedPrompt.payload!.prompt = `${String(processTask.payload!.prompt)}\nprompt forged outside the durable MAP workflow`;
+      await expect(admittedRunner.run(forgedPrompt)).resolves.toMatchObject({
+        kind: "invalid_request",
+        error: expect.stringMatching(/queue payload.*snapshot/i),
+      });
+      const forgedArtifact = structuredClone(processTask);
+      forgedArtifact.artifactHash = "f".repeat(64);
+      await expect(admittedRunner.run(forgedArtifact)).resolves.toMatchObject({
+        kind: "invalid_request",
+        error: expect.stringMatching(/queue payload.*snapshot/i),
+      });
+      expect(launch).toHaveBeenCalledTimes(1);
+      expect(service.runs.list().some((run) => run.stage === "coordination" &&
+        String(run.payload?.prompt).includes("Promoted MAP learning projection for codex"))).toBe(true);
       await expect(service.delegate({ ...input, idempotencyKey: "task:write:again" })).rejects.toThrow(/exhausted/i);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
-  });
+  }, 20_000);
 
   it("creates two active and two deferred review lanes when one provider is unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-degraded-service-"));

@@ -3,489 +3,234 @@ import {
   ROUTING_POLICY_VERSION,
   STAGES,
   STAGE_POLICY,
+  constrainEffortForAgent,
+  increaseRequestedEffort,
+  providerSupportsApprovalScope,
+  routeStage,
+  selectFixedAgentEffort,
   selectStageAssignment,
+  stageRequiresReadOnly,
   type ActiveAgentId,
+  type ApprovalScope,
   type ProviderHealthSnapshot,
   type Stage,
   type TrustedEffortInputs,
 } from "../src/domain/routing.js";
-import { classifyOutcome } from "../src/domain/outcomes.js";
+import {
+  FAILOVER_OUTCOMES,
+  TERMINAL_OUTCOMES,
+  classifyOutcome,
+} from "../src/domain/outcomes.js";
 
-const EXPECTED_STAGES = [
-  "coordination",
-  "planning",
-  "plan_audit",
-  "plan_critic",
-  "prd",
-  "prd_audit",
-  "prd_critic",
-  "architecture",
-  "architecture_audit",
-  "architecture_critic",
-  "ui_ux",
-  "bdd",
-  "tdd_coding",
-  "unit_testing",
-  "e2e_infrastructure",
-  "e2e_testing",
-  "test_audit",
-  "test_critic",
-  "code_audit",
-  "code_critic",
-  "code_review",
-] as const;
-
-type ExpectedStage = (typeof EXPECTED_STAGES)[number];
-type ExpectedEffort = "low" | "medium" | "high" | "xhigh";
-
-const EXPECTED_POLICY_VERSION = "routing-v3";
-
-const EXPECTED_CAPABILITIES = {
-  grok: {
-    model: "grok-4.6",
-    efforts: ["low", "medium", "high", "xhigh"],
-  },
-  codex: {
-    model: "gpt-5.6-sol",
-    efforts: ["low", "medium", "high", "xhigh"],
-  },
-} as const satisfies Record<
-  ActiveAgentId,
-  { model: string; efforts: readonly ExpectedEffort[] }
->;
-
-const EXPECTED_STAGE_POLICY = {
-  coordination: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "medium" },
-  },
-  planning: {
-    preferredAgent: "grok",
-    baselineEffort: { grok: "medium", codex: "medium" },
-  },
-  plan_audit: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  plan_critic: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "xhigh", codex: "xhigh" },
-  },
-  prd: {
-    preferredAgent: "grok",
-    baselineEffort: { grok: "medium", codex: "medium" },
-  },
-  prd_audit: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  prd_critic: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "xhigh", codex: "xhigh" },
-  },
-  architecture: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  architecture_audit: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  architecture_critic: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "xhigh", codex: "xhigh" },
-  },
-  ui_ux: {
-    preferredAgent: "grok",
-    baselineEffort: { grok: "medium", codex: "medium" },
-  },
-  bdd: {
-    preferredAgent: "grok",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  tdd_coding: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  unit_testing: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "medium", codex: "medium" },
-  },
-  e2e_infrastructure: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  e2e_testing: {
-    preferredAgent: "grok",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  test_audit: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  test_critic: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "xhigh", codex: "xhigh" },
-  },
-  code_audit: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-  code_critic: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "xhigh", codex: "xhigh" },
-  },
-  code_review: {
-    preferredAgent: "codex",
-    baselineEffort: { grok: "high", codex: "high" },
-  },
-} as const satisfies Record<
-  ExpectedStage,
-  {
-    preferredAgent: ActiveAgentId;
-    baselineEffort: Record<ActiveAgentId, ExpectedEffort>;
-  }
->;
-
-const ORIGINS = ["grok", "codex"] as const satisfies readonly ActiveAgentId[];
-const AGENTS = ["grok", "codex"] as const satisfies readonly ActiveAgentId[];
-
-const BASE_TRUSTED_INPUTS = {
+const BASE_INPUTS = {
   artifactBytes: 1_024,
   changedFiles: 2,
   attemptOrdinal: 0,
   approvalScope: "workspace-read",
 } as const satisfies TrustedEffortInputs;
 
-const HEALTHY = {
-  grok: "healthy",
-  codex: "healthy",
-} as const satisfies ProviderHealthSnapshot;
-
-const stageRows = ORIGINS.flatMap((origin) =>
-  EXPECTED_STAGES.map((stage) => [origin, stage] as const),
-);
-
-const assignmentFor = (
-  stage: ExpectedStage,
+const assignment = (
+  stage: Stage,
   origin: ActiveAgentId,
-  health: ProviderHealthSnapshot,
-  trustedInputs: TrustedEffortInputs = BASE_TRUSTED_INPUTS,
-) =>
-  selectStageAssignment({
-    stage: stage as Stage,
-    origin,
-    health,
-    trustedInputs,
+  health: ProviderHealthSnapshot = { grok: "healthy", codex: "healthy" },
+  trustedInputs: TrustedEffortInputs = BASE_INPUTS,
+) => selectStageAssignment({ stage, origin, health, trustedInputs });
+
+describe("routing-v4 canonical policy", () => {
+  it("pins the complete policy to routing-v4 with Codex as every stage owner", () => {
+    expect(ROUTING_POLICY_VERSION).toBe("routing-v4");
+    expect(Object.keys(STAGE_POLICY)).toEqual([...STAGES]);
+    expect(STAGES).toHaveLength(21);
+    expect(STAGES.every((stage) => STAGE_POLICY[stage].preferredAgent === "codex")).toBe(true);
   });
 
-const bump = (agent: ActiveAgentId, effort: ExpectedEffort) => {
-  const ladder = EXPECTED_CAPABILITIES.codex.efforts;
-  const index = ladder.indexOf(effort);
-  const bumped = ladder[Math.min(index + 1, ladder.length - 1)]!;
-  return {
-    effort: bumped,
-    reason: effort === "xhigh"
-      ? agent === "codex"
-        ? "provider_policy_limit:gpt-5.6-sol:xhigh"
-        : "model_capability_limit:grok-4.6:xhigh"
-      : null,
-  } as const;
-};
-
-describe("routing v2 canonical policy", () => {
-  it("exports the test-owned literal complete stage policy as the only matrix", () => {
-    expect(STAGES).toEqual(EXPECTED_STAGES);
-    expect(STAGE_POLICY).toEqual(EXPECTED_STAGE_POLICY);
-    expect(ROUTING_POLICY_VERSION).toBe(EXPECTED_POLICY_VERSION);
-  });
-
-  it.each(stageRows)(
-    "routes %s-origin %s to the preferred provider and exact supported model",
-    (origin, stage) => {
-      const expected = EXPECTED_STAGE_POLICY[stage];
-      const result = assignmentFor(stage, origin, HEALTHY);
-
+  it.each(STAGES)("routes %s to Codex for either request origin", (stage) => {
+    for (const origin of ["grok", "codex"] as const) {
+      const result = assignment(stage, origin);
       expect(result).toEqual({
-        agent: expected.preferredAgent,
-        model: EXPECTED_CAPABILITIES[expected.preferredAgent].model,
-        effort: expected.baselineEffort[expected.preferredAgent],
-        policyVersion: EXPECTED_POLICY_VERSION,
-        reasons: [
-          `stage_baseline:${stage}:${expected.baselineEffort[expected.preferredAgent]}`,
-        ],
-        degraded: false,
-      });
-      expect(EXPECTED_CAPABILITIES[result.agent].efforts).toContain(result.effort);
-    },
-  );
-
-  it.each(stageRows)(
-    "routes %s-origin %s to Codex when Grok is unavailable",
-    (origin, stage) => {
-      const policy = EXPECTED_STAGE_POLICY[stage];
-      const degraded = policy.preferredAgent === "grok";
-      const baseline = policy.baselineEffort.codex;
-      const escalated = bump("codex", baseline);
-
-      expect(
-        assignmentFor(stage, origin, { grok: "unavailable", codex: "healthy" }),
-      ).toEqual({
         agent: "codex",
         model: "gpt-5.6-sol",
-        effort: degraded ? escalated.effort : baseline,
-        policyVersion: EXPECTED_POLICY_VERSION,
-        reasons: [
-          `stage_baseline:${stage}:${baseline}`,
-          ...(degraded ? (["degraded_fallback"] as const) : []),
-          ...(degraded && escalated.reason ? ([escalated.reason] as const) : []),
-        ],
-        degraded,
+        effort: STAGE_POLICY[stage].baselineEffort.codex,
+        policyVersion: "routing-v4",
+        reasons: [`stage_baseline:${stage}:${STAGE_POLICY[stage].baselineEffort.codex}`],
+        degraded: false,
       });
-    },
-  );
-
-  it.each(stageRows)(
-    "routes %s-origin %s to Grok when Codex is unavailable",
-    (origin, stage) => {
-      const policy = EXPECTED_STAGE_POLICY[stage];
-      const degraded = policy.preferredAgent === "codex";
-      const baseline = policy.baselineEffort.grok;
-      const escalated = bump("grok", baseline);
-
-      expect(
-        assignmentFor(stage, origin, { grok: "healthy", codex: "unavailable" }),
-      ).toEqual({
-        agent: "grok",
-        model: "grok-4.6",
-        effort: degraded ? escalated.effort : baseline,
-        policyVersion: EXPECTED_POLICY_VERSION,
-        reasons: [
-          `stage_baseline:${stage}:${baseline}`,
-          ...(degraded ? (["degraded_fallback"] as const) : []),
-          ...(degraded && escalated.reason ? ([escalated.reason] as const) : []),
-        ],
-        degraded,
-      });
-    },
-  );
-
-  it("fails closed when neither provider is healthy", () => {
-    expect(() =>
-      assignmentFor("planning", "grok", {
-        grok: "probing",
-        codex: "disabled",
-      }),
-    ).toThrow(/no healthy provider/i);
+    }
   });
 
-  it("routes external Grok-preferred work to Codex with explicit fallback evidence", () => {
-    expect(assignmentFor("planning", "grok", HEALTHY, {
-      ...BASE_TRUSTED_INPUTS,
+  it.each(STAGES)("blocks %s when Codex is unavailable even if Grok is healthy", (stage) => {
+    expect(() => assignment(stage, "grok", { grok: "healthy", codex: "unavailable" }))
+      .toThrow("No healthy provider is available");
+  });
+
+  it.each(["workspace-read", "workspace-write", "external"] as const)(
+    "allows only Codex to own %s workflow authority",
+    (scope) => {
+      expect(providerSupportsApprovalScope("codex", scope)).toBe(true);
+      expect(providerSupportsApprovalScope("grok", scope)).toBe(false);
+    },
+  );
+
+  it("fails closed when neither harness is healthy", () => {
+    expect(() => assignment("planning", "codex", { grok: "unavailable", codex: "unavailable" }))
+      .toThrow("No healthy provider is available");
+  });
+
+  it("preserves authority bytes while routing external work to Codex", () => {
+    const result = routeStage({
+      stage: "planning",
+      origin: "grok",
+      health: { grok: "healthy", codex: "healthy" },
+      role: "stage-owner",
+      artifactRef: "artifact:plan",
+      artifactHash: "a".repeat(64),
       approvalScope: "external",
-    })).toEqual({
-      agent: "codex",
+      idempotencyKey: "plan:external",
+      trustedInputs: { ...BASE_INPUTS, approvalScope: "external" },
+    });
+    expect(result).toEqual({
+      assignedAgent: "codex",
       model: "gpt-5.6-sol",
-      effort: "xhigh",
-      policyVersion: EXPECTED_POLICY_VERSION,
-      reasons: [
-        "stage_baseline:planning:medium",
-        "degraded_fallback",
-        "external_scope",
-      ],
-      degraded: true,
+      effort: "high",
+      policyVersion: "routing-v4",
+      reasons: ["stage_baseline:planning:medium", "external_scope"],
+      degraded: false,
+      role: "stage-owner",
+      artifactRef: "artifact:plan",
+      artifactHash: "a".repeat(64),
+      approvalScope: "external",
+      idempotencyKey: "plan:external",
     });
   });
 
-  it("fails closed instead of routing external work to Grok", () => {
-    expect(() => assignmentFor(
-      "architecture",
-      "codex",
-      { grok: "healthy", codex: "unavailable" },
-      { ...BASE_TRUSTED_INPUTS, approvalScope: "external" },
-    )).toThrow(/no healthy provider/i);
+  it.each([
+    "coordination",
+    "plan_audit",
+    "plan_critic",
+    "prd_audit",
+    "prd_critic",
+    "architecture_audit",
+    "architecture_critic",
+    "test_audit",
+    "test_critic",
+    "code_audit",
+    "code_critic",
+    "code_review",
+  ] as const)("marks %s as read-only", (stage) => {
+    expect(stageRequiresReadOnly(stage)).toBe(true);
+  });
+
+  it.each([
+    "planning",
+    "prd",
+    "architecture",
+    "ui_ux",
+    "bdd",
+    "tdd_coding",
+    "unit_testing",
+    "e2e_infrastructure",
+    "e2e_testing",
+  ] as const)("does not misclassify delivery stage %s as read-only", (stage) => {
+    expect(stageRequiresReadOnly(stage)).toBe(false);
   });
 });
 
-describe("routing v2 adaptive effort", () => {
-  it.each(
-    EXPECTED_STAGES.flatMap((stage) =>
-      AGENTS.map((agent) => [stage, agent] as const),
-    ),
-  )("uses the literal %s baseline for %s and escalates only fallback", (stage, agent) => {
-    const policy = EXPECTED_STAGE_POLICY[stage];
-    const degraded = policy.preferredAgent !== agent;
-    const baseline = policy.baselineEffort[agent];
-    const health: ProviderHealthSnapshot = {
-      grok: agent === "grok" ? "healthy" : "unavailable",
-      codex: agent === "codex" ? "healthy" : "unavailable",
-    };
-    const escalated = bump(agent, baseline);
-
-    expect(assignmentFor(stage, "codex", health)).toMatchObject({
-      agent,
-      model: EXPECTED_CAPABILITIES[agent].model,
-      effort: degraded ? escalated.effort : baseline,
-      reasons: [
-        `stage_baseline:${stage}:${baseline}`,
-        ...(degraded ? (["degraded_fallback"] as const) : []),
-        ...(degraded && escalated.reason ? ([escalated.reason] as const) : []),
-      ],
-      degraded,
-    });
-  });
-
-  it.each([
-    ["attemptOrdinal", { attemptOrdinal: 1 }, "retry"],
-    ["external approval", { approvalScope: "external" }, "external_scope"],
-    ["artifactBytes", { artifactBytes: 262_144 }, "large_artifact"],
-    ["changedFiles", { changedFiles: 20 }, "broad_change_set"],
-  ] as const)("adds the %s modifier at its inclusive boundary", (_label, patch, reason) => {
-    const decision = assignmentFor("coordination", "codex", HEALTHY, {
-      ...BASE_TRUSTED_INPUTS,
-      ...patch,
-    });
-
-    expect(decision).toMatchObject({
-      effort: "high",
-      reasons: ["stage_baseline:coordination:medium", reason],
-    });
-  });
-
-  it.each([
-    ["attemptOrdinal", { attemptOrdinal: 0 }],
-    ["workspace approval", { approvalScope: "workspace-write" }],
-    ["artifactBytes", { artifactBytes: 262_143 }],
-    ["changedFiles", { changedFiles: 19 }],
-  ] as const)("does not add the %s modifier below its boundary", (_label, patch) => {
-    const decision = assignmentFor("coordination", "codex", HEALTHY, {
-      ...BASE_TRUSTED_INPUTS,
-      ...patch,
-    });
-
-    expect(decision).toMatchObject({
-      effort: "medium",
-      reasons: ["stage_baseline:coordination:medium"],
-    });
-  });
-
-  it("keeps canonical reason order while effort caps at xhigh", () => {
-    const decision = assignmentFor(
-      "planning",
-      "grok",
-      HEALTHY,
-      {
+describe("routing-v4 adaptive effort", () => {
+  it("keeps modifier order deterministic and caps Codex at xhigh", () => {
+    const decision = selectFixedAgentEffort({
+      stage: "planning",
+      agent: "codex",
+      degraded: false,
+      trustedInputs: {
         artifactBytes: 262_144,
         changedFiles: 20,
         attemptOrdinal: 1,
         approvalScope: "external",
       },
-    );
-
+    });
     expect(decision).toEqual({
       agent: "codex",
       model: "gpt-5.6-sol",
       effort: "xhigh",
-      policyVersion: EXPECTED_POLICY_VERSION,
+      policyVersion: "routing-v4",
       reasons: [
         "stage_baseline:planning:medium",
-        "degraded_fallback",
         "retry",
         "external_scope",
         "large_artifact",
         "broad_change_set",
         "provider_policy_limit:gpt-5.6-sol:xhigh",
       ],
-      degraded: true,
-    });
-    expect(new Set(decision.reasons).size).toBe(decision.reasons.length);
-  });
-
-  it("changes the decision for deliberately mutated threshold inputs", () => {
-    const below = assignmentFor("coordination", "codex", HEALTHY, {
-      ...BASE_TRUSTED_INPUTS,
-      artifactBytes: 262_143,
-      changedFiles: 19,
-    });
-    const atThreshold = assignmentFor("coordination", "codex", HEALTHY, {
-      ...BASE_TRUSTED_INPUTS,
-      artifactBytes: 262_144,
-      changedFiles: 20,
-    });
-
-    expect(atThreshold).not.toEqual(below);
-    expect(below.reasons).toEqual(["stage_baseline:coordination:medium"]);
-    expect(atThreshold.reasons).toEqual([
-      "stage_baseline:coordination:medium",
-      "large_artifact",
-      "broad_change_set",
-    ]);
-  });
-});
-
-describe("routing v2 per-attempt decisions", () => {
-  it("creates a new decision per attempt while preserving the pinned version and prior evidence", () => {
-    const initial = assignmentFor("planning", "grok", HEALTHY);
-    const initialEvidence = structuredClone(initial);
-    const retry = assignmentFor("planning", "grok", HEALTHY, {
-      ...BASE_TRUSTED_INPUTS,
-      attemptOrdinal: 1,
-    });
-    const failover = assignmentFor(
-      "planning",
-      "grok",
-      { grok: "unavailable", codex: "healthy" },
-      { ...BASE_TRUSTED_INPUTS, attemptOrdinal: 2 },
-    );
-
-    expect(retry).not.toBe(initial);
-    expect(failover).not.toBe(retry);
-    expect(initial).toEqual(initialEvidence);
-    expect([initial.policyVersion, retry.policyVersion, failover.policyVersion]).toEqual([
-      EXPECTED_POLICY_VERSION,
-      EXPECTED_POLICY_VERSION,
-      EXPECTED_POLICY_VERSION,
-    ]);
-    expect(initial.reasons).toEqual(["stage_baseline:planning:medium"]);
-    expect(retry.reasons).toEqual(["stage_baseline:planning:medium", "retry"]);
-    expect(failover).toMatchObject({
-      agent: "codex",
-      reasons: [
-        "stage_baseline:planning:medium",
-        "degraded_fallback",
-        "retry",
-      ],
+      degraded: false,
     });
   });
-});
 
-describe("routing v2 failover outcome classification", () => {
-  const EXPECTED_OUTCOMES = {
-    auth: true,
-    quota: true,
-    rate_limit: true,
-    network_timeout: true,
-    overload: true,
-    model_unavailable: true,
-    cli_missing: true,
-    invalid_request: false,
-    task_failure: false,
-    safety_denial: false,
-    permission_denial: false,
-    user_cancelled: false,
-  } as const;
+  it("keeps Grok effort selection available only for explicit review-lane decisions", () => {
+    expect(selectFixedAgentEffort({
+      stage: "code_critic",
+      agent: "grok",
+      degraded: false,
+      trustedInputs: BASE_INPUTS,
+    })).toEqual({
+      agent: "grok",
+      model: "grok-4.6",
+      effort: "xhigh",
+      policyVersion: "routing-v4",
+      reasons: ["stage_baseline:code_critic:xhigh"],
+      degraded: false,
+    });
+  });
 
-  it.each(Object.entries(EXPECTED_OUTCOMES))(
-    "classifies %s failover eligibility as %s",
-    (kind, failoverEligible) => {
-      expect(classifyOutcome({ kind: kind as keyof typeof EXPECTED_OUTCOMES })).toEqual({
-        failoverEligible,
-        countsAgainstProvider: failoverEligible,
-      });
+  it("changes only at exact trusted thresholds", () => {
+    expect(assignment("planning", "codex", undefined, { ...BASE_INPUTS, artifactBytes: 262_143 }).reasons)
+      .not.toContain("large_artifact");
+    expect(assignment("planning", "codex", undefined, { ...BASE_INPUTS, artifactBytes: 262_144 }).reasons)
+      .toContain("large_artifact");
+    expect(assignment("planning", "codex", undefined, { ...BASE_INPUTS, changedFiles: 19 }).reasons)
+      .not.toContain("broad_change_set");
+    expect(assignment("planning", "codex", undefined, { ...BASE_INPUTS, changedFiles: 20 }).reasons)
+      .toContain("broad_change_set");
+  });
+
+  it("uses a stable requested-effort ladder and provider-specific caps", () => {
+    expect(increaseRequestedEffort("medium", 3)).toBe("max");
+    expect(increaseRequestedEffort("xhigh", 2)).toBe("ultra");
+    expect(constrainEffortForAgent("codex", "ultra")).toEqual({
+      effort: "xhigh",
+      reason: "provider_policy_limit:gpt-5.6-sol:xhigh",
+    });
+    expect(constrainEffortForAgent("grok", "ultra")).toEqual({
+      effort: "xhigh",
+      reason: "model_capability_limit:grok-4.6:xhigh",
+    });
+  });
+
+  it.each(["workspace-read", "workspace-write", "external"] as const)(
+    "keeps scope %s in trusted effort inputs",
+    (scope: ApprovalScope) => {
+      const result = assignment("architecture", "codex", undefined, { ...BASE_INPUTS, approvalScope: scope });
+      expect(result.agent).toBe("codex");
+      expect(result.reasons.includes("external_scope")).toBe(scope === "external");
     },
   );
+});
 
-  it("rejects an unknown outcome instead of widening failover", () => {
-    expect(() => classifyOutcome({ kind: "unknown" as never })).toThrow(/unknown outcome/i);
+describe("routing-v4 provider outcome classification", () => {
+  it.each(FAILOVER_OUTCOMES)("classifies %s as retryable but not transferable", (kind) => {
+    expect(classifyOutcome({ kind })).toEqual({
+      failoverEligible: true,
+      countsAgainstProvider: true,
+    });
+  });
+
+  it.each(TERMINAL_OUTCOMES)("classifies %s as terminal", (kind) => {
+    expect(classifyOutcome({ kind })).toEqual({
+      failoverEligible: false,
+      countsAgainstProvider: false,
+    });
+  });
+
+  it("rejects unknown outcomes instead of widening retry authority", () => {
+    expect(() => classifyOutcome({ kind: "unknown" } as never)).toThrow("Unknown outcome: unknown");
   });
 });

@@ -74,6 +74,9 @@ export class ReviewLane {
     changedFiles: number,
     degraded: boolean,
   ) {
+    if (approvalScope !== "workspace-read") {
+      throw new Error("review lanes are read-only and require workspace-read authority");
+    }
     this.bytes = Buffer.from(artifact);
     this.artifactHash = createHash("sha256").update(this.bytes).digest("hex");
     this.recomputedHash = createHash("sha256").update(this.bytes).digest("hex");
@@ -134,6 +137,9 @@ export interface ReviewPlan {
 }
 
 export function createReviewPlan(input: ReviewInput): ReviewPlan {
+  if (input.approvalScope !== "workspace-read") {
+    throw new Error("review is read-only and requires workspace-read authority");
+  }
   const healthy = AGENTS.filter((agent) => input.health[agent] === "healthy");
   if (healthy.length === 0) throw new Error("No healthy provider is available for review");
   if (healthy.length === 2) {

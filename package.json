@@ -6,19 +6,27 @@
   "author": "Anton Shalin <anton.shalin@gmail.com>",
   "type": "module",
   "bin": {
-    "agent-collab": "dist/cli.js"
+    "agent-collab": "scripts/agent-collab-launcher.mjs",
+    "agent-collab-eval": "scripts/agent-collab-eval-launcher.mjs"
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.test.json",
-    "start": "node dist/cli.js"
+    "test:flow": "vitest run tests/source-launcher.test.ts tests/map-framework-integration.test.ts tests/map-admin.test.ts tests/map-update.test.ts tests/evidence-ledger.test.ts tests/execution-snapshot.test.ts tests/execution-admission.test.ts tests/execution-owner-contract.test.ts tests/routing-v4-contract.test.ts tests/collaboration-runtime.test.ts tests/runtime-review-barrier.test.ts tests/review-verdict.test.ts tests/runner-commands.test.ts tests/grok-v2.test.ts tests/worker.test.ts tests/app-service.test.ts --maxWorkers=1 --no-file-parallelism",
+    "map:verify": "mapify check-installed . && mapify check && npm run build --silent && node dist/flow/map-admin-cli.js verify .",
+    "map:update": "npm run build --silent && node dist/flow/map-update-cli.js candidate .",
+    "map:project:codex": "npm run build --silent && node dist/flow/map-admin-cli.js project codex .",
+    "map:project:grok": "npm run build --silent && node dist/flow/map-admin-cli.js project grok .",
+    "eval": "node scripts/agent-collab-eval-launcher.mjs",
+    "start": "node scripts/agent-collab-launcher.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "better-sqlite3": "13.0.3",
     "execa": "10.0.1",
+    "tsx": "4.22.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
