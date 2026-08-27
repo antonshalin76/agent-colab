@@ -85,13 +85,13 @@ describe("runtime provider health persistence", () => {
 
   it("allows exactly one initial probe and persists its claim across reopen", () => {
     const path = database();
-    const first = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    const first = new ProviderHealthStore(path, { cooldownMs: 1_000, attemptLeaseMs: 1_000 });
 
     expect(first.canAttempt("grok", 10)).toBe(true);
     expect(first.canAttempt("grok", 10)).toBe(false);
     first.close();
 
-    const reopened = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    const reopened = new ProviderHealthStore(path, { cooldownMs: 1_000, attemptLeaseMs: 1_000 });
     expect(reopened.snapshot().grok).toMatchObject({
       health: "probing",
       attemptClaimed: true,
@@ -100,6 +100,31 @@ describe("runtime provider health persistence", () => {
     expect(reopened.canAttempt("grok", 11)).toBe(false);
     expect(reopened.canAttempt("grok", 1_010)).toBe(true);
     reopened.close();
+  });
+
+  it("does not expire a live admission claim on the shorter failure cooldown", () => {
+    const store = new ProviderHealthStore(database(), {
+      cooldownMs: 1_000,
+      attemptLeaseMs: 31 * 60_000,
+    });
+    expect(store.canAttempt("grok", 0)).toBe(true);
+    expect(store.canAttempt("grok", 1_000)).toBe(false);
+    expect(store.canAttempt("grok", 31 * 60_000)).toBe(true);
+    store.close();
+  });
+
+  it("lets only the owning admission token transition provider health", () => {
+    const store = new ProviderHealthStore(database(), { cooldownMs: 1_000 });
+    expect(store.canAttempt("grok", 10)).toBe(true);
+
+    store.recordSuccess("grok", 20, 9);
+    expect(store.get("grok")).toMatchObject({ health: "probing", attemptClaimed: true, updatedAt: 10 });
+
+    store.recordSuccess("grok", 21, 10);
+    expect(store.get("grok")).toMatchObject({
+      health: "healthy", attemptClaimed: false, capabilityVerified: true, updatedAt: 21,
+    });
+    store.close();
   });
 
   it("persists failover failure and admits only one probe after cooldown under contention", () => {

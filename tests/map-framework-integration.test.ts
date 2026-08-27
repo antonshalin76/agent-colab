@@ -289,10 +289,10 @@ mainDescribe("MAP 3.28.1 Codex profile", () => {
     expect(() => validateMapProfile(reducedProfile.root, reducedProfile.expectation))
       .toThrow(/profile|full/i);
 
-    const automaticUpdates = createMapFixture();
-    rewriteConfig(automaticUpdates.root, (config) =>
+    const liveAutomaticPromotion = createMapFixture();
+    rewriteConfig(liveAutomaticPromotion.root, (config) =>
       config.replace("updates.auto: false", "updates.auto: true"));
-    expect(() => validateMapProfile(automaticUpdates.root, automaticUpdates.expectation))
+    expect(() => validateMapProfile(liveAutomaticPromotion.root, liveAutomaticPromotion.expectation))
       .toThrow(/update/i);
 
     const missingSkill = createMapFixture();

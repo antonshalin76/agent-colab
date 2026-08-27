@@ -164,13 +164,16 @@ dispatch and immediately before Codex, Grok, or Claude starts.
 
 ## MAP lifecycle
 
-The installed profile is `full`/`lite`, version `3.28.1`, revision
-`1ba52a77b8228a509f3ef08c4fb1f89465699a73`; automatic updates and `/map-auto`
-remain disabled. `map-profile-lock.json` is the checked-in identity.
+The installed profile is `full`/`lite`. The checked-in profile lock records the
+currently verified version and local adapter identities. MAP's maintained
+same-major updater is enabled; higher-major releases still require explicit
+approval.
 
 `npm run map:update` builds an isolated candidate with pinned `uv` and
 Bubblewrap, verifies the candidate offline, and never mutates the active
-profile. Promotion requires a separate reviewed decision. Routine profile
+profile. `npm run map:auto-update` runs that same fail-closed candidate path.
+The user timer checks daily with jitter; promotion remains a separate reviewed
+operation because it changes execution-snapshot identity. Routine profile
 checks use `npm run map:verify`.
 
 ## Stage close
@@ -195,3 +198,9 @@ npm run map:verify
 `test:flow` includes the deterministic Claude command/parser, provider-health,
 six-lane barrier, migration-v3, capability-probe, worker, MCP status, and MAP
 compatibility contracts. It does not run evals or contact a live provider.
+
+Provider admission is demand-driven. An unverified or cooldown-expired provider
+claims one real deferred review lane through the durable health lease. Success
+activates the provider's remaining lanes; a failover-eligible failure returns it
+to cooldown. The explicit capability-probe command is diagnostic and is not a
+prerequisite for ordinary work.

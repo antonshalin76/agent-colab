@@ -32,6 +32,11 @@ export interface ProviderHealthState {
   updatedAt: number;
 }
 
+export interface ProviderAdmission {
+  runnable: boolean;
+  claimedAt?: number | undefined;
+}
+
 interface ProviderHealthRow {
   agent: ReviewProviderId;
   health: ProviderHealth;
@@ -44,6 +49,7 @@ interface ProviderHealthRow {
 
 interface ProviderHealthOptions {
   cooldownMs: number;
+  attemptLeaseMs?: number;
   enabled?: Record<ReviewProviderId, boolean>;
 }
 
@@ -60,12 +66,17 @@ const toState = (row: ProviderHealthRow): ProviderHealthState => ({
 export class ProviderHealthStore {
   private readonly db: Database.Database;
   private readonly cooldownMs: number;
+  private readonly attemptLeaseMs: number;
 
   constructor(path: string, options: ProviderHealthOptions) {
     if (!Number.isSafeInteger(options.cooldownMs) || options.cooldownMs <= 0) {
       throw new Error("cooldownMs must be a positive integer");
     }
     this.cooldownMs = options.cooldownMs;
+    this.attemptLeaseMs = options.attemptLeaseMs ?? 31 * 60_000;
+    if (!Number.isSafeInteger(this.attemptLeaseMs) || this.attemptLeaseMs <= 0) {
+      throw new Error("attemptLeaseMs must be a positive integer");
+    }
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
@@ -161,10 +172,10 @@ export class ProviderHealthStore {
     };
   }
 
-  canAttempt(agent: ReviewProviderId, now: number): boolean {
+  acquireAdmission(agent: ReviewProviderId, now: number): ProviderAdmission {
     const current = this.get(agent);
-    if (current.health === "healthy") return true;
-    if (current.health === "disabled") return false;
+    if (current.health === "healthy") return { runnable: true };
+    if (current.health === "disabled") return { runnable: false };
     const changed = this.db.prepare(`
       UPDATE runtime_provider_health
          SET health = 'probing', retry_at = NULL, attempt_claimed = 1, updated_at = ?
@@ -173,18 +184,15 @@ export class ProviderHealthStore {
            (health = 'probing' AND (attempt_claimed = 0 OR updated_at <= ?))
            OR (health = 'unavailable' AND retry_at IS NOT NULL AND retry_at <= ?)
          )
-    `).run(now, agent, now - this.cooldownMs, now).changes;
-    return changed === 1;
+    `).run(now, agent, now - this.attemptLeaseMs, now).changes;
+    return changed === 1 ? { runnable: true, claimedAt: now } : { runnable: false };
   }
 
-  isRunnable(agent: ReviewProviderId, now: number): boolean {
-    const current = this.get(agent);
-    if (current.health === "healthy") return true;
-    if (current.health === "probing") return !current.attemptClaimed || current.updatedAt <= now - this.cooldownMs;
-    return current.health === "unavailable" && current.retryAt !== null && current.retryAt <= now && !current.attemptClaimed;
+  canAttempt(agent: ReviewProviderId, now: number): boolean {
+    return this.acquireAdmission(agent, now).runnable;
   }
 
-  recordSuccess(agent: ReviewProviderId, now: number): ProviderHealthState {
+  recordSuccess(agent: ReviewProviderId, now: number, expectedClaimedAt?: number): ProviderHealthState {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
     this.db.prepare(`
@@ -192,7 +200,8 @@ export class ProviderHealthStore {
          SET health = 'healthy', retry_at = NULL, failure_count = 0,
              attempt_claimed = 0, capability_verified = 1, updated_at = ?
        WHERE agent = ?
-    `).run(now, agent);
+         AND (? IS NULL OR (attempt_claimed = 1 AND updated_at = ?))
+    `).run(now, agent, expectedClaimedAt ?? null, expectedClaimedAt ?? null);
     return this.get(agent);
   }
 
@@ -209,15 +218,21 @@ export class ProviderHealthStore {
     return this.get(agent);
   }
 
-  releaseAttempt(agent: ReviewProviderId, now: number): ProviderHealthState {
+  releaseAttempt(agent: ReviewProviderId, now: number, expectedClaimedAt?: number): ProviderHealthState {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
-    this.db.prepare(`UPDATE runtime_provider_health SET attempt_claimed = 0, updated_at = ? WHERE agent = ?`)
-      .run(now, agent);
+    this.db.prepare(`UPDATE runtime_provider_health SET attempt_claimed = 0, updated_at = ?
+      WHERE agent = ? AND (? IS NULL OR (attempt_claimed = 1 AND updated_at = ?))`)
+      .run(now, agent, expectedClaimedAt ?? null, expectedClaimedAt ?? null);
     return this.get(agent);
   }
 
-  recordFailoverFailure(agent: ReviewProviderId, outcome: ProviderOutcome, now: number): ProviderHealthState {
+  recordFailoverFailure(
+    agent: ReviewProviderId,
+    outcome: ProviderOutcome,
+    now: number,
+    expectedClaimedAt?: number,
+  ): ProviderHealthState {
     if (!classifyOutcome(outcome).failoverEligible) {
       throw new Error(`Outcome is not failover eligible: ${outcome.kind}`);
     }
@@ -229,7 +244,9 @@ export class ProviderHealthStore {
          SET health = 'unavailable', retry_at = ?, failure_count = failure_count + 1,
              attempt_claimed = 0, capability_verified = ?, updated_at = ?
        WHERE agent = ?
-    `).run(now + this.cooldownMs, preserveCapability ? 1 : 0, now, agent);
+         AND (? IS NULL OR (attempt_claimed = 1 AND updated_at = ?))
+    `).run(now + this.cooldownMs, preserveCapability ? 1 : 0, now, agent,
+      expectedClaimedAt ?? null, expectedClaimedAt ?? null);
     return this.get(agent);
   }
 

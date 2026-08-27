@@ -213,6 +213,17 @@ export class LocalCollabService implements CollabService {
         return run;
       });
   }
+  private admitDemandedReview(reviewId: string, sourceFingerprint: string, now: number): void {
+    for (const agent of ["grok", "claude", "codex"] as const) {
+      this.reviews.activateDeferred({
+        reviewId,
+        agent,
+        currentSourceFingerprint: sourceFingerprint,
+        now,
+        providerHealth: this.providers,
+      });
+    }
+  }
   closeMapLearning(input: MapLearningBytesInput) {
     return this.mapControl.closeLearning(input);
   }
@@ -252,6 +263,7 @@ export class LocalCollabService implements CollabService {
         createdAt: Date.now(),
       });
       const { reviewId } = expectation;
+      this.admitDemandedReview(reviewId, source.fingerprint, Date.now());
       const runs = this.reviewRuns(reviewId, "codex");
       return { name: gate.name, reviewId, barrier: this.reviews.barrier(reviewId), runIds: runs.map((run) => run.id) };
     });
@@ -368,6 +380,7 @@ export class LocalCollabService implements CollabService {
       prompts: { auditor: `AUDITOR independent lane. ${safePrompt}`, critic: `CRITIC independent lane. ${safePrompt}` },
       createdAt: Date.now(), project, requester: input.requester,
       sourceFingerprint: source.fingerprint, changedFiles: source.changedFiles.length });
+    this.admitDemandedReview(reviewId, source.fingerprint, Date.now());
     const runs = this.reviewRuns(reviewId, input.requester);
     return { reviewId, laneCount: 6, activeLaneCount: runs.length, runState: review.runState, runIds: runs.map((lane) => lane.id) };
   }

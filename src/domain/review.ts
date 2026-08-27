@@ -145,7 +145,9 @@ export function createReviewPlan(input: ReviewInput): ReviewPlan {
     throw new Error("review is read-only and requires workspace-read authority");
   }
   const healthy = AGENTS.filter((agent) => input.health[agent] === "healthy");
-  if (healthy.length === 0) throw new Error("No healthy provider is available for review");
+  if (AGENTS.every((agent) => input.health[agent] === "disabled")) {
+    throw new Error("No enabled provider is available for review");
+  }
   if (healthy.length === AGENTS.length) {
     return {
       runState: "FULL_CROSS_PROVIDER",

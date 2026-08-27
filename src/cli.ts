@@ -34,6 +34,8 @@ import { RunStore, type RunRecord } from "./store/run-store.js";
 import { DurableWorker } from "./worker/durable-worker.js";
 import { WorktreeLeaseStore, type WorktreeLease } from "./worktree/lease-store.js";
 import type { AttemptAssignment } from "./workflow/workflow.js";
+import { prepareCommandInput } from "./runners/provider-command.js";
+import { discoverProviderVersion } from "./probes/provider-version.js";
 import {
   parsePersistedDomainEffect,
   assertPersistedDomainEffectMatchesRun,
@@ -266,7 +268,10 @@ if (command === "reconcile-run") {
       throw new Error("review reconciliation cannot synthesize completed evidence; resolve as failed and replay a new lane");
     }
     effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
-      resultKind: "task_failure" };
+      resultKind: "task_failure",
+      ...(typeof run.payload?.providerAdmissionClaimedAt === "number"
+        ? { providerAdmissionClaimedAt: run.payload.providerAdmissionClaimedAt }
+        : {}) };
   } else if (workflowId && stageId && assignment && agent === "codex") {
     if (resolution === "completed") {
       store.close();
@@ -433,6 +438,14 @@ if (command === "mcp") {
         reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "failed",
           error: providerResult, terminalAt });
       }
+      const admissionClaimedAt = effect.providerAdmissionClaimedAt;
+      if (resultKind === "success") {
+        health.recordSuccess(agent, terminalAt, admissionClaimedAt);
+      } else if (isFailoverOutcome(resultKind)) {
+        health.recordFailoverFailure(agent, { kind: resultKind }, terminalAt, admissionClaimedAt);
+      } else if (admissionClaimedAt !== undefined) {
+        health.releaseAttempt(agent, terminalAt, admissionClaimedAt);
+      }
       return;
     }
     poison("unknown persisted domain effect");
@@ -593,11 +606,6 @@ if (command === "mcp") {
       if (durableLaunch?.launched && durableLaunchInfo?.phase !== "started") {
         return result;
       }
-      if (isReviewProviderId(agent) && resultKind === "success") health.recordSuccess(agent, Date.now());
-      if (isReviewProviderId(agent) && isFailoverOutcome(resultKind)) {
-        health.recordFailoverFailure(agent, { kind: resultKind }, Date.now());
-      }
-
       let effect: Record<string, unknown> | null = null;
       if (workflowId && workflowStageId && queuedAssignment && agent === "codex") {
         const terminalAt = Date.now();
@@ -642,9 +650,14 @@ if (command === "mcp") {
       } else if (reviewId && reviewAttemptId && (role === "auditor" || role === "critic") &&
           isReviewProviderId(agent)) {
         effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
-          resultKind, terminalAt: Date.now() };
+          resultKind, terminalAt: Date.now(),
+          ...(typeof run.payload?.providerAdmissionClaimedAt === "number"
+            ? { providerAdmissionClaimedAt: run.payload.providerAdmissionClaimedAt }
+            : {}) };
       }
-      if (!effect) return result;
+      if (!effect) {
+        return result;
+      }
       commitDomainEffect({ providerResult: result, effect,
         status: resultKind === "success" || isFailoverOutcome(resultKind) ? "completed" : "failed" });
       const committed = effectStore.get(run.id)!;
@@ -660,6 +673,12 @@ if (command === "mcp") {
 
   let stopping = false;
   process.once("SIGTERM", () => { stopping = true; });
+  const workerLoops = workers.map(async (worker) => {
+    while (!stopping) {
+      const run = await worker.runOnce(Date.now());
+      if (run === undefined) await delay(500);
+    }
+  });
   let lastRecovery = 0;
   while (!stopping) {
     const now = Date.now();
@@ -684,8 +703,6 @@ if (command === "mcp") {
       const recoveredQueue = new RunStore(layout.database);
       collaborationRuntime.drainDispatchOutbox(recoveredQueue, now); recoveredQueue.close();
       for (const agent of REVIEW_PROVIDERS) {
-        const provider = health.get(agent);
-        if (provider.health !== "healthy") continue;
         for (const reviewId of reviews.deferredReviewIds(agent)) {
           const snapshot = reviews.get(reviewId); if (!snapshot) continue;
           const currentSourceFingerprint = snapshot.project ? captureWorkspaceFingerprint(snapshot.project).fingerprint : undefined;
@@ -695,9 +712,9 @@ if (command === "mcp") {
       }
       lastRecovery = now;
     }
-    await Promise.all(workers.map((worker) => worker.runOnce(now)));
     await delay(500);
   }
+  await Promise.all(workerLoops);
   for (const worker of workers) worker.close();
   health.close(); reviews.close(); collaborationRuntime.close(); worktreeLeases.close(); effectStore.close();
 } else {
@@ -709,9 +726,9 @@ if (command === "mcp") {
       throw new Error("live capability probing may incur provider cost; pass APPROVE_LIVE_CAPABILITY_PROBE explicitly");
     }
     const versions = {
-      grok: process.env.AGENT_COLLAB_GROK_VERSION ?? "grok 1.0.5 (5115b46bc9)",
-      claude: process.env.AGENT_COLLAB_CLAUDE_VERSION ?? "2.1.247 (Claude Code)",
-      codex: process.env.AGENT_COLLAB_CODEX_VERSION ?? "codex-cli 0.147.0",
+      grok: discoverProviderVersion(grokBinary),
+      claude: discoverProviderVersion(claudeBinary),
+      codex: discoverProviderVersion(codexBinary),
     };
     const result = await runCapabilityProbes({
       providers: {
@@ -727,16 +744,22 @@ if (command === "mcp") {
         execute: async (request) => {
           const version = spawnSync(request.file, ["--version"], { encoding: "utf8", timeout: 10_000, shell: false });
           if (version.status !== 0) throw version.error ?? new Error(version.stderr || "version probe failed");
-          const processResult = await execa(request.file, request.args, {
-            cwd: request.cwd,
-            input: request.stdin,
-            shell: false,
-            reject: false,
-            timeout: request.timeoutMs,
-            cleanup: true,
-          });
-          return { exitCode: processResult.exitCode ?? -1, version: version.stdout.trim(),
-            stdout: processResult.stdout, stderr: processResult.stderr };
+          const prepared = prepareCommandInput(request);
+          try {
+            const processResult = await execa(request.file, prepared.args, {
+              cwd: request.cwd,
+              ...(prepared.input !== undefined ? { input: prepared.input } : {}),
+              shell: false,
+              reject: false,
+              timeout: request.timeoutMs,
+              cleanup: true,
+              env: { AGENT_COLLAB_RUN: "1" },
+            });
+            return { exitCode: processResult.exitCode ?? -1, version: version.stdout.trim(),
+              stdout: processResult.stdout, stderr: processResult.stderr };
+          } finally {
+            prepared.cleanup();
+          }
         },
       },
     });

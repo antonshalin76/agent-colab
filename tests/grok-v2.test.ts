@@ -14,6 +14,7 @@ import {
   normalizeGrokResult,
 } from "../src/runners/grok.js";
 import {
+  prepareCommandInput,
   type CommandSpec,
 } from "../src/runners/provider-command.js";
 
@@ -113,6 +114,7 @@ describe("BDD-8 exact provider-neutral Grok runner contract", () => {
       shell: false,
       timeoutMs: 90_000,
       killProcessGroup: true,
+      promptFileArgIndex: 7,
     };
     expect(command).toEqual(expected);
     expect(command.args).not.toContain("--always-approve");
@@ -137,6 +139,19 @@ describe("BDD-8 exact provider-neutral Grok runner contract", () => {
       approvalScope: "external",
       approvalReference: "approval:external",
     } as unknown as Parameters<typeof buildGrokCommand>[0])).toThrow(/workspace-read/i);
+  });
+
+  it("rejects an invalid prompt-file argument index before creating temporary state", () => {
+    expect(() => prepareCommandInput({
+      file: binary,
+      args: ["--prompt-file", "/dev/stdin"],
+      cwd: "/repo",
+      stdin: "audit",
+      shell: false,
+      timeoutMs: 90_000,
+      killProcessGroup: true,
+      promptFileArgIndex: 0,
+    })).toThrow(/promptFileArgIndex/i);
   });
 
   it("accepts only terminal exact-model protocol evidence and returns visible text", () => {

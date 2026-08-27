@@ -648,7 +648,7 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
   }, 20_000);
 
-  it("creates four active and two deferred review lanes when Claude is unavailable", async () => {
+  it("uses the first demanded Claude lane as admission after cooldown", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-degraded-service-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
@@ -662,12 +662,12 @@ describe("local collaboration service wiring", () => {
       const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
       const result = await service.requestReview({ requester: "codex", project, artifactHash, artifactContent,
         prompt: "review", approvalScope: "workspace-read", idempotencyKey: "degraded-review" });
-      expect(result).toMatchObject({ laneCount: 6, activeLaneCount: 4, runState: "DEGRADED_REVIEW_SET" });
+      expect(result).toMatchObject({ laneCount: 6, activeLaneCount: 5, runState: "DEGRADED_REVIEW_SET" });
       expect(service.runs.list().map((run) => run.payload?.preferredAgent)).toEqual([
-        "grok", "grok", "codex", "codex",
+        "grok", "grok", "codex", "codex", "claude",
       ]);
       expect(service.reviews.get(result.reviewId)?.lanes.filter((lane) => lane.agent === "claude")
-        .every((lane) => lane.status === "deferred")).toBe(true);
+        .map((lane) => lane.status)).toEqual(["queued", "deferred"]);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 

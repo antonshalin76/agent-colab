@@ -17,9 +17,7 @@ import {
 } from "node:path";
 import { z } from "zod";
 
-const MAP_VERSION = "3.28.1";
-const MAP_SOURCE_REVISION = "1ba52a77b8228a509f3ef08c4fb1f89465699a73";
-const MAP_SOURCE_ARCHIVE_SHA256 = "b5a391a4f892334655a9d5dc0a405020dfb9284dbd9c9ee63b8be78a818bf990";
+const StableVersionSchema = z.string().regex(/^\d+\.\d+\.\d+$/u);
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const InstalledAtSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
 const ManagementModeSchema = z.enum(["fenced", "full", "hooks-merge"]);
@@ -38,7 +36,7 @@ const ConfigEntrySchema = z.object({
   file: z.string().min(1),
   key_path: z.string().min(1),
   installed_at: z.string().min(1),
-  mapify_version: z.string().min(1),
+  mapify_version: StableVersionSchema,
 }).strict();
 
 const InstallManifestSchema = z.object({
@@ -56,7 +54,7 @@ const OutsideScopeSchema = z.object({
 }).strict();
 
 const ExpectationSchema = z.object({
-  version: z.string().min(1),
+  version: StableVersionSchema,
   sourceRevision: z.string().regex(/^[a-f0-9]{40}$/),
   sourceArchiveSha256: Sha256Schema,
   provider: z.literal("codex"),
@@ -71,7 +69,7 @@ const ManagedMetadataSchema = z.object({
   installed_at: InstalledAtSchema,
 }).strict();
 
-const OFFICIAL_MANAGEMENT_MODE_BY_DESTINATION = {
+const REQUIRED_MANAGEMENT_MODE_BY_DESTINATION = {
   ".agents/skills/map-check/SKILL.md": "fenced",
   ".agents/skills/map-efficient/SKILL.md": "fenced",
   ".agents/skills/map-efficient/efficient-reference.md": "fenced",
@@ -103,8 +101,8 @@ const OFFICIAL_MANAGEMENT_MODE_BY_DESTINATION = {
   "AGENTS.md": "fenced",
 } as const satisfies Record<string, z.infer<typeof ManagementModeSchema>>;
 
-const OFFICIAL_DESTINATIONS = Object.keys(OFFICIAL_MANAGEMENT_MODE_BY_DESTINATION).sort();
-const OFFICIAL_CODEX_SKILLS = [
+const REQUIRED_DESTINATIONS = Object.keys(REQUIRED_MANAGEMENT_MODE_BY_DESTINATION).sort();
+const REQUIRED_CODEX_SKILLS = [
   "map-check",
   "map-efficient",
   "map-explain",
@@ -114,7 +112,6 @@ const OFFICIAL_CODEX_SKILLS = [
   "map-understand",
   "map-upgrade",
 ] as const;
-const CODEX_AGENTS = ["decomposer", "evaluator", "monitor", "predictor", "researcher"] as const;
 const LOCAL_LEARNING_ADAPTER = ".agents/skills/map-learn/SKILL.md";
 
 export interface MapProfileExpectation {
@@ -127,9 +124,9 @@ export interface MapProfileExpectation {
 }
 
 export interface MapProfileReceipt {
-  version: typeof MAP_VERSION;
-  sourceRevision: typeof MAP_SOURCE_REVISION;
-  sourceArchiveSha256: typeof MAP_SOURCE_ARCHIVE_SHA256;
+  version: string;
+  sourceRevision: string;
+  sourceArchiveSha256: string;
   provider: "codex";
   profile: "full";
   minimality: "lite";
@@ -301,9 +298,9 @@ function assertFenceContract(content: string, destination: string, mode: Manifes
   }
 }
 
-function assertManifestIdentity(manifest: InstallManifest): void {
-  if (manifest.mapify_version !== MAP_VERSION) {
-    throw new Error(`MAP manifest version must be ${MAP_VERSION}`);
+function assertManifestIdentity(manifest: InstallManifest, expectedVersion: string): void {
+  if (manifest.mapify_version !== expectedVersion) {
+    throw new Error(`MAP manifest version must be ${expectedVersion}`);
   }
   if (manifest.provider !== "codex" || !sameStrings(manifest.providers, ["codex"])) {
     throw new Error("MAP manifest provider must be exactly codex");
@@ -315,20 +312,17 @@ function assertManifestIdentity(manifest: InstallManifest): void {
   if (new Set(destinations).size !== destinations.length) {
     throw new Error("MAP manifest inventory contains duplicate destinations");
   }
-  const sorted = [...destinations].sort();
-  if (!sameStrings(sorted, OFFICIAL_DESTINATIONS)) {
-    const expected = new Set(OFFICIAL_DESTINATIONS);
-    const actual = new Set(sorted);
-    const missing = OFFICIAL_DESTINATIONS.filter((destination) => !actual.has(destination));
-    const unexpected = sorted.filter((destination) => !expected.has(destination));
-    throw new Error(`MAP manifest inventory mismatch; missing=${missing.join(",")}; unexpected=${unexpected.join(",")}`);
+  const actual = new Set(destinations);
+  const missing = REQUIRED_DESTINATIONS.filter((destination) => !actual.has(destination));
+  if (missing.length > 0) {
+    throw new Error(`MAP manifest required inventory is incomplete; missing=${missing.join(",")}`);
   }
   for (const entry of manifest.entries) {
     requireSafeRelativePath(entry.dest, "MAP manifest destination");
-    const expectedMode = OFFICIAL_MANAGEMENT_MODE_BY_DESTINATION[
-      entry.dest as keyof typeof OFFICIAL_MANAGEMENT_MODE_BY_DESTINATION
+    const expectedMode = REQUIRED_MANAGEMENT_MODE_BY_DESTINATION[
+      entry.dest as keyof typeof REQUIRED_MANAGEMENT_MODE_BY_DESTINATION
     ];
-    if (entry.management_mode !== expectedMode) {
+    if (expectedMode !== undefined && entry.management_mode !== expectedMode) {
       throw new Error(`MAP manifest management mode drift for ${entry.dest}: expected ${expectedMode}`);
     }
     if (!entry.committed) throw new Error(`MAP manifest managed file is not committed: ${entry.dest}`);
@@ -338,7 +332,7 @@ function assertManifestIdentity(manifest: InstallManifest): void {
       }
       continue;
     }
-    if (entry.template_hash === "" || entry.mapify_version !== MAP_VERSION) {
+    if (entry.template_hash === "" || entry.mapify_version !== expectedVersion) {
       throw new Error(`MAP manifest entry version or template digest is invalid: ${entry.dest}`);
     }
     if (entry.installed_at !== manifest.installed_at) {
@@ -352,9 +346,11 @@ function assertManifestIdentity(manifest: InstallManifest): void {
 
 function assertExpectedDigests(
   expected: Readonly<Record<string, string>>,
+  manifest: InstallManifest,
 ): void {
   const destinations = Object.keys(expected).sort();
-  if (!sameStrings(destinations, OFFICIAL_DESTINATIONS)) {
+  const manifestDestinations = manifest.entries.map((entry) => entry.dest).sort();
+  if (!sameStrings(destinations, manifestDestinations)) {
     throw new Error("MAP managed digest expectation must cover the exact official inventory");
   }
 }
@@ -366,7 +362,7 @@ function assertManagedFiles(
 ): Record<string, string> {
   const entries = new Map(manifest.entries.map((entry) => [entry.dest, entry]));
   const receiptDigests: Record<string, string> = {};
-  for (const destination of OFFICIAL_DESTINATIONS) {
+  for (const destination of manifest.entries.map((entry) => entry.dest).sort()) {
     const entry = entries.get(destination);
     if (entry === undefined) throw new Error(`MAP managed manifest entry is missing: ${destination}`);
     const bytes = readBytes(root, destination, "MAP managed file");
@@ -383,7 +379,7 @@ function assertManagedFiles(
     }
     const content = decodeUtf8(bytes, `MAP managed file ${destination}`);
     const { metadata, cleanContent } = extractManagedMetadata(content, destination);
-    if (metadata.mapify_version !== MAP_VERSION || metadata.template_hash !== entry.template_hash) {
+    if (metadata.mapify_version !== manifest.mapify_version || metadata.template_hash !== entry.template_hash) {
       throw new Error(`MAP managed metadata version or template digest mismatch: ${destination}`);
     }
     if (metadata.installed_at !== entry.installed_at) {
@@ -418,11 +414,11 @@ function assertProjectConfig(root: string): void {
     throw new Error("MAP config minimality must be lite");
   }
   if (requireFlatConfigValue(config, "updates.auto") !== "false") {
-    throw new Error("MAP config automatic updates must be disabled");
+    throw new Error("MAP config updates.auto live promotion must be disabled");
   }
 }
 
-function assertCodexConfig(root: string): void {
+function assertCodexConfig(root: string, manifest: InstallManifest): void {
   const config = decodeUtf8(readBytes(root, ".codex/config.toml", "Codex config"), "Codex config");
   let section = "";
   let hooksEnabled = false;
@@ -441,11 +437,15 @@ function assertCodexConfig(root: string): void {
     if (agent !== undefined && configFile !== undefined) registrations.set(agent, configFile);
   }
   if (!hooksEnabled) throw new Error("Codex MAP hooks feature must be enabled");
+  const managedAgents = manifest.entries.flatMap(({ dest }) => {
+    const match = dest.match(/^\.codex\/agents\/([a-z][a-z0-9_-]*)\.toml$/u);
+    return match?.[1] === undefined ? [] : [match[1]];
+  }).sort();
   const registeredAgents = [...registrations.keys()].sort();
-  if (!sameStrings(registeredAgents, [...CODEX_AGENTS].sort())) {
+  if (!sameStrings(registeredAgents, managedAgents)) {
     throw new Error(`Codex MAP agent registrations are incomplete: ${registeredAgents.join(",")}`);
   }
-  for (const agent of CODEX_AGENTS) {
+  for (const agent of managedAgents) {
     if (registrations.get(agent) !== `./agents/${agent}.toml`) {
       throw new Error(`Codex MAP agent registration path is invalid: ${agent}`);
     }
@@ -511,7 +511,15 @@ function assertSkillInventory(root: string, manifest: InstallManifest): string[]
       return entry.name;
     })
     .sort();
-  const expected = [...OFFICIAL_CODEX_SKILLS, "map-learn"].sort();
+  const officialSkills = [...new Set(manifest.entries.flatMap(({ dest }) => {
+    const match = dest.match(/^\.agents\/skills\/(map-[a-z0-9-]+)\//u);
+    return match?.[1] === undefined ? [] : [match[1]];
+  }))].sort();
+  const missingRequired = REQUIRED_CODEX_SKILLS.filter((skill) => !officialSkills.includes(skill));
+  if (missingRequired.length > 0) {
+    throw new Error(`Codex MAP required skill inventory is incomplete: ${missingRequired.join(",")}`);
+  }
+  const expected = [...officialSkills, "map-learn"].sort();
   if (!sameStrings(names, expected)) {
     throw new Error(`Codex MAP skill inventory mismatch: ${names.join(",")}`);
   }
@@ -519,15 +527,16 @@ function assertSkillInventory(root: string, manifest: InstallManifest): string[]
   if (manifest.entries.some((entry) => entry.dest === LOCAL_LEARNING_ADAPTER)) {
     throw new Error("MAP manifest must not own the local map-learn adapter");
   }
-  return [...OFFICIAL_CODEX_SKILLS];
+  return officialSkills;
 }
 
 function assertOutsideScope(
   root: string,
+  manifest: InstallManifest,
   outsideDigests: Readonly<Record<string, string>>,
 ): void {
   const reserved = new Set([
-    ...OFFICIAL_DESTINATIONS,
+    ...manifest.entries.map((entry) => entry.dest),
     ".map/mapify.lock.json",
     ".map/config.yaml",
   ]);
@@ -547,30 +556,26 @@ export function validateMapProfile(
   expectationInput: MapProfileExpectation,
 ): MapProfileReceipt {
   const expectation = parseExpectation(expectationInput);
-  if (expectation.version !== MAP_VERSION) throw new Error(`MAP expected version must be ${MAP_VERSION}`);
-  if (expectation.sourceRevision !== MAP_SOURCE_REVISION) {
-    throw new Error(`MAP source revision must be pinned to ${MAP_SOURCE_REVISION}`);
-  }
-  if (expectation.sourceArchiveSha256 !== MAP_SOURCE_ARCHIVE_SHA256) {
-    throw new Error(`MAP source archive must be pinned to ${MAP_SOURCE_ARCHIVE_SHA256}`);
-  }
   if (expectation.provider !== "codex") throw new Error("MAP expected provider must be codex");
-  assertExpectedDigests(expectation.managedFileSha256);
 
   const root = canonicalRoot(rootInput);
   const manifest = parseManifest(readBytes(root, ".map/mapify.lock.json", "MAP manifest"));
-  assertManifestIdentity(manifest);
+  assertManifestIdentity(manifest, expectation.version);
+  if (manifest.entries.some((entry) => entry.dest === LOCAL_LEARNING_ADAPTER)) {
+    throw new Error("MAP manifest must not own the local map-learn adapter");
+  }
+  assertExpectedDigests(expectation.managedFileSha256, manifest);
   const managedFileSha256 = assertManagedFiles(root, manifest, expectation.managedFileSha256);
   assertProjectConfig(root);
-  assertCodexConfig(root);
+  assertCodexConfig(root, manifest);
   assertCodexHooks(root, manifest);
   const upstreamSkillInventory = assertSkillInventory(root, manifest);
-  assertOutsideScope(root, expectation.outsideScopeSha256);
+  assertOutsideScope(root, manifest, expectation.outsideScopeSha256);
 
   return {
-    version: MAP_VERSION,
-    sourceRevision: MAP_SOURCE_REVISION,
-    sourceArchiveSha256: MAP_SOURCE_ARCHIVE_SHA256,
+    version: expectation.version,
+    sourceRevision: expectation.sourceRevision,
+    sourceArchiveSha256: expectation.sourceArchiveSha256,
     provider: "codex",
     profile: "full",
     minimality: "lite",

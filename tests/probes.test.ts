@@ -102,7 +102,14 @@ const success = (agent: "grok" | "claude" | "codex") => {
         payload: {
           type: "message",
           role: "assistant",
-          content: [{ type: "output_text", text: capabilityPayload("xhigh") }],
+          content: [{
+            type: "output_text",
+            text: JSON.stringify({
+              protocolVersion: "agent-collab/v2",
+              reasoningEffort: "xhigh",
+              visibleText: capabilityPayload("xhigh"),
+            }),
+          }],
         },
       }),
     ].join("\n") + "\n",
@@ -184,6 +191,7 @@ describe("BDD-9 executable bounded review-provider capability probes", () => {
         timeoutMs: 3_000,
         shell: false,
         killProcessGroup: true,
+        promptFileArgIndex: 7,
       },
     ]);
 

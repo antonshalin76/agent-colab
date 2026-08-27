@@ -399,8 +399,10 @@ function verifyCanonicalProfile(root: string): VerifiedMapProfile {
   }
   const sandboxToolPath = profileLock.sandboxTool.executablePath;
   const sandboxToolMetadata = lstatSync(sandboxToolPath);
+  // A hardened user-systemd unit maps host root ownership to nobody (65534).
+  // Canonical path plus the pinned executable digest is stable across that namespace.
   if (!sandboxToolMetadata.isFile() || sandboxToolMetadata.isSymbolicLink() ||
-      realpathSync(sandboxToolPath) !== sandboxToolPath || sandboxToolMetadata.uid !== 0 ||
+      realpathSync(sandboxToolPath) !== sandboxToolPath ||
       (sandboxToolMetadata.mode & 0o111) === 0 ||
       sha256(readFileSync(sandboxToolPath)) !== profileLock.sandboxTool.executableSha256) {
     throw new Error("MAP sandbox tool does not match the checked-in executable identity");

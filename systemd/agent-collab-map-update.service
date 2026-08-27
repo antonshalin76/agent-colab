@@ -1,0 +1,15 @@
+[Unit]
+Description=Stage and verify an isolated MAP update candidate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Source/agent-collab
+ExecStart=/usr/bin/env npm run map:auto-update
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+Environment=PATH=%h/.nvm/versions/node/v24.14.1/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin

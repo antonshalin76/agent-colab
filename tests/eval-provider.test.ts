@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeCodexResult } from "../src/runners/codex.js";
 import { normalizeGrokResult } from "../src/runners/grok.js";
 import type { CommandSpec } from "../src/runners/provider-command.js";
+import { discoverProviderVersion } from "../src/probes/provider-version.js";
 import {
   buildEvalProviderCommand,
   buildContainedEvalProviderCommand,
@@ -595,7 +596,7 @@ describe("paired benchmark provider containment", () => {
   it.skipIf(process.platform !== "linux" || ![
     installedCodex, installedGrok, installedSkills, installedCodexAuth, installedGrokAuth,
   ].every(existsSync))(
-    "resolves the installed 0.147.0/1.0.5 executable layouts without reading provider history",
+    "resolves the installed provider executable layouts without reading provider history",
     () => {
       const root = makeRoot("agent-collab-eval-installed-layout-");
       const attemptRoot = join(root, "attempt");
@@ -630,7 +631,10 @@ describe("paired benchmark provider containment", () => {
         expect(launch.command.args).toContain("--share-net");
         expect(launch.command.args.join(" ")).not.toMatch(/history|sessions|transcript|memories/i);
       }
-      for (const [launch, version] of [[codex, "0.147.0"], [grok, "1.0.5"]] as const) {
+      for (const [launch, version] of [
+        [codex, discoverProviderVersion(installedCodex)],
+        [grok, discoverProviderVersion(installedGrok)],
+      ] as const) {
         const separator = launch.command.args.lastIndexOf("--");
         const args = [...launch.command.args.slice(0, separator + 1), launch.containerExecutable, "--version"];
         const result = spawnSync(launch.command.file, args, {
@@ -643,7 +647,7 @@ describe("paired benchmark provider containment", () => {
         });
         expect(result.error).toBeUndefined();
         expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout).toContain(version);
+        expect(result.stdout.trim()).toBe(version);
       }
     },
   );

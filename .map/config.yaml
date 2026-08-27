@@ -60,7 +60,7 @@ profile: full
 # Allowed: off, lite, full, ultra
 minimality: lite
 
-# Automatic stable MAP updates. Disable with `mapify init --no-auto-update`.
+# Automatic isolated MAP candidate checks; active promotion remains reviewed.
 updates.auto: false
 
 # Agent-prompt layering for repeated same-workflow dispatches (#231).

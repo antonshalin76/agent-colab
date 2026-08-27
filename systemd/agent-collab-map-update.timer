@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for MAP framework updates daily
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=24h
+RandomizedDelaySec=30m
+Persistent=true
+Unit=agent-collab-map-update.service
+
+[Install]
+WantedBy=timers.target

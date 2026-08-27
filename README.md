@@ -194,10 +194,15 @@ rollback bundle; take an operator backup before running it.
 `restore-v1` requires a confirmed inactive service. It restores the v1 data pair
 and leaves service lifecycle changes to the operator.
 
-`doctor` is intentionally non-live. Authentication readiness leaves a provider
-in `probing`. An explicit exact-model structured capability probe changes it to
-`healthy`; the probe consumes provider capacity and is never started
-implicitly:
+`doctor` is intentionally non-live. A provider that has not completed useful
+work remains internally unverified. When review work actually needs that
+provider, the runtime atomically admits one real review lane. A successful
+result marks the provider healthy and releases its remaining deferred lanes; a
+failover-eligible failure starts the bounded cooldown. This demand admission
+does not send a separate capability prompt.
+
+The explicit exact-model probe remains available only as an operator diagnostic
+and may consume provider capacity:
 
 ```bash
 npm start -- probe APPROVE_LIVE_CAPABILITY_PROBE

@@ -67,6 +67,7 @@ export const PersistedDomainEffectSchema = z.discriminatedUnion("type", [
     role: z.enum(["auditor", "critic"]),
     agent: z.enum(["grok", "claude", "codex"]),
     resultKind: ResultKindSchema,
+    providerAdmissionClaimedAt: TerminalAtSchema.optional(),
     terminalAt: TerminalAtSchema,
   }).strict(),
 ]);
@@ -118,6 +119,8 @@ export function assertPersistedDomainEffectMatchesRun(
     requireEqual(effect.role, payload.reviewRole, "review role");
     requireEqual(effect.agent, object(payload.decision)?.agent, "review agent");
     requireEqual(effect.resultKind, providerResult.kind, "provider result kind");
+    requireEqual(effect.providerAdmissionClaimedAt, payload.providerAdmissionClaimedAt,
+      "provider admission claim");
     requireEqual(providerResult.agent, effect.agent, "provider result agent");
     return;
   }

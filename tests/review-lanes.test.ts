@@ -117,10 +117,19 @@ describe("BDD-C1 six-lane review policy", () => {
     }
   });
 
-  it("rejects review creation when no provider is healthy", () => {
-    expect(() => createReviewPlan({
+  it("durably defers demanded review work when enabled providers are not verified yet", () => {
+    const plan = createReviewPlan({
       ...common,
       health: { grok: "unavailable", claude: "disabled", codex: "probing" },
-    })).toThrow(/no healthy provider/i);
+    });
+    expect(plan.activeLanes).toEqual([]);
+    expect(plan.deferredLanes).toHaveLength(6);
+  });
+
+  it("rejects review creation when every provider is disabled", () => {
+    expect(() => createReviewPlan({
+      ...common,
+      health: { grok: "disabled", claude: "disabled", codex: "disabled" },
+    })).toThrow(/no enabled provider/i);
   });
 });

@@ -32,6 +32,7 @@ export interface CapabilityProbeRequest {
   timeoutMs: number;
   shell: false;
   killProcessGroup: true;
+  promptFileArgIndex?: number;
 }
 
 interface CapabilityProcessResult {
@@ -109,6 +110,9 @@ const requestFor = (
     timeoutMs: command.timeoutMs,
     shell: false,
     killProcessGroup: true,
+    ...(command.promptFileArgIndex !== undefined
+      ? { promptFileArgIndex: command.promptFileArgIndex }
+      : {}),
   };
 };
 
@@ -188,7 +192,12 @@ const parseObserved = (
             expectedSessionId: sessionId,
             expectedEffort: config.effort,
           })
-        : normalizeCodexResult(result.stdout);
+        : normalizeCodexResult(result.stdout, {
+            includeUsage: true,
+            expectedEffort: config.effort,
+            expectedProtocolVersion: PROTOCOL,
+            pinnedModel: "gpt-5.6-sol",
+          });
     const capabilityText = agent === "claude"
       ? claudeCapabilityText(normalized.text)
       : normalized.text;

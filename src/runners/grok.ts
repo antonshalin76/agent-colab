@@ -145,6 +145,7 @@ export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
     "--tools",
     READ_TOOLS.join(","),
   );
+  const promptFileArgIndex = args.indexOf("/dev/stdin");
   return {
     file: input.binary,
     args,
@@ -153,6 +154,7 @@ export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
     shell: false,
     timeoutMs: input.timeoutMs,
     killProcessGroup: true,
+    promptFileArgIndex,
   };
 }
 

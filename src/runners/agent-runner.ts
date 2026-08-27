@@ -22,7 +22,7 @@ import { normalizeCodexResult } from "./codex.js";
 import { normalizeGrokResult } from "./grok.js";
 import type { GrokEffort } from "./grok.js";
 import { normalizeClaudeResult } from "./claude.js";
-import { buildProviderCommand, type CommandSpec } from "./provider-command.js";
+import { buildProviderCommand, prepareCommandInput, type CommandSpec } from "./provider-command.js";
 import {
   assertCurrentControlMapLearningLaunchBinding,
   verifyCurrentMapProfile,
@@ -342,18 +342,26 @@ function taskPayload(
 
 class ExecaProcessLauncher implements ProcessLauncher {
   launch(command: CommandSpec): LaunchedProcess {
-    const subprocess = execa(command.file, command.args, {
+    const prepared = prepareCommandInput(command);
+    let subprocess;
+    try {
+      subprocess = execa(command.file, prepared.args, {
       cwd: command.cwd,
-      input: command.stdin,
+      ...(prepared.input !== undefined ? { input: prepared.input } : {}),
       shell: false,
       detached: process.platform !== "win32",
       reject: false,
       all: false,
       cleanup: true,
-      env: { AGENT_COLLAB_PROTOCOL: PROTOCOL },
-    });
+      env: { AGENT_COLLAB_PROTOCOL: PROTOCOL, AGENT_COLLAB_RUN: "1" },
+      });
+    } catch (error) {
+      prepared.cleanup();
+      throw error;
+    }
     if (subprocess.pid === undefined) {
       void subprocess.catch(() => undefined);
+      prepared.cleanup();
       throw Object.assign(new Error(`agent process did not start: ${command.file}`), {
         code: "ENOENT",
       });
@@ -361,10 +369,10 @@ class ExecaProcessLauncher implements ProcessLauncher {
     return {
       pid: subprocess.pid,
       result: subprocess.then((result) => ({
-        exitCode: result.exitCode ?? -1,
-        stdout: result.stdout,
-        stderr: result.stderr,
-      })),
+          exitCode: result.exitCode ?? -1,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        })).finally(prepared.cleanup),
       terminate: (signal) => {
         if (subprocess.pid !== undefined && process.platform !== "win32") {
           try { process.kill(-subprocess.pid, signal); } catch { /* process group already exited */ }

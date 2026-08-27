@@ -83,6 +83,7 @@ export interface ReviewAttemptSnapshot {
   error?: unknown;
   createdAt: number;
   terminalAt: number | null;
+  providerAdmissionClaimedAt?: number | undefined;
 }
 
 export interface ReviewBarrierSnapshot {
@@ -122,6 +123,7 @@ export interface LaneEnqueueDescriptor {
   project?: string | undefined;
   requester?: ActiveAgentId | undefined;
   sourceFingerprint?: string | undefined;
+  providerAdmissionClaimedAt?: number | undefined;
 }
 
 interface ReviewRow {
@@ -241,6 +243,9 @@ export const createReviewRunInput = (lane: LaneEnqueueDescriptor) => {
       artifactHash: lane.artifactHash,
       reviewAttemptId: lane.attemptId,
       reviewAttemptOrdinal: lane.attemptOrdinal,
+      ...(lane.providerAdmissionClaimedAt === undefined
+        ? {}
+        : { providerAdmissionClaimedAt: lane.providerAdmissionClaimedAt }),
     },
   };
 };
@@ -433,6 +438,9 @@ export class RunGateUnitOfWork {
           : {}),
         createdAt: link.created_at,
         terminalAt,
+        ...(typeof payload.providerAdmissionClaimedAt === "number"
+          ? { providerAdmissionClaimedAt: payload.providerAdmissionClaimedAt }
+          : {}),
       };
     });
   }
@@ -624,6 +632,9 @@ export class RunGateUnitOfWork {
       degraded: lane.degraded,
       attemptId: attempt.attemptId,
       attemptOrdinal: attempt.attemptOrdinal,
+      ...(attempt.providerAdmissionClaimedAt === undefined
+        ? {}
+        : { providerAdmissionClaimedAt: attempt.providerAdmissionClaimedAt }),
       ...(review.project === null ? {} : { project: review.project }),
       ...(review.requester === null ? {} : { requester: review.requester }),
       ...(review.source_fingerprint === null ? {} : { sourceFingerprint: review.source_fingerprint }),
@@ -863,16 +874,19 @@ export class RunGateUnitOfWork {
       `).run(input.now, input.reviewId, input.agent);
       return { status: "stale_artifact", lanes: [] };
     }
-    if (!input.providerHealth.isRunnable(input.agent, input.now)) {
+    const admission = input.providerHealth.acquireAdmission(input.agent, input.now);
+    if (!admission.runnable) {
       return { status: "provider_unavailable", lanes: [] };
     }
+    const admissionRun = admission.claimedAt !== undefined;
 
     const activate = this.db.transaction(() => {
       const deferred = this.laneRows(input.reviewId).filter(
         (lane) => lane.agent === input.agent && lane.status === "deferred",
       );
+      const selected = admissionRun ? deferred.slice(0, 1) : deferred;
       const descriptors: LaneEnqueueDescriptor[] = [];
-      for (const lane of deferred) {
+      for (const lane of selected) {
         const attempts = this.attemptsFor(input.reviewId, lane.agent, lane.role);
         const latest = attempts.at(-1);
         const attemptOrdinal = (latest?.attemptOrdinal ?? -1) + 1;
@@ -886,7 +900,7 @@ export class RunGateUnitOfWork {
           ? lane.idempotency_key
           : `${review.idempotency_key}:${lane.agent}:${lane.role}:attempt:${attemptOrdinal}`;
         const claimed = this.db.prepare(`UPDATE runtime_review_lanes
-          SET model=?,effort=?,policy_version=?,reasons=?,session_id=?,idempotency_key=?,degraded=1
+          SET status='queued',model=?,effort=?,policy_version=?,reasons=?,session_id=?,idempotency_key=?,degraded=1
           WHERE review_id=? AND agent=? AND role=? AND status='deferred'`).run(
             decision.model, decision.effort, decision.policyVersion, JSON.stringify(decision.reasons),
             sessionId, idempotencyKey, input.reviewId, lane.agent, lane.role,
@@ -910,6 +924,9 @@ export class RunGateUnitOfWork {
           degraded: true,
           attemptId: randomUUID(),
           attemptOrdinal,
+          ...(admission.claimedAt === undefined
+            ? {}
+            : { providerAdmissionClaimedAt: admission.claimedAt }),
           ...(review.project === null ? {} : { project: review.project }),
           ...(review.requester === null ? {} : { requester: review.requester }),
           ...(review.source_fingerprint === null ? {} : { sourceFingerprint: review.source_fingerprint }),
@@ -922,11 +939,20 @@ export class RunGateUnitOfWork {
           );
         descriptors.push(descriptor);
       }
-      this.db.prepare(`UPDATE runtime_review_lanes SET status='queued'
-        WHERE review_id=? AND agent=? AND status='deferred'`).run(input.reviewId, input.agent);
       return descriptors;
     });
-    const lanes = activate.immediate();
+    let lanes: LaneEnqueueDescriptor[];
+    try {
+      lanes = activate.immediate();
+    } catch (error) {
+      if (admission.claimedAt !== undefined) {
+        input.providerHealth.releaseAttempt(input.agent, input.now, admission.claimedAt);
+      }
+      throw error;
+    }
+    if (lanes.length === 0 && admission.claimedAt !== undefined) {
+      input.providerHealth.releaseAttempt(input.agent, input.now, admission.claimedAt);
+    }
     return lanes.length === 0 ? { status: "none", lanes } : { status: "activated", lanes };
   }
 

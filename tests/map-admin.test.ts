@@ -258,7 +258,7 @@ describe("local MAP administration adapter", { timeout: 15_000 }, () => {
     expect(() => verifyInstalledMapProfile(runtimeDrift)).toThrow(/runtime tool.*identity/i);
   });
 
-  it("includes Python bytecode in the MAP runtime tree identity", () => {
+  it("includes executable Python bytecode in the MAP runtime tree identity", () => {
     const root = tempRoot("agent-collab-map-runtime-tree-");
     const bytecodeDirectory = join(root, "lib/python/site-packages/__pycache__");
     mkdirSync(bytecodeDirectory, { recursive: true });
@@ -266,6 +266,8 @@ describe("local MAP administration adapter", { timeout: 15_000 }, () => {
     writeFileSync(bytecodePath, "first-bytecode");
     const before = fingerprintMapRuntimeToolTree(root);
     writeFileSync(bytecodePath, "mutated-bytecode");
+    expect(fingerprintMapRuntimeToolTree(root)).not.toBe(before);
+    writeFileSync(join(root, "lib/python/site-packages/mapify_cli.py"), "source");
     expect(fingerprintMapRuntimeToolTree(root)).not.toBe(before);
   });
 

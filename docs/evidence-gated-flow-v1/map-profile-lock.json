@@ -22,12 +22,12 @@
     "toolRoot": "/home/anton/.local/share/uv/tools/mapify-cli",
     "executablePath": "/home/anton/.local/share/uv/tools/mapify-cli/bin/mapify",
     "executableSha256": "2284fff2c1493ae8334dfbe51fca7395e8cd4dbcf8dbe1f20ecf40d11ab4b7d8",
-    "toolTreeSha256": "3da0de77d9e7b02a7dd5705c5d8f57f121f6463f33dc3e725c2d63d32ec34588",
+    "toolTreeSha256": "ef8906b98fce1423154efbb2ceffa40da52e5993c52b6179b8b035d933bcae6e",
     "pythonRealPath": "/home/anton/.local/share/uv/python/cpython-3.14.0rc3-linux-x86_64-gnu/bin/python3.14",
     "pythonSha256": "d5dde1eb49cbf743e4c389a6461fe27cf2da7792b672f6db62618f93430e26ea"
   },
   "mapManifestSha256": "392a90596d0aaff3a6cfc2e40bed3dbbcc0b2da41512b1827fa1b5cb4de536e0",
-  "mapConfigSha256": "9135c22e19e484fffb369b8d91829fe61d5e98a3608acee880ec741273e519b0",
+  "mapConfigSha256": "22a94cdd0465ec1cfcbe0943d5d53fe588c95c695e78d89c2437ce9c047f0890",
   "managedFileSha256": {
     ".agents/skills/map-check/SKILL.md": "624fcb01a897e806f652942ee71d4216394b9d655acf0380135779ec1d8aca20",
     ".agents/skills/map-efficient/SKILL.md": "89f31e5f0e261a935b286eae491ffd94f7015630197a0bc2bd2e8b396154e418",

@@ -605,9 +605,8 @@ describe("runtime durable review barrier", () => {
       providerHealth: health,
     });
     expect(activated.status).toBe("activated");
-    expect(activated.lanes.map((lane) => `${lane.agent}:${lane.role}`).sort()).toEqual([
+    expect(activated.lanes.map((lane) => `${lane.agent}:${lane.role}`)).toEqual([
       "claude:auditor",
-      "claude:critic",
     ]);
     for (const lane of activated.lanes) {
       const run = createReviewRunInput(lane);
@@ -615,17 +614,17 @@ describe("runtime durable review barrier", () => {
       const context = formatMapLearningLaunchBindingContext(run.payload.mapLearning);
       expect(run.payload.prompt.split(context)).toHaveLength(2);
     }
-    expect(health.get("claude").attemptClaimed).toBe(false);
+    expect(health.get("claude").attemptClaimed).toBe(true);
     expect(competing.activateDeferred({ reviewId: input.reviewId, agent: "claude",
-      currentSourceFingerprint: sourceFingerprint, now: 1_100, providerHealth: health }).status).toBe("none");
-    expect(store.enqueueDescriptors(input.reviewId)).toHaveLength(2);
+      currentSourceFingerprint: sourceFingerprint, now: 1_100, providerHealth: health }).status).toBe("provider_unavailable");
+    expect(store.enqueueDescriptors(input.reviewId)).toHaveLength(1);
     expect(store.activateDeferred({
       reviewId: input.reviewId,
       agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
-    })).toEqual({ status: "none", lanes: [] });
+    })).toEqual({ status: "provider_unavailable", lanes: [] });
 
     store.close();
     competing.close();
@@ -757,7 +756,7 @@ describe("runtime durable review barrier", () => {
       providerHealth: health,
     });
     expect(activated.status).toBe("activated");
-    expect(activated.lanes).toHaveLength(2);
+    expect(activated.lanes).toHaveLength(1);
     expect(store.get(input.reviewId)?.artifactHash).toBe(artifactHash);
 
     store.close();
