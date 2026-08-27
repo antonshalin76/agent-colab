@@ -31,6 +31,11 @@ const artifact = Buffer.from("immutable runtime review packet", "utf8");
 const artifactHash = createHash("sha256").update(artifact).digest("hex");
 const project = process.cwd();
 const sourceFingerprint = captureWorkspaceFingerprint(project).fingerprint;
+const healthyReviewProviders = {
+  grok: "healthy",
+  claude: "healthy",
+  codex: "healthy",
+} as const;
 const input = {
   reviewId: "review-runtime-1",
   stageId: "architecture-audit",
@@ -49,7 +54,7 @@ const input = {
 
 const attemptIdFor = (
   store: RunGateUnitOfWork,
-  agent: "grok" | "codex",
+  agent: "grok" | "claude" | "codex",
   role: "auditor" | "critic",
 ): string => store.attempts(input.reviewId, agent, role).at(-1)!.attemptId;
 
@@ -71,10 +76,33 @@ const changesResult = () => ({
   },
 });
 
+const inconclusiveResult = () => ({
+  kind: "success",
+  reviewVerdict: {
+    schemaVersion: "review-verdict/v1",
+    verdict: "INCONCLUSIVE",
+    findings: [],
+  },
+});
+
+const warningPassResult = () => ({
+  kind: "success",
+  reviewVerdict: {
+    schemaVersion: "review-verdict/v1",
+    verdict: "PASS",
+    findings: [{ risk_level: "warn", message: "blocking warning" }],
+  },
+});
+
+const malformedSuccessResult = () => ({
+  kind: "success",
+  reviewVerdict: { verdict: "PASS", findings: [] },
+});
+
 const completeLaneWithEvidence = (
   path: string,
   store: RunGateUnitOfWork,
-  agent: "grok" | "codex",
+  agent: "grok" | "claude" | "codex",
   role: "auditor" | "critic",
   verdict: "pass" | "changes" = "pass",
 ): void => {
@@ -118,7 +146,7 @@ describe("runtime durable review barrier", () => {
     )`);
     db.close();
 
-    expect(() => new RunGateUnitOfWork(path)).toThrow(/current routing-v4 schema/i);
+    expect(() => new RunGateUnitOfWork(path)).toThrow(/current routing-v5 schema/i);
     const unchanged = new Database(path, { readonly: true });
     expect(unchanged.prepare(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_review_lanes'",
@@ -129,7 +157,7 @@ describe("runtime durable review barrier", () => {
   it("rejects a routing-v2 review database without mutating schema or rows", () => {
     const path = database();
     const source = new RunGateUnitOfWork(path);
-    source.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
+    source.create({ ...input, health: healthyReviewProviders });
     source.close();
 
     const schema = new Database(path);
@@ -137,7 +165,7 @@ describe("runtime durable review barrier", () => {
     schema.pragma("writable_schema = ON");
     schema.prepare(`
       UPDATE sqlite_master
-         SET sql = replace(sql, 'policy_version = ''routing-v4''',
+         SET sql = replace(sql, 'policy_version = ''routing-v5''',
                                 'policy_version = ''routing-v2''')
        WHERE type = 'table'
          AND name IN ('runtime_review_lanes', 'runtime_review_lane_attempts')
@@ -157,7 +185,7 @@ describe("runtime durable review barrier", () => {
     const lanesBefore = before.prepare("SELECT * FROM runtime_review_lanes ORDER BY agent,role").all();
     before.close();
 
-    expect(() => new RunGateUnitOfWork(path)).toThrow(/current routing-v4 schema/i);
+    expect(() => new RunGateUnitOfWork(path)).toThrow(/current routing-v5 schema/i);
 
     const verified = new Database(path, { readonly: true });
     expect(verified.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all()).toEqual(schemaBefore);
@@ -167,14 +195,14 @@ describe("runtime durable review barrier", () => {
        WHERE type = 'table' AND name = 'runtime_review_lanes'
     `).get() as { sql: string }).sql;
     expect(tableSql).toContain("'routing-v2'");
-    expect(tableSql).not.toContain("'routing-v4'");
+    expect(tableSql).not.toContain("'routing-v5'");
     verified.close();
   });
 
   it("rolls back a corrupt routing-v2 migration and rejects every reopen", () => {
     const path = database();
     const source = new RunGateUnitOfWork(path);
-    source.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
+    source.create({ ...input, health: healthyReviewProviders });
     source.close();
 
     const schema = new Database(path);
@@ -182,7 +210,7 @@ describe("runtime durable review barrier", () => {
     schema.pragma("writable_schema = ON");
     schema.prepare(`
       UPDATE sqlite_master
-         SET sql = replace(sql, 'policy_version = ''routing-v4''',
+         SET sql = replace(sql, 'policy_version = ''routing-v5''',
                                 'policy_version = ''routing-v2''')
        WHERE type = 'table'
          AND name IN ('runtime_review_lanes', 'runtime_review_lane_attempts')
@@ -212,51 +240,55 @@ describe("runtime durable review barrier", () => {
     unchanged.close();
   });
 
-  it("persists exact four full-review lanes over copied bytes and exposes enqueue descriptors", () => {
+  it("persists exact six full-review lanes over copied bytes and exposes enqueue descriptors", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
     const source = Buffer.from(artifact);
     const review = store.create({
       ...input,
       artifact: source,
-      health: { grok: "healthy", codex: "healthy" },
+      health: healthyReviewProviders,
     });
     source.fill(0);
 
     expect(review.runState).toBe("FULL_CROSS_PROVIDER");
     expect(review.artifactHash).toBe(artifactHash);
     expect(review.artifact).toEqual(artifact);
-    expect(review.lanes).toHaveLength(4);
+    expect(review.lanes).toHaveLength(6);
     expect(review.lanes.map((lane) => `${lane.agent}:${lane.role}:${lane.status}`)).toEqual([
       "grok:auditor:queued",
       "grok:critic:queued",
+      "claude:auditor:queued",
+      "claude:critic:queued",
       "codex:auditor:queued",
       "codex:critic:queued",
     ]);
 
     const descriptors = store.enqueueDescriptors(input.reviewId);
-    expect(descriptors).toHaveLength(4);
-    expect(new Set(descriptors.map((lane) => lane.sessionId)).size).toBe(4);
-    expect(new Set(descriptors.map((lane) => lane.idempotencyKey)).size).toBe(4);
+    expect(descriptors).toHaveLength(6);
+    expect(new Set(descriptors.map((lane) => lane.sessionId)).size).toBe(6);
+    expect(new Set(descriptors.map((lane) => lane.idempotencyKey)).size).toBe(6);
     expect(descriptors.every((lane) => lane.artifactHash === artifactHash)).toBe(true);
     expect(descriptors.every((lane) => lane.artifact.equals(artifact))).toBe(true);
     expect(descriptors.map(({ agent, role, model, effort, policyVersion, reasons }) => ({
       agent, role, model, effort, policyVersion, reasons,
     }))).toEqual([
-      { agent: "grok", role: "auditor", model: "grok-4.6", effort: "high", policyVersion: "routing-v4", reasons: ["stage_baseline:code_audit:high"] },
-      { agent: "grok", role: "critic", model: "grok-4.6", effort: "xhigh", policyVersion: "routing-v4", reasons: ["stage_baseline:code_critic:xhigh"] },
-      { agent: "codex", role: "auditor", model: "gpt-5.6-sol", effort: "high", policyVersion: "routing-v4", reasons: ["stage_baseline:code_audit:high"] },
-      { agent: "codex", role: "critic", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v4", reasons: ["stage_baseline:code_critic:xhigh"] },
+      { agent: "grok", role: "auditor", model: "grok-4.6", effort: "high", policyVersion: "routing-v5", reasons: ["stage_baseline:code_audit:high"] },
+      { agent: "grok", role: "critic", model: "grok-4.6", effort: "xhigh", policyVersion: "routing-v5", reasons: ["stage_baseline:code_critic:xhigh"] },
+      { agent: "claude", role: "auditor", model: "glm-5.3", effort: "high", policyVersion: "routing-v5", reasons: ["stage_baseline:code_audit:high"] },
+      { agent: "claude", role: "critic", model: "glm-5.3", effort: "xhigh", policyVersion: "routing-v5", reasons: ["stage_baseline:code_critic:xhigh"] },
+      { agent: "codex", role: "auditor", model: "gpt-5.6-sol", effort: "high", policyVersion: "routing-v5", reasons: ["stage_baseline:code_audit:high"] },
+      { agent: "codex", role: "critic", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v5", reasons: ["stage_baseline:code_critic:xhigh"] },
     ]);
     descriptors[0]!.artifact.fill(1);
     expect(store.enqueueDescriptors(input.reviewId)[0]!.artifact).toEqual(artifact);
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: false,
       terminalCount: 0,
-      requiredCount: 4,
+      requiredCount: 6,
     });
     const runs = new RunStore(path);
-    expect(runs.list()).toHaveLength(4);
+    expect(runs.list()).toHaveLength(6);
     runs.close();
     store.close();
   });
@@ -266,7 +298,7 @@ describe("runtime durable review barrier", () => {
     const first = new RunGateUnitOfWork(path);
     const created = first.create({
       ...input,
-      health: { grok: "healthy", codex: "healthy" },
+      health: healthyReviewProviders,
     });
     first.close();
 
@@ -274,14 +306,14 @@ describe("runtime durable review barrier", () => {
     const same = reopened.create({
       ...input,
       artifact: Buffer.from(artifact),
-      health: { grok: "unavailable", codex: "healthy" },
+      health: { ...healthyReviewProviders, grok: "unavailable" },
     });
     expect(same).toEqual(created);
     expect(() =>
       reopened.create({
         ...input,
         artifact: Buffer.from("changed bytes"),
-        health: { grok: "healthy", codex: "healthy" },
+        health: healthyReviewProviders,
       }),
     ).toThrow(/immutable review conflict/i);
     reopened.close();
@@ -290,6 +322,8 @@ describe("runtime durable review barrier", () => {
   it.each([
     "grok:auditor",
     "grok:critic",
+    "claude:auditor",
+    "claude:critic",
     "codex:auditor",
     "codex:critic",
   ])("rolls back the full gate when atomic run creation fails at %s", (lane) => {
@@ -304,7 +338,7 @@ describe("runtime durable review barrier", () => {
 
     expect(() => store.create({
       ...input,
-      health: { grok: "healthy", codex: "healthy" },
+      health: healthyReviewProviders,
     })).toThrow(/injected review run failure/i);
     const evidence = new Database(path, { readonly: true });
     for (const table of [
@@ -322,7 +356,7 @@ describe("runtime durable review barrier", () => {
   it("records terminality without treating failures or change requests as semantic PASS", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
+    store.create({ ...input, health: healthyReviewProviders });
 
     store.recordTerminal({
       reviewId: input.reviewId,
@@ -341,6 +375,24 @@ describe("runtime durable review barrier", () => {
       status: "failed",
       error: { message: "critic failure" },
       terminalAt: 201,
+    });
+    store.recordTerminal({
+      reviewId: input.reviewId,
+      agent: "claude",
+      role: "auditor",
+      attemptId: attemptIdFor(store, "claude", "auditor"),
+      status: "completed",
+      result: passResult(),
+      terminalAt: 202,
+    });
+    store.recordTerminal({
+      reviewId: input.reviewId,
+      agent: "claude",
+      role: "critic",
+      attemptId: attemptIdFor(store, "claude", "critic"),
+      status: "completed",
+      result: passResult(),
+      terminalAt: 202,
     });
     store.recordTerminal({
       reviewId: input.reviewId,
@@ -364,8 +416,8 @@ describe("runtime durable review barrier", () => {
     });
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: false,
-      terminalCount: 4,
-      requiredCount: 4,
+      terminalCount: 6,
+      requiredCount: 6,
     });
     store.close();
 
@@ -373,9 +425,14 @@ describe("runtime durable review barrier", () => {
     expect(reopened.get(input.reviewId)?.lanes.map(({ status }) => status).sort()).toEqual([
       "completed",
       "completed",
+      "completed",
+      "completed",
       "failed",
       "timed_out",
     ]);
+    expect(reopened.get(input.reviewId)?.lanes.find(
+      ({ agent, role }) => agent === "claude" && role === "critic",
+    )?.result).toEqual(passResult());
     expect(reopened.barrier(input.reviewId).satisfied).toBe(false);
     expect(reopened.recordTerminal({
       reviewId: input.reviewId,
@@ -399,14 +456,17 @@ describe("runtime durable review barrier", () => {
 
   it.each([
     ["request_changes", "completed", changesResult()],
+    ["inconclusive", "completed", inconclusiveResult()],
+    ["warning_pass", "completed", warningPassResult()],
+    ["malformed_success", "completed", malformedSuccessResult()],
     ["failed", "failed", undefined],
     ["timed_out", "timed_out", undefined],
   ] as const)("keeps one isolated %s lane from satisfying the semantic barrier", (_case, blockedStatus, blockedResult) => {
     const store = new RunGateUnitOfWork(database());
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
+    store.create({ ...input, health: healthyReviewProviders });
     const blockedAgent = "grok" as const;
     const blockedRole = "auditor" as const;
-    for (const agent of ["grok", "codex"] as const) {
+    for (const agent of ["grok", "claude", "codex"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         const blocked = agent === blockedAgent && role === blockedRole;
         store.recordTerminal({
@@ -423,8 +483,8 @@ describe("runtime durable review barrier", () => {
     }
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: false,
-      terminalCount: 4,
-      requiredCount: 4,
+      terminalCount: 6,
+      requiredCount: 6,
     });
     store.close();
   });
@@ -432,16 +492,16 @@ describe("runtime durable review barrier", () => {
   it("opens the semantic barrier only when every required lane completes with PASS", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
-    for (const agent of ["grok", "codex"] as const) {
+    store.create({ ...input, health: healthyReviewProviders });
+    for (const agent of ["grok", "claude", "codex"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         completeLaneWithEvidence(path, store, agent, role);
       }
     }
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: true,
-      terminalCount: 4,
-      requiredCount: 4,
+      terminalCount: 6,
+      requiredCount: 6,
     });
     store.close();
   });
@@ -449,8 +509,8 @@ describe("runtime durable review barrier", () => {
   it("rejects completed runner rows whose payload is not the exact canonical review packet", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
-    for (const agent of ["grok", "codex"] as const) {
+    store.create({ ...input, health: healthyReviewProviders });
+    for (const agent of ["grok", "claude", "codex"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         completeLaneWithEvidence(path, store, agent, role);
       }
@@ -469,8 +529,8 @@ describe("runtime durable review barrier", () => {
   it("keeps exact launched runner evidence blocked when its semantic verdict requests changes", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
-    for (const agent of ["grok", "codex"] as const) {
+    store.create({ ...input, health: healthyReviewProviders });
+    for (const agent of ["grok", "claude", "codex"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         completeLaneWithEvidence(
           path,
@@ -485,11 +545,12 @@ describe("runtime durable review barrier", () => {
     store.close();
   });
 
-  it("creates two active and two deferred lanes, activating deferred only after provider cooldown", () => {
+  it("creates four active and two deferred lanes, activating Claude only after provider cooldown", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    expect(health.canAttempt("grok", 0)).toBe(true);
-    health.recordFailoverFailure("grok", { kind: "quota" }, 100);
+    expect(health.canAttempt("claude", 0)).toBe(true);
+    health.recordFailoverFailure("claude", { kind: "quota" }, 100);
+    health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
 
     const store = new RunGateUnitOfWork(path);
@@ -497,56 +558,70 @@ describe("runtime durable review barrier", () => {
     const sourceFingerprint = captureWorkspaceFingerprint(project).fingerprint;
     const review = store.create({
       ...input,
-      health: { grok: "unavailable", codex: "healthy" },
+      health: { ...healthyReviewProviders, claude: "unavailable" },
       project,
       requester: "codex",
       sourceFingerprint,
     });
-    expect(review.runState).toBe("DEGRADED_SINGLE_PROVIDER");
+    expect(review.runState).toBe("DEGRADED_REVIEW_SET");
     expect(review.lanes.map((lane) => `${lane.agent}:${lane.role}:${lane.status}`)).toEqual([
-      "grok:auditor:deferred",
-      "grok:critic:deferred",
+      "grok:auditor:queued",
+      "grok:critic:queued",
+      "claude:auditor:deferred",
+      "claude:critic:deferred",
       "codex:auditor:queued",
       "codex:critic:queued",
     ]);
     expect(store.enqueueDescriptors(input.reviewId).map((lane) => lane.agent)).toEqual([
+      "grok",
+      "grok",
       "codex",
       "codex",
     ]);
+    for (const agent of ["grok", "codex"] as const) {
+      for (const role of ["auditor", "critic"] as const) {
+        completeLaneWithEvidence(path, store, agent, role);
+      }
+    }
+    expect(store.barrier(input.reviewId)).toEqual({
+      satisfied: false,
+      terminalCount: 4,
+      requiredCount: 6,
+    });
     const competing = new RunGateUnitOfWork(path);
 
     expect(store.activateDeferred({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_099,
       providerHealth: health,
     })).toEqual({ status: "provider_unavailable", lanes: [] });
     const activated = store.activateDeferred({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
     });
     expect(activated.status).toBe("activated");
     expect(activated.lanes.map((lane) => `${lane.agent}:${lane.role}`).sort()).toEqual([
-      "grok:auditor",
-      "grok:critic",
+      "claude:auditor",
+      "claude:critic",
     ]);
     for (const lane of activated.lanes) {
       const run = createReviewRunInput(lane);
-      expect(run.payload.mapLearning.consumer).toBe("grok");
+      expect(run.payload.mapLearning.consumer).toBe("claude");
       const context = formatMapLearningLaunchBindingContext(run.payload.mapLearning);
       expect(run.payload.prompt.split(context)).toHaveLength(2);
     }
-    expect(health.get("grok").attemptClaimed).toBe(false);
-    expect(competing.activateDeferred({ reviewId: input.reviewId, agent: "grok",
+    expect(health.get("claude").attemptClaimed).toBe(false);
+    expect(competing.activateDeferred({ reviewId: input.reviewId, agent: "claude",
       currentSourceFingerprint: sourceFingerprint, now: 1_100, providerHealth: health }).status).toBe("none");
-    expect(store.enqueueDescriptors(input.reviewId)).toHaveLength(4);
+    expect(store.enqueueDescriptors(input.reviewId)).toHaveLength(2);
     expect(store.activateDeferred({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
@@ -561,33 +636,41 @@ describe("runtime durable review barrier", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
     health.recordSuccess("grok", 1);
+    health.recordSuccess("claude", 1);
     health.recordSuccess("codex", 1);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
+    store.create({ ...input, health: healthyReviewProviders });
     const initial = store.enqueueDescriptors(input.reviewId)
-      .find((lane) => lane.agent === "grok" && lane.role === "auditor")!;
+      .find((lane) => lane.agent === "claude" && lane.role === "auditor")!;
     const attemptRuns = new RunStore(path);
-    const claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
+    let claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
       now: Date.now() + 1_000 })!;
+    while (claimedInitial.idempotencyKey !== initial.idempotencyKey) {
+      attemptRuns.releaseForRetry(claimedInitial.id, claimedInitial.leaseToken!, {
+        nextAttemptAt: Date.now() + 60_000,
+      });
+      claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
+        now: Date.now() + 1_000 })!;
+    }
     expect(claimedInitial.idempotencyKey).toBe(initial.idempotencyKey);
-    attemptRuns.markLaunchIntent(claimedInitial.id, claimedInitial.leaseToken!, { agent: "grok" });
+    attemptRuns.markLaunchIntent(claimedInitial.id, claimedInitial.leaseToken!, { agent: "claude" });
     attemptRuns.markLaunched(claimedInitial.id, claimedInitial.leaseToken!, { pid: 1234 });
     attemptRuns.commitDomainEffect({
       id: claimedInitial.id,
       token: claimedInitial.leaseToken!,
-      providerResult: { kind: "quota", agent: "grok" },
+      providerResult: { kind: "quota", agent: "claude" },
       effect: { type: "review", reviewId: input.reviewId, attemptId: initial.attemptId,
-        role: "auditor", agent: "grok", resultKind: "quota", terminalAt: 100 },
+        role: "auditor", agent: "claude", resultKind: "quota", terminalAt: 100 },
       status: "completed",
     });
     attemptRuns.close();
 
     const deferred = store.recordProviderUnavailable({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       role: "auditor",
       attemptId: initial.attemptId,
-      error: { kind: "quota", agent: "grok" },
+      error: { kind: "quota", agent: "claude" },
       terminalAt: 100,
     });
     expect(deferred.status).toBe("deferred");
@@ -602,17 +685,17 @@ describe("runtime durable review barrier", () => {
     ]);
     expect(store.recordProviderUnavailable({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       role: "auditor",
       attemptId: initial.attemptId,
-      error: { kind: "quota", agent: "grok" },
+      error: { kind: "quota", agent: "claude" },
       terminalAt: 100,
     }).attempts).toHaveLength(1);
 
-    health.recordSuccess("grok", 1_100);
+    health.recordSuccess("claude", 1_100);
     const activated = store.activateDeferred({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
@@ -626,31 +709,31 @@ describe("runtime durable review barrier", () => {
     expect(retry.attemptId).not.toBe(initial.attemptId);
     expect(retry.sessionId).not.toBe(initial.sessionId);
     expect(retry.idempotencyKey).not.toBe(initial.idempotencyKey);
-    expect(store.attempts(input.reviewId, "grok", "auditor")).toHaveLength(2);
+    expect(store.attempts(input.reviewId, "claude", "auditor")).toHaveLength(2);
     expect(store.recordProviderUnavailable({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       role: "auditor",
       attemptId: initial.attemptId,
-      error: { kind: "quota", agent: "grok" },
+      error: { kind: "quota", agent: "claude" },
       terminalAt: 100,
     }).status).toBe("queued");
-    expect(store.attempts(input.reviewId, "grok", "auditor")).toHaveLength(2);
+    expect(store.attempts(input.reviewId, "claude", "auditor")).toHaveLength(2);
     expect(() => store.recordTerminal({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       role: "auditor",
       attemptId: initial.attemptId,
       status: "completed",
       result: { verdict: "late" },
       terminalAt: 1_101,
     })).toThrow(/active attempt/i);
-    expect(store.attempts(input.reviewId, "grok", "auditor").at(-1)?.status).toBe("scheduled");
-    expect(store.activateDeferred({ reviewId: input.reviewId, agent: "grok",
+    expect(store.attempts(input.reviewId, "claude", "auditor").at(-1)?.status).toBe("scheduled");
+    expect(store.activateDeferred({ reviewId: input.reviewId, agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_101, providerHealth: health })).toEqual({ status: "none", lanes: [] });
     expect(store.enqueueDescriptors(input.reviewId)
-      .find((lane) => lane.agent === "grok" && lane.role === "auditor")?.attemptId)
+      .find((lane) => lane.agent === "claude" && lane.role === "auditor")?.attemptId)
       .toBe(retry.attemptId);
     store.close();
     health.close();
@@ -659,15 +742,16 @@ describe("runtime durable review barrier", () => {
   it("activates against the immutable persisted artifact without a caller-supplied hash", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    expect(health.canAttempt("grok", 0)).toBe(true);
-    health.recordFailoverFailure("grok", { kind: "model_unavailable" }, 100);
+    expect(health.canAttempt("claude", 0)).toBe(true);
+    health.recordFailoverFailure("claude", { kind: "model_unavailable" }, 100);
+    health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "unavailable", codex: "healthy" } });
+    store.create({ ...input, health: { ...healthyReviewProviders, claude: "unavailable" } });
 
     const activated = store.activateDeferred({
       reviewId: input.reviewId,
-      agent: "grok",
+      agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
@@ -683,7 +767,7 @@ describe("runtime durable review barrier", () => {
   it("makes a post-launch unknown attempt explicit and resolves it only by exact attempt id", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { grok: "healthy", codex: "healthy" } });
+    store.create({ ...input, health: healthyReviewProviders });
     const attemptId = attemptIdFor(store, "grok", "auditor");
     const runs = new RunStore(path);
     const claimed = runs.claimNext({ workerId: "reconcile-test", leaseMs: 1_000,
@@ -709,13 +793,14 @@ describe("runtime durable review barrier", () => {
   it("marks deferred lanes stale when the source workspace fingerprint changed", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    health.canAttempt("grok", 0); health.recordFailoverFailure("grok", { kind: "quota" }, 100);
+    health.canAttempt("claude", 0); health.recordFailoverFailure("claude", { kind: "quota" }, 100);
+    health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, sourceFingerprint: "workspace-v1", health: { grok: "unavailable", codex: "healthy" } });
-    expect(store.activateDeferred({ reviewId: input.reviewId, agent: "grok",
+    store.create({ ...input, sourceFingerprint: "workspace-v1", health: { ...healthyReviewProviders, claude: "unavailable" } });
+    expect(store.activateDeferred({ reviewId: input.reviewId, agent: "claude",
       currentSourceFingerprint: "workspace-v2", now: 1_100, providerHealth: health })).toEqual({ status: "stale_artifact", lanes: [] });
-    expect(health.get("grok").attemptClaimed).toBe(false);
+    expect(health.get("claude").attemptClaimed).toBe(false);
     store.close(); health.close();
   });
 });

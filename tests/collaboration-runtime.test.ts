@@ -146,7 +146,7 @@ const completeCoordination = (
   now = 2,
 ) => persistOutcome(runtime, runs, workflowId, active, "success", now).state;
 
-describe("routing-v4 collaboration runtime and transactional outbox", () => {
+describe("routing-v5 collaboration runtime and transactional outbox", () => {
   it("rejects a workflow without an exact durable MAP learning snapshot before persistence", () => {
     const root = makeRoot("missing-map-learning");
     const db = join(root, "state.db");
@@ -273,7 +273,7 @@ describe("routing-v4 collaboration runtime and transactional outbox", () => {
       expect(initial.activeStage?.assignment).toMatchObject({
         agent: "codex",
         model: "gpt-5.6-sol",
-        policyVersion: "routing-v4",
+        policyVersion: "routing-v5",
         attemptOrdinal: 0,
       });
       expect(runtime.drainDispatchOutbox(runs, 2)).toBe(1);
@@ -284,7 +284,7 @@ describe("routing-v4 collaboration runtime and transactional outbox", () => {
       const planning = completeCoordination(runtime, runs, "wf", initial.activeStage!, 3);
       expect(planning.activeStage).toMatchObject({
         id: "planning",
-        assignment: { agent: "codex", policyVersion: "routing-v4" },
+        assignment: { agent: "codex", policyVersion: "routing-v5" },
       });
       expect(runtime.drainDispatchOutbox(runs, 4)).toBe(1);
       expect(runs.getByIdempotencyKey("wf:dispatch:1")?.payload?.workflowDispatchIdentity)
@@ -385,7 +385,7 @@ describe("routing-v4 collaboration runtime and transactional outbox", () => {
       expect(state.completedStageIds).toContain(active.id);
       expect(state.activeStage).toMatchObject({
         id: "planning",
-        assignment: { agent: "codex", policyVersion: "routing-v4" },
+        assignment: { agent: "codex", policyVersion: "routing-v5" },
       });
       expect(() => runtime.recordRunnerOutcome("wf", receipt, 4))
         .toThrow(/runner receipt|active workflow stage/i);

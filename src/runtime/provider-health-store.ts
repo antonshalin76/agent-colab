@@ -1,24 +1,29 @@
 import Database from "better-sqlite3";
 import { classifyOutcome, type ProviderOutcome } from "../domain/outcomes.js";
-import type { AgentId, ProviderHealth } from "../domain/routing.js";
+import {
+  REVIEW_PROVIDER_IDS,
+  type ProviderHealth,
+  type ReviewProviderId,
+} from "../domain/routing.js";
 
-const AGENTS: readonly AgentId[] = ["grok", "codex"];
+const AGENTS = REVIEW_PROVIDER_IDS;
 const TRANSIENT_CAPABILITY_FAILURES: ReadonlySet<ProviderOutcome["kind"]> = new Set([
   "quota", "rate_limit", "overload", "network_timeout",
 ]);
 
-const assertFreshV2Schema = (db: Database.Database): void => {
+const assertFreshV3Schema = (db: Database.Database): void => {
   const row = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runtime_provider_health'",
   ).get() as { sql: string } | undefined;
   const sql = row?.sql.toLowerCase() ?? "";
-  if (!sql.includes("'grok'") || sql.includes("'claude'") || !sql.includes("capability_verified")) {
-    throw new Error("runtime_provider_health requires offline v1-to-v2 migration");
+  if (!sql.includes("'grok'") || !sql.includes("'claude'") || !sql.includes("'codex'") ||
+      !sql.includes("capability_verified")) {
+    throw new Error("runtime_provider_health requires offline v2-to-v3 migration");
   }
 };
 
 export interface ProviderHealthState {
-  agent: AgentId;
+  agent: ReviewProviderId;
   health: ProviderHealth;
   retryAt: number | null;
   failureCount: number;
@@ -28,7 +33,7 @@ export interface ProviderHealthState {
 }
 
 interface ProviderHealthRow {
-  agent: AgentId;
+  agent: ReviewProviderId;
   health: ProviderHealth;
   retry_at: number | null;
   failure_count: number;
@@ -39,7 +44,7 @@ interface ProviderHealthRow {
 
 interface ProviderHealthOptions {
   cooldownMs: number;
-  enabled?: Record<AgentId, boolean>;
+  enabled?: Record<ReviewProviderId, boolean>;
 }
 
 const toState = (row: ProviderHealthRow): ProviderHealthState => ({
@@ -69,7 +74,7 @@ export class ProviderHealthStore {
     ).get();
     if (existing !== undefined) {
       try {
-        assertFreshV2Schema(this.db);
+        assertFreshV3Schema(this.db);
       } catch (error) {
         this.db.close();
         throw error;
@@ -77,7 +82,7 @@ export class ProviderHealthStore {
     }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS runtime_provider_health (
-        agent TEXT PRIMARY KEY CHECK (agent IN ('grok', 'codex')),
+        agent TEXT PRIMARY KEY CHECK (agent IN ('grok', 'claude', 'codex')),
         health TEXT NOT NULL CHECK (health IN ('healthy', 'unavailable', 'probing', 'disabled')),
         retry_at INTEGER,
         failure_count INTEGER NOT NULL DEFAULT 0,
@@ -87,15 +92,15 @@ export class ProviderHealthStore {
       )
     `);
     try {
-      assertFreshV2Schema(this.db);
+      assertFreshV3Schema(this.db);
     } catch (error) {
       this.db.close();
       throw error;
     }
-    this.initialize(options.enabled ?? { grok: true, codex: true });
+    this.initialize(options.enabled ?? { grok: true, claude: true, codex: true });
   }
 
-  private initialize(enabled: Record<AgentId, boolean>): void {
+  private initialize(enabled: Record<ReviewProviderId, boolean>): void {
     const initialize = this.db.transaction(() => {
       for (const agent of AGENTS) {
         const row = this.row(agent);
@@ -134,7 +139,7 @@ export class ProviderHealthStore {
     initialize.immediate();
   }
 
-  private row(agent: AgentId): ProviderHealthRow | undefined {
+  private row(agent: ReviewProviderId): ProviderHealthRow | undefined {
     return this.db.prepare(`
       SELECT agent, health, retry_at, failure_count, attempt_claimed, capability_verified, updated_at
         FROM runtime_provider_health
@@ -142,20 +147,21 @@ export class ProviderHealthStore {
     `).get(agent) as ProviderHealthRow | undefined;
   }
 
-  get(agent: AgentId): ProviderHealthState {
+  get(agent: ReviewProviderId): ProviderHealthState {
     const row = this.row(agent);
     if (row === undefined) throw new Error(`Provider health is not initialized: ${agent}`);
     return toState(row);
   }
 
-  snapshot(): Record<AgentId, ProviderHealthState> {
+  snapshot(): Record<ReviewProviderId, ProviderHealthState> {
     return {
       grok: this.get("grok"),
+      claude: this.get("claude"),
       codex: this.get("codex"),
     };
   }
 
-  canAttempt(agent: AgentId, now: number): boolean {
+  canAttempt(agent: ReviewProviderId, now: number): boolean {
     const current = this.get(agent);
     if (current.health === "healthy") return true;
     if (current.health === "disabled") return false;
@@ -171,14 +177,14 @@ export class ProviderHealthStore {
     return changed === 1;
   }
 
-  isRunnable(agent: AgentId, now: number): boolean {
+  isRunnable(agent: ReviewProviderId, now: number): boolean {
     const current = this.get(agent);
     if (current.health === "healthy") return true;
     if (current.health === "probing") return !current.attemptClaimed || current.updatedAt <= now - this.cooldownMs;
     return current.health === "unavailable" && current.retryAt !== null && current.retryAt <= now && !current.attemptClaimed;
   }
 
-  recordSuccess(agent: AgentId, now: number): ProviderHealthState {
+  recordSuccess(agent: ReviewProviderId, now: number): ProviderHealthState {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
     this.db.prepare(`
@@ -190,7 +196,7 @@ export class ProviderHealthStore {
     return this.get(agent);
   }
 
-  recordAuthReady(agent: AgentId, now: number): ProviderHealthState {
+  recordAuthReady(agent: ReviewProviderId, now: number): ProviderHealthState {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
     this.db.prepare(`
@@ -203,7 +209,7 @@ export class ProviderHealthStore {
     return this.get(agent);
   }
 
-  releaseAttempt(agent: AgentId, now: number): ProviderHealthState {
+  releaseAttempt(agent: ReviewProviderId, now: number): ProviderHealthState {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
     this.db.prepare(`UPDATE runtime_provider_health SET attempt_claimed = 0, updated_at = ? WHERE agent = ?`)
@@ -211,7 +217,7 @@ export class ProviderHealthStore {
     return this.get(agent);
   }
 
-  recordFailoverFailure(agent: AgentId, outcome: ProviderOutcome, now: number): ProviderHealthState {
+  recordFailoverFailure(agent: ReviewProviderId, outcome: ProviderOutcome, now: number): ProviderHealthState {
     if (!classifyOutcome(outcome).failoverEligible) {
       throw new Error(`Outcome is not failover eligible: ${outcome.kind}`);
     }

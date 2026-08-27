@@ -1,12 +1,17 @@
-export type ActiveAgentId = "grok" | "codex";
+export const ACTIVE_AGENT_IDS = ["grok", "codex"] as const;
+export const REVIEW_PROVIDER_IDS = ["grok", "claude", "codex"] as const;
+
+export type ActiveAgentId = (typeof ACTIVE_AGENT_IDS)[number];
+export type ReviewProviderId = (typeof REVIEW_PROVIDER_IDS)[number];
 export type AgentId = ActiveAgentId;
 export type ProviderHealth = "healthy" | "unavailable" | "probing" | "disabled";
 export type ProviderHealthSnapshot = Record<ActiveAgentId, ProviderHealth>;
-export type Effort = "low" | "medium" | "high" | "xhigh";
-export type RequestedEffort = Effort | "max" | "ultra";
+export type ReviewProviderHealthSnapshot = Record<ReviewProviderId, ProviderHealth>;
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+export type RequestedEffort = Effort | "ultra";
 export type ApprovalScope = "workspace-read" | "workspace-write" | "external";
 
-export const ROUTING_POLICY_VERSION = "routing-v4" as const;
+export const ROUTING_POLICY_VERSION = "routing-v5" as const;
 
 export const STAGES = [
   "coordination",
@@ -141,11 +146,14 @@ export type EffortReason =
   | "large_artifact"
   | "broad_change_set"
   | `provider_policy_limit:gpt-5.6-sol:${Effort}`
-  | `model_capability_limit:grok-4.6:${Effort}`;
+  | `model_capability_limit:grok-4.6:${Effort}`
+  | `model_capability_limit:glm-5.3:${Effort}`;
 
-export interface EffortDecision {
-  readonly agent: ActiveAgentId;
-  readonly model: "grok-4.6" | "gpt-5.6-sol";
+export type ProviderModel = "grok-4.6" | "glm-5.3" | "gpt-5.6-sol";
+
+export interface EffortDecision<A extends ReviewProviderId = ReviewProviderId> {
+  readonly agent: A;
+  readonly model: ProviderModel;
   readonly effort: Effort;
   readonly policyVersion: typeof ROUTING_POLICY_VERSION;
   readonly reasons: readonly EffortReason[];
@@ -159,9 +167,9 @@ export interface SelectStageAssignmentInput {
   readonly trustedInputs: TrustedEffortInputs;
 }
 
-export interface SelectFixedAgentEffortInput {
+export interface SelectFixedAgentEffortInput<A extends ReviewProviderId = ReviewProviderId> {
   readonly stage: Stage;
-  readonly agent: ActiveAgentId;
+  readonly agent: A;
   readonly trustedInputs: TrustedEffortInputs;
   readonly degraded: boolean;
 }
@@ -174,13 +182,18 @@ export const PROVIDER_EFFORT_PROFILES = {
     supportedEfforts: ["low", "medium", "high", "xhigh"],
     policyMaximum: null,
   },
+  claude: {
+    model: "glm-5.3",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    policyMaximum: null,
+  },
   codex: {
     model: "gpt-5.6-sol",
     supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     policyMaximum: "xhigh",
   },
-} as const satisfies Record<ActiveAgentId, {
-  readonly model: "grok-4.6" | "gpt-5.6-sol";
+} as const satisfies Record<ReviewProviderId, {
+  readonly model: ProviderModel;
   readonly supportedEfforts: readonly RequestedEffort[];
   readonly policyMaximum: Effort | null;
 }>;
@@ -204,7 +217,7 @@ export type EffortLimitReason = Extract<
 >;
 
 export const constrainEffortForAgent = (
-  agent: ActiveAgentId,
+  agent: ReviewProviderId,
   requested: RequestedEffort,
 ): { effort: Effort; reason: EffortLimitReason | null } => {
   const profile = PROVIDER_EFFORT_PROFILES[agent];
@@ -223,10 +236,10 @@ export const constrainEffortForAgent = (
       reason: `provider_policy_limit:gpt-5.6-sol:${effort}`,
     };
   }
-  return {
-    effort,
-    reason: `model_capability_limit:grok-4.6:${effort}`,
-  };
+  const reason = agent === "grok"
+    ? `model_capability_limit:grok-4.6:${effort}` as const
+    : `model_capability_limit:glm-5.3:${effort}` as const;
+  return { effort, reason };
 };
 
 export const preferredAgentForStage = (stage: Stage): ActiveAgentId =>
@@ -240,8 +253,8 @@ const READ_ONLY_STAGES: ReadonlySet<Stage> = new Set([
 export const stageRequiresReadOnly = (stage: Stage): boolean => READ_ONLY_STAGES.has(stage);
 
 export const modelForAgent = (
-  agent: ActiveAgentId,
-): EffortDecision["model"] => (agent === "grok" ? "grok-4.6" : "gpt-5.6-sol");
+  agent: ReviewProviderId,
+): ProviderModel => PROVIDER_EFFORT_PROFILES[agent].model;
 
 export const providerSupportsApprovalScope = (
   agent: ActiveAgentId,
@@ -250,7 +263,7 @@ export const providerSupportsApprovalScope = (
 
 export function selectStageAssignment(
   input: SelectStageAssignmentInput,
-): EffortDecision {
+): EffortDecision<ActiveAgentId> {
   const policy = STAGE_POLICY[input.stage];
   const preferred = policy.preferredAgent;
   const agent = input.health[preferred] === "healthy" &&
@@ -269,10 +282,13 @@ export function selectStageAssignment(
   });
 }
 
-export function selectFixedAgentEffort(
-  input: SelectFixedAgentEffortInput,
-): EffortDecision {
-  const baseline = STAGE_POLICY[input.stage].baselineEffort[input.agent];
+export function selectFixedAgentEffort<A extends ReviewProviderId>(
+  input: SelectFixedAgentEffortInput<A>,
+): EffortDecision<A> {
+  const activeBaseline = STAGE_POLICY[input.stage].baselineEffort;
+  const baseline: Effort = input.agent === "claude"
+    ? activeBaseline.codex
+    : activeBaseline[input.agent as ActiveAgentId];
   const reasons: EffortReason[] = [
     `stage_baseline:${input.stage}:${baseline}`,
   ];

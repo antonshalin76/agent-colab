@@ -2,23 +2,27 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
-Local, single-user collaboration router for Grok and Codex coding agents.
+Local, single-user collaboration router for Codex, Grok, and Claude Code coding
+agents.
 
 Agent Collab exposes a stdio MCP server, a durable SQLite work queue, a
-read-only normalized history index, and a shared skills root so both agents can
+read-only normalized history index, and a shared skills root so the agents can
 coordinate work without exposing a network listener.
 
 ## What it does
 
 - Routes every mutable workflow stage through Codex 5.6 Sol using persisted
-  `routing-v4` decisions; Grok 4.6 is an additional read-only review harness.
+  `routing-v5` decisions. Grok 4.6 and Claude Code with GLM-5.3 are additional
+  read-only review harnesses.
 - Selects model effort adaptively from `low`, `medium`, `high`, `xhigh`, `max`,
   and `ultra`.
-- Caps Codex/Sol at `xhigh` by policy while leaving Grok uncapped by router
-  policy and bounded only by the effort levels advertised by the pinned model.
-- Creates isolated review lanes for auditor and critic roles on each provider.
+- Caps Codex/Sol at `xhigh` by policy. Grok is bounded by its pinned model at
+  `xhigh`; Claude/GLM-5.3 accepts `low` through `max` and rejects `ultra`.
+- Creates six isolated review lanes: auditor and corrective critic roles for
+  Grok, Claude, and Codex. Their durable reports are read by the main Codex
+  workflow through `collab_run_status`.
 - Retries the Codex stage owner after bounded provider outages without
-  transferring writer authority to Grok.
+  transferring writer authority to Grok or Claude.
 - Keeps degraded review lanes durable so the missing provider can recover the
   exact read-only lane when the artifact and workspace fingerprint still match.
 - Indexes native agent histories and memory as read-only, redacted, hashed,
@@ -36,7 +40,7 @@ coordinate work without exposing a network listener.
 - Node.js 24 or newer
 - npm
 - SQLite support through `better-sqlite3`
-- Grok CLI and Codex CLI installed locally
+- Grok CLI, Claude Code CLI, and Codex CLI installed locally
 - A client that can register a stdio MCP command
 
 ## Install
@@ -62,6 +66,7 @@ Agent Collab works with these environment variables:
 ```bash
 export AGENT_COLLAB_STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agent-collab"
 export AGENT_COLLAB_GROK_BIN="$(command -v grok)"
+export AGENT_COLLAB_CLAUDE_BIN="$(command -v claude)"
 export AGENT_COLLAB_CODEX_BIN="$(command -v codex)"
 export AGENT_COLLAB_ALLOWED_ROOTS="$HOME/src:$HOME/work"
 ```
@@ -81,14 +86,14 @@ state with restrictive permissions where supported by the operating system.
 
 ## MCP command
 
-Register the built CLI as a stdio MCP command in both Grok and Codex:
+Register the built CLI as a stdio MCP command in Grok, Claude Code, and Codex:
 
 ```text
 node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs mcp
 ```
 
-Use the absolute path for your checkout. Restart Grok and Codex after changing
-the MCP registration or shared skills.
+Use the absolute path for your checkout. Restart the three harnesses after
+changing the MCP registration or shared skills.
 
 ## Worker
 
@@ -111,6 +116,7 @@ npm run build
 npm start -- doctor
 npm start -- doctor-v1
 npm start -- migrate-v2
+npm start -- migrate-v3
 npm start -- verify-bundle /absolute/rollback/bundle
 npm start -- restore-v1 /absolute/rollback/bundle
 npm start -- reconcile-run <run-id> <completed|failed>
@@ -177,6 +183,14 @@ active and writes a retained rollback bundle under
 `$AGENT_COLLAB_STATE_DIR/rollback/`. Normal commands never migrate a v1 database
 implicitly.
 
+`migrate-v3` is an offline v2-to-v3 state-schema migration. Stop the user
+service first. It requires both databases to be at v2, keeps history at v2, and
+refuses before DDL if any row exists in `runs`, `collaboration_runs`,
+`collaboration_dispatch_outbox`, `runtime_review_barriers`,
+`runtime_review_lanes`, `runtime_review_lane_attempts`, or `worktree_leases` —
+including terminal rows. Unlike `migrate-v2`, it does not create a retained
+rollback bundle; take an operator backup before running it.
+
 `restore-v1` requires a confirmed inactive service. It restores the v1 data pair
 and leaves service lifecycle changes to the operator.
 
@@ -211,14 +225,17 @@ npm start -- probe APPROVE_LIVE_CAPABILITY_PROBE
 Codex owns coordination, planning, architecture, implementation, verification,
 state transitions, and the task-worktree mutation lease.
 
-Grok is an additional independent harness for immutable `workspace-read`
-auditor and critic lanes. It cannot become a workflow writer or an outage
+Grok and Claude are additional independent harnesses for immutable
+`workspace-read` auditor and corrective critic lanes. Claude is pinned to
+`glm-5.3`, a fresh non-persistent session, an empty MCP configuration, and the
+`Read,Glob,Grep` tool surface. Neither can become a workflow writer or an outage
 replacement for Codex.
 
 The MAP 3.28.1 control plane is pinned to the Codex provider. Planning prompts
 invoke its plan contract; architecture-sensitive and implementation stages are
 held at `blocked_map_admission` until exact-target architecture and
-implementer-readiness barriers pass across Codex and Grok auditor/critic lanes.
+implementer-readiness barriers pass across Codex, Grok, and Claude
+auditor/critic lanes.
 The target binds branch ref, upstream ref and tip, merge base, HEAD,
 source/index/nested-repository identity, and the active MAP profile version,
 revision, archive, manifest, profile-lock, managed-byte, local `map-learn`, and
@@ -227,7 +244,7 @@ every durable stage, rejects it before workflow persistence if missing, and
 quarantines a stale outbox copy before publication. The runner repeats the
 entire fixed admission synchronously at its final pre-spawn boundary, including
 source, learning, profile, durable target, review barriers, and consumed
-authority; both harnesses receive the promoted
+authority; all three harnesses receive the promoted
 MAP learning projection in their real execution prompts.
 Review output uses the strict `review-verdict/v1` schema with canonical
 `risk_level`. `npm run map:update` creates and validates an isolated candidate,
@@ -269,7 +286,7 @@ authoritative `collaboration.db`; production declarations expose only the
 fixed-root `MapControlPlane` mutation input, so callers cannot substitute a
 project root, evidence DB, execution backend, or structural authority.
 Promotion requires a canonical task packet, validated finding lifecycles, and
-four launched durable Codex/Grok PASS rows for that exact packet. Its fix,
+six launched durable Codex/Grok/Claude PASS rows for that exact packet. Its fix,
 old-code regression, and sibling-scan receipts are produced by three distinct
 oracle/control defect-class-specific, code-owned `map-evidence-record`
 executors. Their stage, oracle, control, typed root-cause class, and mutation
@@ -284,7 +301,11 @@ the record and head, revalidates source, control, and MAP profile after publicat
 and rolls back an interrupted or drifted promotion before any projection or retry.
 Every workflow and review queue row carries the exact promoted projection bytes,
 digest, and consumer. The runner compares them with current control-root
-learning and the prompt immediately before starting Codex or Grok.
+learning and the prompt immediately before starting Codex, Grok, or Claude.
+
+The existing Grok/Codex evaluation corpus and paired benchmark remain
+unchanged. Claude is added only to production review routing; this change does
+not add Claude eval cells or execute live provider calls.
 
 Retry, external authority, artifacts of at least 256 KiB, and
 changes spanning at least 20 files each raise requested effort by one step

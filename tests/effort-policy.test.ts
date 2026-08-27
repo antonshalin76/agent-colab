@@ -45,18 +45,27 @@ const runnerWith = (launch = vi.fn(() => ({
 }))) => ({
   launch,
   runner: new AgentRunner({
-    binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+    binaries: {
+      grok: "/home/anton/.local/bin/grok",
+      claude: "/home/anton/.local/bin/claude",
+      codex: "/opt/codex",
+    },
     timeoutMs: 90_000,
     launcher: { launch } as ProcessLauncher,
   }),
 });
 
 describe("provider-specific effort limits", () => {
-  it("pins the changed durable decision grammar to routing-v4", () => {
-    expect(ROUTING_POLICY_VERSION).toBe("routing-v4");
+  it("pins the changed durable decision grammar to routing-v5", () => {
+    expect(ROUTING_POLICY_VERSION).toBe("routing-v5");
   });
 
-  it("caps Codex/Sol at xhigh while Grok has no policy maximum", () => {
+  it("separates workflow agents from the three review providers", () => {
+    expect(Reflect.get(routing, "ACTIVE_AGENT_IDS")).toEqual(["grok", "codex"]);
+    expect(Reflect.get(routing, "REVIEW_PROVIDER_IDS")).toEqual(["grok", "claude", "codex"]);
+  });
+
+  it("owns all review provider model and effort capabilities in one profile", () => {
     const profile = Reflect.get(routing, "PROVIDER_EFFORT_PROFILES") as
       | Record<string, unknown>
       | undefined;
@@ -64,6 +73,11 @@ describe("provider-specific effort limits", () => {
       grok: {
         model: "grok-4.6",
         supportedEfforts: ["low", "medium", "high", "xhigh"],
+        policyMaximum: null,
+      },
+      claude: {
+        model: "glm-5.3",
+        supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
         policyMaximum: null,
       },
       codex: {
@@ -83,6 +97,9 @@ describe("provider-specific effort limits", () => {
     ["grok", "xhigh", "xhigh", null],
     ["grok", "max", "xhigh", "model_capability_limit:grok-4.6:xhigh"],
     ["grok", "ultra", "xhigh", "model_capability_limit:grok-4.6:xhigh"],
+    ["claude", "low", "low", null],
+    ["claude", "max", "max", null],
+    ["claude", "ultra", "max", "model_capability_limit:glm-5.3:max"],
   ] as const)("constrains %s requested %s to %s with exact evidence", (agent, requested, effort, reason) => {
     const constrain = Reflect.get(routing, "constrainEffortForAgent") as
       | ((agent: string, requested: string) => unknown)
@@ -153,13 +170,13 @@ describe("provider-specific effort limits", () => {
   it("accepts exact capped evidence bound to its immutable review dispatch identity", async () => {
     const valid = runnerWith();
     const identity = {
-      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v4",
+      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v5",
       reasons: [
         "stage_baseline:code_critic:xhigh",
         "retry",
         "provider_policy_limit:gpt-5.6-sol:xhigh",
       ],
-      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v4",
+      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v5",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
     };
     await expect(valid.runner.run({
@@ -184,10 +201,10 @@ describe("provider-specific effort limits", () => {
     ["cap evidence", { reasons: ["stage_baseline:code_critic:xhigh", "retry"] }],
   ] as const)("rejects decision %s drift from immutable workflow identity", async (_label, patch) => {
     const identity = {
-      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v4",
+      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v5",
       reasons: ["stage_baseline:code_critic:xhigh", "retry",
         "provider_policy_limit:gpt-5.6-sol:xhigh"],
-      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v4",
+      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v5",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
     };
     const forged = runnerWith();
@@ -218,7 +235,7 @@ describe("provider-specific effort limits", () => {
         requester: "codex", workflowId: "workflow", workflowStageId: "coordination",
         workflowDispatchId: "workflow:dispatch:0", sourceFingerprint, mapLearning: codexLearning,
         decision: {
-          agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v4",
+          agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v5",
           reasons: ["stage_baseline:coordination:medium"],
         },
       },
@@ -228,9 +245,9 @@ describe("provider-specific effort limits", () => {
 
   it("rejects workflow session drift from immutable identity", async () => {
     const identity = {
-      agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v4",
+      agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v5",
       reasons: ["stage_baseline:planning:medium"], degraded: false,
-      attemptOrdinal: 0, attemptId: "stage:attempt:0:codex:routing-v4",
+      attemptOrdinal: 0, attemptId: "stage:attempt:0:codex:routing-v5",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
     };
     const drift = runnerWith();
@@ -258,7 +275,7 @@ describe("provider-specific effort limits", () => {
       payload: {
         project: "/repo", prompt: "review", approvalScope: "workspace-read",
         decision: {
-          agent, model, effort: "xhigh", policyVersion: "routing-v4",
+          agent, model, effort: "xhigh", policyVersion: "routing-v5",
           reasons: ["stage_baseline:code_critic:xhigh", "retry", capReason],
         },
       },

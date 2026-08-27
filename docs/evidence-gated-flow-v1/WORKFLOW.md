@@ -5,9 +5,10 @@ PRD/design/task chain and its runtime policy JSON.
 
 ## Outcome
 
-Ship coherent changes with Codex as coordinator and sole writer, Grok as an
-additional read-only reviewer, MAP as the maintained planning/review method,
-and deterministic code as the authority for state changes.
+Ship coherent changes with Codex as coordinator and sole writer, Grok and
+Claude Code/GLM-5.3 as additional read-only reviewers, MAP as the maintained
+planning/review method, and deterministic code as the authority for state
+changes.
 
 The workflow optimizes for a correct small system. A review finding should
 remove a defect class or expose a missing invariant. It must not start an
@@ -17,9 +18,10 @@ unbounded patch-and-review loop.
 
 - Codex owns planning, architecture, implementation, verification, workflow
   state, and the task-worktree mutation lease.
-- Grok receives immutable `workspace-read` packets only. It can audit or
-  criticize; it cannot write, approve a transition, or replace Codex during an
-  outage.
+- Grok and Claude receive immutable `workspace-read` packets only. They can
+  audit or criticize; they cannot write, approve a transition, or replace Codex
+  during an outage. Claude is pinned to GLM-5.3, a fresh non-persistent session,
+  an empty MCP configuration, and `Read,Glob,Grep`.
 - Provider text is an observation. Typed validators, durable state, exact
   source identity, and human authority decide transitions.
 - Live provider probes, paid runs, publication, push, PR, deployment, and
@@ -34,7 +36,7 @@ unbounded patch-and-review loop.
 | `Snapshot` | repository, branch, base, HEAD, diff, source and MAP identity | stage policy |
 | `Gate` | one typed transition decision from current evidence | work execution |
 | `Run` | durable attempt, lease, result, recovery and audit row | policy duplication |
-| `Adapter` | Codex, Grok and MAP transport formatting | approval or domain decisions |
+| `Adapter` | Codex, Grok, Claude and MAP transport formatting | approval or domain decisions |
 
 Functionality, persistence, state transitions, audit evidence, and broker
 decisions stay with their owning service. An adapter may project a decision but
@@ -75,7 +77,7 @@ snapshot or an owning decision changes.
 | Simplify | `/map-efficient` | deletion/reuse plan and code budget | no parallel owner or fallback |
 | Implement | MAP actor path, Codex only | coherent diff plus characterization | changed behavior has a real test seam |
 | Verify | `/map-check` | focused tests, typecheck/build, relevant integration evidence | deterministic gates pass |
-| Review | `/map-review` | bounded Codex/Grok auditor and critic verdicts | exact packet has no blocking finding |
+| Review | `/map-review` | bounded Codex/Grok/Claude auditor and critic verdicts | exact packet has no blocking finding |
 | Learn | `/map-learn` plus local registry | class guard, regression and sibling scan | code-owned executor evidence passes |
 
 Use MAP end to end, but keep its role explicit: MAP structures work and review;
@@ -104,8 +106,8 @@ general permission.
 |---|---|
 | target identity differs from the packet | invalidate downstream work and re-plan |
 | architecture or owner is ambiguous | stop before implementation |
-| Codex unavailable | durable bounded retry; no Grok writer fallback |
-| Grok unavailable during review | keep its lane deferred and artifact-bound |
+| Codex unavailable | durable bounded retry; no alternative-provider writer fallback |
+| Grok or Claude unavailable during review | keep that provider's lanes deferred and artifact-bound |
 | safety or permission denial | terminal blocked state; no retry or transfer |
 | compiler, test, typecheck or build fails | return to the owning design/code surface |
 | review is failed, stale, inconclusive or requests changes | gate stays closed |
@@ -121,20 +123,26 @@ snapshot.
 Outcome classes have one source in `domain/outcomes.ts`. A generic queue `Run`
 may retry delivery only before a domain effect owns the result. A Codex workflow
 outage closes the old run, then the workflow reducer schedules one bounded new
-Codex dispatch. A Grok outage is recovered only as a new attempt in the same
-immutable read-only review lane. Provider output cannot create a replay run,
-and the writer lease has no transfer operation.
+Codex dispatch. A Grok or Claude outage is recovered only as a new attempt in
+the same immutable read-only review lane. Provider output cannot create a
+replay run, and the writer lease has no transfer operation.
 
 ## Review contract
 
 Review the whole affected invariant, not only changed lines. The packet carries
 the exact artifact bytes, prompt, snapshot, launch identity and coverage target.
-Four lanes may be used when risk warrants them:
+The barrier has exactly six lanes:
 
 - Codex architecture/maintainability auditor;
 - Codex corrective critic;
 - Grok architecture/maintainability auditor;
-- Grok corrective critic.
+- Grok corrective critic;
+- Claude architecture/maintainability auditor;
+- Claude corrective critic.
+
+Every result is stored under its immutable provider/role attempt and exposed to
+the main Codex workflow through the existing durable status read. No reviewer
+can callback into workflow transitions or obtain mutation authority.
 
 One bounded audit and one correction pass are the default. A repeated comment
 must become a deterministic validator, mutation, or documented design change.
@@ -148,11 +156,11 @@ root-cause class and old-code mutation.
 
 Closure needs three current-code results: the fix, a regression that catches
 the old-code mutation, and a sibling-surface scan. All bind the same source and
-candidate. Four durable read-only review lanes bind the same task packet.
+candidate. Six durable read-only review lanes bind the same task packet.
 Unsupported or mismatched findings remain open.
 
 Promoted rules are provider-neutral and project-scoped. They are revalidated at
-dispatch and immediately before Codex or Grok starts.
+dispatch and immediately before Codex, Grok, or Claude starts.
 
 ## MAP lifecycle
 
@@ -183,3 +191,7 @@ npm run typecheck
 npm run build
 npm run map:verify
 ```
+
+`test:flow` includes the deterministic Claude command/parser, provider-health,
+six-lane barrier, migration-v3, capability-probe, worker, MCP status, and MAP
+compatibility contracts. It does not run evals or contact a live provider.

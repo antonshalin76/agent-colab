@@ -69,10 +69,10 @@ export class CollaborationRunStore {
       .all() as Array<{ state_json: string }>;
     if (legacy.some(({ state_json }) => {
       const state = JSON.parse(state_json) as { policyVersion?: unknown };
-      return state.policyVersion !== "routing-v4";
+      return state.policyVersion !== "routing-v5";
     })) {
       if (this.ownsDatabase) this.db.close();
-      throw new Error("collaboration runs require offline routing-v4 migration");
+      throw new Error("collaboration runs require offline routing-v5 migration");
     }
   }
 

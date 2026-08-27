@@ -43,11 +43,13 @@ const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const MapVersionSchema = z.string().regex(/^\d+\.\d+\.\d+$/);
 const FindingIdSchema = z.string().regex(/^FIND-\d{3,}$/);
 const ControlIdSchema = z.string().regex(/^CTRL-\d{3}$/);
-const ConsumerScopeSchema = z.enum(["codex", "grok"]);
+const ConsumerScopeSchema = z.enum(["codex", "grok", "claude"]);
+const LegacyConsumerScopeSchema = z.enum(["codex", "grok"]);
+const LEARNING_CONSUMERS = ["codex", "grok", "claude"] as const;
 const LearningReviewReceiptSchema = z.object({
   schemaVersion: z.literal("learning-review-receipt/v1"),
   reviewId: z.string().min(1),
-  agent: z.enum(["codex", "grok"]),
+  agent: z.enum(["codex", "grok", "claude"]),
   role: z.enum(["auditor", "critic"]),
   sessionId: z.uuid(),
   attemptId: z.uuid(),
@@ -93,16 +95,23 @@ export const LearningHandoffSchema = z.object({
   findingIds: z.array(FindingIdSchema).min(1).max(MAX_REFERENCES)
     .refine(unique, "learning handoff finding IDs must be unique"),
   findingClosures: z.array(FindingClosureSchema).min(1).max(MAX_REFERENCES),
-  reviewReceipts: z.array(LearningReviewReceiptSchema).length(4),
+  reviewReceipts: z.array(LearningReviewReceiptSchema).length(6),
 }).strict().superRefine((value, context) => {
   const closureIds = value.findingClosures.map(({ findingId }) => findingId).sort();
   if (!unique(closureIds) || JSON.stringify(closureIds) !== JSON.stringify([...value.findingIds].sort())) {
     context.addIssue({ code: "custom", message: "learning finding closures must match the exact finding IDs" });
   }
   const pairs = value.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort();
-  const expected = ["codex:auditor", "codex:critic", "grok:auditor", "grok:critic"];
+  const expected = [
+    "claude:auditor",
+    "claude:critic",
+    "codex:auditor",
+    "codex:critic",
+    "grok:auditor",
+    "grok:critic",
+  ];
   if (JSON.stringify(pairs) !== JSON.stringify(expected)) {
-    context.addIssue({ code: "custom", message: "learning promotion requires four independent review receipts" });
+    context.addIssue({ code: "custom", message: "learning promotion requires six independent review receipts" });
   }
   if (value.reviewReceipts.some(({ candidateSha256 }) => candidateSha256 !== value.candidateSha256)) {
     context.addIssue({ code: "custom", message: "learning review receipt candidate digest mismatch" });
@@ -120,11 +129,11 @@ export const MapLearningCandidateSchema = z.object({
   ),
   controlIds: z.array(ControlIdSchema).min(1).max(MAX_REFERENCES)
     .refine(unique, "learning control IDs must be unique"),
-  consumerScopes: z.array(ConsumerScopeSchema).length(2)
+  consumerScopes: z.array(ConsumerScopeSchema).length(3)
     .refine(unique, "learning consumer scopes must be unique")
     .refine(
-      (scopes) => scopes.includes("codex") && scopes.includes("grok"),
-      "provider-neutral learning must include Codex and Grok",
+      (scopes) => scopes.includes("codex") && scopes.includes("grok") && scopes.includes("claude"),
+      "provider-neutral learning must include Codex, Grok, and Claude",
     ),
   revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 }).strict();
@@ -151,7 +160,7 @@ const MapLearningTaskPacketSchema = z.object({
   }
 });
 
-export const MapLearningRecordSchema = z.object({
+const LegacyMapLearningRecordSchema = z.object({
   schemaVersion: z.literal("map-learning-record/v1"),
   recordId: Sha256Schema,
   taskPacketSha256: Sha256Schema,
@@ -162,9 +171,37 @@ export const MapLearningRecordSchema = z.object({
   findingIds: z.array(FindingIdSchema).min(1).max(MAX_REFERENCES).refine(unique),
   rule: z.string().min(1).max(16 * 1024),
   controlIds: z.array(ControlIdSchema).min(1).max(MAX_REFERENCES).refine(unique),
-  consumerScopes: z.array(ConsumerScopeSchema).length(2).refine(unique),
+  consumerScopes: z.array(LegacyConsumerScopeSchema).length(2).refine(unique)
+    .refine(
+      (scopes) => scopes.includes("codex") && scopes.includes("grok"),
+      "legacy learning must include Codex and Grok",
+    ),
   revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 }).strict();
+
+const CurrentMapLearningRecordSchema = z.object({
+  schemaVersion: z.literal("map-learning-record/v2"),
+  recordId: Sha256Schema,
+  taskPacketSha256: Sha256Schema,
+  handoffSha256: Sha256Schema,
+  candidateSha256: Sha256Schema,
+  mapVersion: MapVersionSchema,
+  mapManifestSha256: Sha256Schema,
+  findingIds: z.array(FindingIdSchema).min(1).max(MAX_REFERENCES).refine(unique),
+  rule: z.string().min(1).max(16 * 1024),
+  controlIds: z.array(ControlIdSchema).min(1).max(MAX_REFERENCES).refine(unique),
+  consumerScopes: z.array(ConsumerScopeSchema).length(3).refine(unique)
+    .refine(
+      (scopes) => scopes.includes("codex") && scopes.includes("grok") && scopes.includes("claude"),
+      "provider-neutral learning must include Codex, Grok, and Claude",
+    ),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+
+export const MapLearningRecordSchema = z.discriminatedUnion("schemaVersion", [
+  LegacyMapLearningRecordSchema,
+  CurrentMapLearningRecordSchema,
+]);
 
 const MapLearningCloseInputSchema = z.object({
   taskPacketBytes: z.instanceof(Uint8Array).refine(
@@ -234,7 +271,7 @@ function parseCandidate(input: unknown): MapLearningCandidate {
   return {
     ...parsed.data,
     controlIds: [...parsed.data.controlIds].sort(),
-    consumerScopes: [...parsed.data.consumerScopes].sort() as LearningConsumer[],
+    consumerScopes: [...LEARNING_CONSUMERS],
   };
 }
 
@@ -242,7 +279,7 @@ function normalizeCandidate(candidate: MapLearningCandidate): MapLearningCandida
   return {
     ...candidate,
     controlIds: [...candidate.controlIds].sort(),
-    consumerScopes: [...candidate.consumerScopes].sort() as LearningConsumer[],
+    consumerScopes: [...LEARNING_CONSUMERS],
   };
 }
 
@@ -372,14 +409,14 @@ function recordAddress(handoffSha256: string, candidateSha256: string): string {
   return sha256(`${handoffSha256}\n${candidateSha256}\n`);
 }
 
-function recordCandidate(record: MapLearningRecord): MapLearningCandidate {
-  return {
-    schemaVersion: "map-learning-candidate/v1",
+function recordCandidateBytes(record: MapLearningRecord): Uint8Array {
+  return jsonBytes({
+    schemaVersion: "map-learning-candidate/v1" as const,
     rule: record.rule,
     controlIds: [...record.controlIds],
     consumerScopes: [...record.consumerScopes],
     revision: record.revision,
-  };
+  });
 }
 
 function validateStoredRecord(path: string, expectedBytes?: Uint8Array): MapLearningRecord {
@@ -403,7 +440,7 @@ function validateStoredRecord(path: string, expectedBytes?: Uint8Array): MapLear
   const parsed = MapLearningRecordSchema.safeParse(input);
   if (!parsed.success) throw new Error(`invalid durable learning record schema: ${parsed.error.message}`);
   const record = parsed.data;
-  const canonicalCandidateSha256 = sha256(candidateBytes(recordCandidate(record)));
+  const canonicalCandidateSha256 = sha256(recordCandidateBytes(record));
   if (record.candidateSha256 !== canonicalCandidateSha256) {
     throw new Error("durable learning candidate digest is stale");
   }
@@ -699,7 +736,7 @@ class MapLearningRegistry {
       requireUnchangedPromotionDatabase(this.promotionDatabasePath, promotionDatabaseIdentity);
       promotionDatabase.pragma("journal_mode = DELETE");
       promotionDatabase.pragma("synchronous = FULL");
-      promotionDatabase.pragma("busy_timeout = 5000");
+      promotionDatabase.pragma("busy_timeout = 15000");
       promotionDatabase.exec(`CREATE TABLE IF NOT EXISTS promotion_mutex (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         schema_version TEXT NOT NULL CHECK (schema_version = 'map-learning-promotion/v1')
@@ -764,7 +801,7 @@ class MapLearningRegistry {
     revalidatePromotion();
     const recordId = recordAddress(handoffSha256, candidateSha256);
     const record = MapLearningRecordSchema.parse({
-      schemaVersion: "map-learning-record/v1",
+      schemaVersion: "map-learning-record/v2",
       recordId,
       taskPacketSha256: handoff.taskPacketSha256,
       handoffSha256,
@@ -878,7 +915,7 @@ class MapLearningRegistry {
     }
     const bytes = jsonBytes({
       schemaVersion: "map-learning-projection/v1",
-      records,
+      records: records.filter(({ consumerScopes }) => new Set<string>(consumerScopes).has(provider)),
     });
     return { bytes, digest: sha256(bytes) };
     });

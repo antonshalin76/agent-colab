@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { execa } from "execa";
 import {
   ROUTING_POLICY_VERSION,
+  PROVIDER_EFFORT_PROFILES,
   STAGES,
   STAGE_POLICY,
   constrainEffortForAgent,
@@ -9,13 +10,18 @@ import {
   type ActiveAgentId,
   type ApprovalScope,
   type Effort,
+  type ProviderModel,
+  type ReviewProviderId,
   type Stage,
 } from "../domain/routing.js";
+import { classifyProviderFailure } from "../domain/outcomes.js";
 import { redactSensitive } from "../security/redaction.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
 import { normalizeCodexResult } from "./codex.js";
 import { normalizeGrokResult } from "./grok.js";
+import type { GrokEffort } from "./grok.js";
+import { normalizeClaudeResult } from "./claude.js";
 import { buildProviderCommand, type CommandSpec } from "./provider-command.js";
 import {
   assertCurrentControlMapLearningLaunchBinding,
@@ -31,7 +37,7 @@ import { ExecutionSnapshotBindingSchema } from "../flow/execution-snapshot.js";
 import type { AttemptAssignment } from "../workflow/workflow.js";
 
 const PROTOCOL = "agent-collab/v2";
-const EFFORTS = new Set<Effort>(["low", "medium", "high", "xhigh"]);
+const EFFORTS = new Set<Effort>(["low", "medium", "high", "xhigh", "max"]);
 const EFFORT_MODIFIERS = [
   "degraded_fallback",
   "retry",
@@ -39,11 +45,11 @@ const EFFORT_MODIFIERS = [
   "large_artifact",
   "broad_change_set",
 ] as const;
-const LIMIT_REASON = /^(provider_policy_limit:gpt-5\.6-sol:xhigh|model_capability_limit:grok-4\.6:xhigh)$/;
+const LIMIT_REASON = /^(provider_policy_limit:gpt-5\.6-sol:xhigh|model_capability_limit:grok-4\.6:xhigh|model_capability_limit:glm-5\.3:max)$/;
 
 export interface SavedRunnerDecision {
-  agent: ActiveAgentId;
-  model: "grok-4.6" | "gpt-5.6-sol";
+  agent: ReviewProviderId;
+  model: ProviderModel;
   effort: Effort;
   policyVersion: typeof ROUTING_POLICY_VERSION;
   reasons: readonly string[];
@@ -86,7 +92,7 @@ export interface ProcessLauncher {
 }
 
 export interface AgentRunnerConfig {
-  binaries: Readonly<Record<ActiveAgentId, string>>;
+  binaries: Readonly<Record<ReviewProviderId, string>>;
   timeoutMs: number;
   authorizationDatabasePath?: string;
   launcher?: ProcessLauncher;
@@ -116,7 +122,7 @@ function approvalScope(value: unknown): ApprovalScope | null {
 
 function validReasons(
   value: unknown,
-  agent: ActiveAgentId,
+  agent: ReviewProviderId,
   effort: Effort,
 ): value is string[] {
   if (!Array.isArray(value) || value.length === 0 ||
@@ -127,7 +133,10 @@ function validReasons(
       !EFFORTS.has(baseline[2] as Effort)) return false;
   const stage = baseline[1] as Stage;
   const baselineEffort = baseline[2] as Effort;
-  if (STAGE_POLICY[stage].baselineEffort[agent] !== baselineEffort) return false;
+  const expectedBaseline = agent === "claude"
+    ? STAGE_POLICY[stage].baselineEffort.codex
+    : STAGE_POLICY[stage].baselineEffort[agent];
+  if (expectedBaseline !== baselineEffort) return false;
   const last = value.at(-1)!;
   const actualLimit = LIMIT_REASON.test(last) ? last : null;
   const modifiers = actualLimit === null ? value.slice(1) : value.slice(1, -1);
@@ -144,10 +153,10 @@ function validReasons(
 
 function parseDecision(value: unknown): SavedRunnerDecision {
   const input = object(value);
-  if (!input || (input.agent !== "grok" && input.agent !== "codex")) {
+  if (!input || (input.agent !== "grok" && input.agent !== "claude" && input.agent !== "codex")) {
     throw new Error("run payload is missing a saved provider decision");
   }
-  const expectedModel = input.agent === "grok" ? "grok-4.6" : "gpt-5.6-sol";
+  const expectedModel = PROVIDER_EFFORT_PROFILES[input.agent].model;
   if (input.model !== expectedModel) throw new Error("saved provider decision has a model mismatch");
   if (typeof input.effort !== "string" || !EFFORTS.has(input.effort as Effort)) {
     throw new Error("saved provider decision has an unsupported effort");
@@ -235,10 +244,10 @@ function taskPayload(
   }
   const workflowRun = !run.stage!.startsWith("review:");
   if (workflowRun && decision.agent !== "codex") {
-    throw new Error("routing-v4 permits Grok only in isolated review lanes");
+    throw new Error("routing-v5 permits alternative providers only in isolated review lanes");
   }
-  if (decision.agent === "grok" && scope !== "workspace-read") {
-    throw new Error("Grok review lanes are read-only");
+  if (decision.agent !== "codex" && scope !== "workspace-read") {
+    throw new Error("alternative-provider review lanes are read-only");
   }
   const mapLearning = assertCurrentControlMapLearningLaunchBinding(
     decision.agent,
@@ -304,7 +313,7 @@ function taskPayload(
           dispatchId: run.idempotencyKey!, assignment: { ...identity.decision,
             sessionId: identity.sessionId, attemptId: identity.attemptId,
             attemptOrdinal: identity.attemptOrdinal, degraded: identity.degraded } as AttemptAssignment,
-          agent: decision.agent, artifactHash: run.artifactHash, project: payload.project,
+          agent: decision.agent as ActiveAgentId, artifactHash: run.artifactHash, project: payload.project,
           prompt: payload.prompt, requester: payload.requester,
           sourceFingerprint: payload.sourceFingerprint, approvalScope: scope,
           ...(authorizationConsumerKey ? { authorizationConsumerKey } : {}), binding });
@@ -367,20 +376,7 @@ class ExecaProcessLauncher implements ProcessLauncher {
   }
 }
 
-export const classifyRunnerFailure = (error: unknown, stderr = "") => {
-  const message = `${error instanceof Error ? error.message : String(error)} ${stderr}`.toLowerCase();
-  if (/enoent|not found/.test(message)) return "cli_missing" as const;
-  if (/timed?\s*out|timeout/.test(message)) return "network_timeout" as const;
-  if (/rate.?limit|429/.test(message)) return "rate_limit" as const;
-  if (/quota|usage limit/.test(message)) return "quota" as const;
-  if (/auth|login|not logged|credential/.test(message)) return "auth" as const;
-  if (/overload|unavailable|capacity|model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
-    return "model_unavailable" as const;
-  }
-  if (/permission|denied/.test(message)) return "permission_denial" as const;
-  if (/invalid request|bad request/.test(message)) return "invalid_request" as const;
-  return "task_failure" as const;
-};
+export const classifyRunnerFailure = classifyProviderFailure;
 
 export class AgentRunner {
   private readonly launcher: ProcessLauncher;
@@ -397,33 +393,48 @@ export class AgentRunner {
       ? `${payload.prompt}\n\nReturn the visible final answer only as valid JSON with exactly these keys: ` +
         `{"protocolVersion":"${PROTOCOL}","reasoningEffort":"${payload.decision.effort}","visibleText":"<your final answer>"}.`
       : payload.prompt;
-    return payload.decision.agent === "grok"
-      ? buildProviderCommand({
-          agent: "grok",
-          command: {
-            binary: this.config.binaries.grok,
-            cwd: payload.project,
-            prompt,
-            approvalScope: "workspace-read",
-            sessionId: payload.sessionId ?? "",
-            effort: payload.decision.effort,
-            timeoutMs: this.config.timeoutMs,
-          },
-        })
-      : buildProviderCommand({
-          agent: "codex",
-          command: {
-            binary: this.config.binaries.codex,
-            cwd: payload.project,
-            prompt,
-            approvalScope: payload.approvalScope,
-            ...(payload.authorizationConsumerKey
-              ? { authorizationConsumerKey: payload.authorizationConsumerKey }
-              : {}),
-            effort: payload.decision.effort,
-            timeoutMs: this.config.timeoutMs,
-          },
-        });
+    if (payload.decision.agent === "grok") {
+      return buildProviderCommand({
+        agent: "grok",
+        command: {
+          binary: this.config.binaries.grok,
+          cwd: payload.project,
+          prompt,
+          approvalScope: "workspace-read",
+          sessionId: payload.sessionId ?? "",
+          effort: payload.decision.effort as GrokEffort,
+          timeoutMs: this.config.timeoutMs,
+        },
+      });
+    }
+    if (payload.decision.agent === "claude") {
+      return buildProviderCommand({
+        agent: "claude",
+        command: {
+          binary: this.config.binaries.claude,
+          cwd: payload.project,
+          prompt,
+          approvalScope: "workspace-read",
+          sessionId: payload.sessionId ?? "",
+          effort: payload.decision.effort,
+          timeoutMs: this.config.timeoutMs,
+        },
+      });
+    }
+    return buildProviderCommand({
+      agent: "codex",
+      command: {
+        binary: this.config.binaries.codex,
+        cwd: payload.project,
+        prompt,
+        approvalScope: payload.approvalScope,
+        ...(payload.authorizationConsumerKey
+          ? { authorizationConsumerKey: payload.authorizationConsumerKey }
+          : {}),
+        effort: payload.decision.effort,
+        timeoutMs: this.config.timeoutMs,
+      },
+    });
   }
 
   async run(
@@ -569,11 +580,15 @@ export class AgentRunner {
       if (result.exitCode !== 0) {
         throw Object.assign(new Error(`agent exited ${result.exitCode}`), { stderr: result.stderr });
       }
-      const normalized =
-        payload.decision.agent === "grok"
-          ? normalizeGrokResult(result.stdout, {
+      const normalized = payload.decision.agent === "grok"
+        ? normalizeGrokResult(result.stdout, {
+            expectedEffort: payload.decision.effort as GrokEffort,
+            expectedProtocolVersion: PROTOCOL,
+          })
+        : payload.decision.agent === "claude"
+          ? normalizeClaudeResult(result.stdout, {
+              expectedSessionId: payload.sessionId ?? "",
               expectedEffort: payload.decision.effort,
-              expectedProtocolVersion: PROTOCOL,
             })
           : normalizeCodexResult(result.stdout);
       if (normalized.model !== payload.decision.model) {

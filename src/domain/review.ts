@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  REVIEW_PROVIDER_IDS,
   selectFixedAgentEffort,
-  type AgentId,
   type ApprovalScope,
   type EffortDecision,
-  type ProviderHealthSnapshot,
+  type ReviewProviderHealthSnapshot,
+  type ReviewProviderId,
 } from "./routing.js";
 
 export type ReviewRole = "auditor" | "critic";
@@ -12,15 +13,16 @@ export type ReviewRole = "auditor" | "critic";
 export interface ReviewInput {
   stageId: string;
   artifact: Buffer;
-  health: ProviderHealthSnapshot;
+  health: ReviewProviderHealthSnapshot;
   approvalScope: ApprovalScope;
   idempotencyKey: string;
   prompts: Record<ReviewRole, string>;
+  sourceFingerprint?: string;
   changedFiles?: number;
 }
 
 export const reviewDecisionFor = (
-  agent: AgentId,
+  agent: ReviewProviderId,
   role: ReviewRole,
   input: { attemptOrdinal: number; artifactBytes: number; changedFiles: number },
 ): EffortDecision => {
@@ -39,7 +41,7 @@ export const reviewDecisionFor = (
 };
 
 const decisionFor = (
-  agent: AgentId,
+  agent: ReviewProviderId,
   role: ReviewRole,
   artifactBytes: number,
   changedFiles: number,
@@ -64,7 +66,7 @@ export class ReviewLane {
 
   constructor(
     readonly stageId: string,
-    readonly agent: AgentId,
+    readonly agent: ReviewProviderId,
     readonly role: ReviewRole,
     artifact: Buffer,
     readonly approvalScope: ApprovalScope,
@@ -73,6 +75,7 @@ export class ReviewLane {
     readonly sessionId: string,
     changedFiles: number,
     degraded: boolean,
+    readonly sourceFingerprint?: string,
   ) {
     if (approvalScope !== "workspace-read") {
       throw new Error("review lanes are read-only and require workspace-read authority");
@@ -109,11 +112,11 @@ export class ReviewLane {
 }
 
 const ROLES: readonly ReviewRole[] = ["auditor", "critic"];
-const AGENTS: readonly AgentId[] = ["grok", "codex"];
+const AGENTS: readonly ReviewProviderId[] = REVIEW_PROVIDER_IDS;
 
 const makeLane = (
   input: ReviewInput,
-  agent: AgentId,
+  agent: ReviewProviderId,
   role: ReviewRole,
   degraded: boolean,
 ): ReviewLane =>
@@ -128,10 +131,11 @@ const makeLane = (
     randomUUID(),
     input.changedFiles ?? 0,
     degraded,
+    input.sourceFingerprint,
   );
 
 export interface ReviewPlan {
-  runState: "FULL_CROSS_PROVIDER" | "DEGRADED_SINGLE_PROVIDER";
+  runState: "FULL_CROSS_PROVIDER" | "DEGRADED_REVIEW_SET";
   activeLanes: ReviewLane[];
   deferredLanes: ReviewLane[];
 }
@@ -142,19 +146,18 @@ export function createReviewPlan(input: ReviewInput): ReviewPlan {
   }
   const healthy = AGENTS.filter((agent) => input.health[agent] === "healthy");
   if (healthy.length === 0) throw new Error("No healthy provider is available for review");
-  if (healthy.length === 2) {
+  if (healthy.length === AGENTS.length) {
     return {
       runState: "FULL_CROSS_PROVIDER",
       activeLanes: AGENTS.flatMap((agent) => ROLES.map((role) => makeLane(input, agent, role, false))),
       deferredLanes: [],
     };
   }
-  const active = healthy[0]!;
-  const deferred = active === "grok" ? "codex" : "grok";
+  const deferred = AGENTS.filter((agent) => !healthy.includes(agent));
   return {
-    runState: "DEGRADED_SINGLE_PROVIDER",
-    activeLanes: ROLES.map((role) => makeLane(input, active, role, true)),
-    deferredLanes: ROLES.map((role) => makeLane(input, deferred, role, true)),
+    runState: "DEGRADED_REVIEW_SET",
+    activeLanes: healthy.flatMap((agent) => ROLES.map((role) => makeLane(input, agent, role, true))),
+    deferredLanes: deferred.flatMap((agent) => ROLES.map((role) => makeLane(input, agent, role, true))),
   };
 }
 

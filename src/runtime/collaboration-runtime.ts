@@ -38,7 +38,7 @@ export const RunnerOutcomeReceiptSchema = z.object({
   attemptOrdinal: z.number().int().nonnegative(),
   agent: z.literal("codex"),
   model: z.literal("gpt-5.6-sol"),
-  policyVersion: z.literal("routing-v4"),
+  policyVersion: z.literal("routing-v5"),
   sessionId: z.uuid(),
   resultKind: z.enum(["success", ...FAILOVER_OUTCOMES, ...TERMINAL_OUTCOMES]),
 }).strict();

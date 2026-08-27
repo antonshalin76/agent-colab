@@ -66,7 +66,7 @@ export function createCollabMcpServer(service: CollabService): McpServer {
     artifactHash: sha256, artifactContent: z.string().max(2_000_000), prompt: z.string().max(200_000),
     approvalScope, approvalReference: boundedId.optional(), idempotencyKey: boundedId,
   }).strict();
-  server.registerTool("collab_request_review", { description: "Dispatch four independent auditor and critic lanes", inputSchema: reviewSchema },
+  server.registerTool("collab_request_review", { description: "Dispatch six independent auditor and critic lanes", inputSchema: reviewSchema },
     guarded(async (input) => {
       if (input.approvalScope === "external" && !input.approvalReference) throw new Error("external review requires explicit approval reference");
       return service.requestReview(input);

@@ -13,11 +13,12 @@ import {
 import { ROUTING_POLICY_VERSION } from "../domain/routing.js";
 import { isFailoverOutcome } from "../domain/outcomes.js";
 import type {
-  AgentId,
+  ActiveAgentId,
   ApprovalScope,
   EffortDecision,
   EffortReason,
-  ProviderHealthSnapshot,
+  ReviewProviderHealthSnapshot,
+  ReviewProviderId,
 } from "../domain/routing.js";
 import { sanitizeResult } from "../security/redaction.js";
 import type { ProviderHealthStore } from "./provider-health-store.js";
@@ -35,7 +36,7 @@ export type ReviewLaneStatus =
   | "timed_out"
   | "stale_artifact";
 export type ReviewTerminalStatus = "completed" | "failed" | "timed_out";
-export type ReviewRunState = "FULL_CROSS_PROVIDER" | "DEGRADED_SINGLE_PROVIDER";
+export type ReviewRunState = "FULL_CROSS_PROVIDER" | "DEGRADED_REVIEW_SET";
 export type PersistedRoutingPolicyVersion = typeof ROUTING_POLICY_VERSION;
 
 const isSemanticPass = (lane: LaneRow): boolean => {
@@ -51,11 +52,11 @@ const isSemanticPass = (lane: LaneRow): boolean => {
 };
 
 export interface ReviewLaneSnapshot {
-  agent: AgentId;
+  agent: ReviewProviderId;
   role: ReviewRole;
   status: ReviewLaneStatus;
   model: EffortDecision["model"];
-  effort: "high" | "xhigh";
+  effort: "high" | "xhigh" | "max";
   policyVersion: PersistedRoutingPolicyVersion;
   reasons: readonly EffortReason[];
   sessionId: string;
@@ -73,7 +74,7 @@ export interface ReviewAttemptSnapshot {
   attemptOrdinal: number;
   status: "scheduled" | "completed" | "provider_unavailable" | "failed" | "timed_out" | "needs_reconciliation";
   model: EffortDecision["model"];
-  effort: "high" | "xhigh";
+  effort: "high" | "xhigh" | "max";
   policyVersion: PersistedRoutingPolicyVersion;
   reasons: readonly EffortReason[];
   sessionId: string;
@@ -95,7 +96,7 @@ export interface ReviewBarrierSnapshot {
   createdAt: number;
   lanes: ReviewLaneSnapshot[];
   project?: string | undefined;
-  requester?: AgentId | undefined;
+  requester?: ActiveAgentId | undefined;
   sourceFingerprint?: string | undefined;
   changedFiles: number;
 }
@@ -103,13 +104,13 @@ export interface ReviewBarrierSnapshot {
 export interface LaneEnqueueDescriptor {
   reviewId: string;
   stageId: string;
-  agent: AgentId;
+  agent: ReviewProviderId;
   role: ReviewRole;
   artifact: Buffer;
   artifactHash: string;
   approvalScope: ApprovalScope;
   model: EffortDecision["model"];
-  effort: "high" | "xhigh";
+  effort: "high" | "xhigh" | "max";
   policyVersion: EffortDecision["policyVersion"];
   reasons: readonly EffortReason[];
   sessionId: string;
@@ -119,7 +120,7 @@ export interface LaneEnqueueDescriptor {
   attemptId: string;
   attemptOrdinal: number;
   project?: string | undefined;
-  requester?: AgentId | undefined;
+  requester?: ActiveAgentId | undefined;
   sourceFingerprint?: string | undefined;
 }
 
@@ -133,18 +134,18 @@ interface ReviewRow {
   run_state: ReviewRunState;
   created_at: number;
   project: string | null;
-  requester: AgentId | null;
+  requester: ActiveAgentId | null;
   source_fingerprint: string | null;
   changed_files: number;
 }
 
 interface LaneRow {
   review_id: string;
-  agent: AgentId;
+  agent: ReviewProviderId;
   role: ReviewRole;
   status: ReviewLaneStatus;
   model: EffortDecision["model"];
-  effort: "high" | "xhigh";
+  effort: "high" | "xhigh" | "max";
   policy_version: PersistedRoutingPolicyVersion;
   reasons: string;
   session_id: string;
@@ -158,7 +159,7 @@ interface LaneRow {
 
 interface AttemptLinkRow {
   review_id: string;
-  agent: AgentId;
+  agent: ReviewProviderId;
   role: ReviewRole;
   attempt_ordinal: number;
   run_id: string;
@@ -169,13 +170,13 @@ export interface CreateReviewBarrierInput {
   reviewId: string;
   stageId: string;
   artifact: Buffer;
-  health: ProviderHealthSnapshot;
+  health: ReviewProviderHealthSnapshot;
   approvalScope: ApprovalScope;
   idempotencyKey: string;
   prompts: Record<ReviewRole, string>;
   createdAt: number;
   project?: string;
-  requester?: AgentId;
+  requester?: ActiveAgentId;
   sourceFingerprint?: string;
   changedFiles?: number;
 }
@@ -188,7 +189,7 @@ export interface ExactSemanticPassReviewInput {
   idempotencyKey: string;
   prompts: Record<ReviewRole, string>;
   project: string;
-  requester: AgentId;
+  requester: ActiveAgentId;
   sourceFingerprint: string;
   changedFiles: number;
 }
@@ -246,7 +247,7 @@ export const createReviewRunInput = (lane: LaneEnqueueDescriptor) => {
 
 interface RecordTerminalInput {
   reviewId: string;
-  agent: AgentId;
+  agent: ReviewProviderId;
   role: ReviewRole;
   attemptId: string;
   status: ReviewTerminalStatus;
@@ -289,7 +290,7 @@ const assertDatabaseIntegrity = (db: Database.Database): void => {
   if (violations.length > 0) throw new Error("review database foreign key check failed");
 };
 
-const assertFreshV4Schema = (db: Database.Database): void => {
+const assertFreshV5Schema = (db: Database.Database): void => {
   const schema = (table: string): string => {
     return tableSchema(db, table);
   };
@@ -297,19 +298,21 @@ const assertFreshV4Schema = (db: Database.Database): void => {
   const lanes = schema("runtime_review_lanes");
   const attempts = schema("runtime_review_lane_attempts");
   if (
-    !barriers.includes("'grok'") ||
-    barriers.includes("'claude'") ||
-    !lanes.includes("'grok'") ||
-    lanes.includes("'claude'") ||
-    !lanes.includes("policy_version") ||
-    !lanes.includes("policy_version = 'routing-v4'") ||
+    !barriers.includes("requester in ('grok', 'codex')") ||
+    barriers.includes("requester in ('grok', 'claude', 'codex')") ||
+    !barriers.includes("run_state in ('full_cross_provider', 'degraded_review_set')") ||
+    !lanes.includes("agent in ('grok', 'claude', 'codex')") ||
+    !lanes.includes("model in ('grok-4.6', 'glm-5.3', 'gpt-5.6-sol')") ||
+    !lanes.includes("effort in ('high', 'xhigh', 'max')") ||
+    !lanes.includes("policy_version = 'routing-v5'") ||
     !lanes.includes("reasons") ||
+    !attempts.includes("agent in ('grok', 'claude', 'codex')") ||
     !attempts.includes("attempt_ordinal") ||
     !attempts.includes("run_id") ||
     attempts.includes("policy_version") ||
     attempts.includes("status text")
   ) {
-    throw new Error("runtime review tables require the current routing-v4 schema");
+    throw new Error("runtime review tables require the current routing-v5 schema");
   }
 };
 
@@ -350,7 +353,7 @@ export class RunGateUnitOfWork {
     try {
       if (existing === undefined) throw new Error("review gate requires migration-owned schema");
       assertDatabaseIntegrity(this.db);
-      assertFreshV4Schema(this.db);
+      assertFreshV5Schema(this.db);
       assertDatabaseIntegrity(this.db);
       this.runs = new RunStore(this.db);
     } catch (error) {
@@ -374,12 +377,12 @@ export class RunGateUnitOfWork {
              idempotency_key, prompt, degraded, result, error, terminal_at
         FROM runtime_review_lanes
        WHERE review_id = ?
-       ORDER BY CASE agent WHEN 'grok' THEN 0 ELSE 1 END,
+       ORDER BY CASE agent WHEN 'grok' THEN 0 WHEN 'claude' THEN 1 ELSE 2 END,
                 CASE role WHEN 'auditor' THEN 0 ELSE 1 END
     `).all(reviewId) as LaneRow[];
   }
 
-  private attemptsFor(reviewId: string, agent?: AgentId, role?: ReviewRole): ReviewAttemptSnapshot[] {
+  private attemptsFor(reviewId: string, agent?: ReviewProviderId, role?: ReviewRole): ReviewAttemptSnapshot[] {
     const links = this.db.prepare(`
       SELECT review_id,agent,role,attempt_ordinal,run_id,created_at
         FROM runtime_review_lane_attempts
@@ -419,7 +422,7 @@ export class RunGateUnitOfWork {
         attemptOrdinal: link.attempt_ordinal,
         status,
         model: decision.model as EffortDecision["model"],
-        effort: decision.effort as "high" | "xhigh",
+        effort: decision.effort as "high" | "xhigh" | "max",
         policyVersion: decision.policyVersion as PersistedRoutingPolicyVersion,
         reasons: decision.reasons as EffortReason[],
         sessionId: identity.sessionId,
@@ -504,6 +507,7 @@ export class RunGateUnitOfWork {
         idempotencyKey: input.idempotencyKey,
         prompts: input.prompts,
         changedFiles: input.changedFiles ?? 0,
+        ...(input.sourceFingerprint ? { sourceFingerprint: input.sourceFingerprint } : {}),
       });
       this.db.prepare(`
         INSERT INTO runtime_review_barriers
@@ -563,7 +567,7 @@ export class RunGateUnitOfWork {
             artifactHash,
             approvalScope: input.approvalScope,
             model: lane.model,
-            effort: lane.effort as "high" | "xhigh",
+            effort: lane.effort as "high" | "xhigh" | "max",
             policyVersion: lane.policyVersion,
             reasons: lane.reasons,
             sessionId: lane.sessionId,
@@ -701,7 +705,7 @@ export class RunGateUnitOfWork {
 
   recordProviderUnavailable(input: {
     reviewId: string;
-    agent: AgentId;
+    agent: ReviewProviderId;
     role: ReviewRole;
     attemptId: string;
     error: unknown;
@@ -744,7 +748,7 @@ export class RunGateUnitOfWork {
     }).immediate();
   }
 
-  attempts(reviewId: string, agent: AgentId, role: ReviewRole): ReviewAttemptSnapshot[] {
+  attempts(reviewId: string, agent: ReviewProviderId, role: ReviewRole): ReviewAttemptSnapshot[] {
     return this.attemptsFor(reviewId, agent, role);
   }
 
@@ -779,11 +783,11 @@ export class RunGateUnitOfWork {
       review.requester !== input.requester ||
       review.sourceFingerprint !== input.sourceFingerprint ||
       review.changedFiles !== input.changedFiles ||
-      review.lanes.length !== 4 ||
+      review.lanes.length !== 6 ||
       review.lanes.some((lane) => lane.prompt !== input.prompts[lane.role]) ||
       this.barrier(input.reviewId).satisfied !== true
     ) {
-      throw new Error(`review barrier is not an exact four-lane semantic PASS: ${input.reviewId}`);
+      throw new Error(`review barrier is not an exact six-lane semantic PASS: ${input.reviewId}`);
     }
     return review;
   }
@@ -832,7 +836,7 @@ export class RunGateUnitOfWork {
     );
   }
 
-  deferredReviewIds(agent: AgentId): string[] {
+  deferredReviewIds(agent: ReviewProviderId): string[] {
     return (this.db.prepare(`SELECT DISTINCT review_id FROM runtime_review_lanes
       WHERE agent=? AND status='deferred' ORDER BY review_id`).all(agent) as Array<{ review_id: string }>)
       .map((row) => row.review_id);
@@ -840,7 +844,7 @@ export class RunGateUnitOfWork {
 
   activateDeferred(input: {
     reviewId: string;
-    agent: AgentId;
+    agent: ReviewProviderId;
     currentSourceFingerprint?: string;
     now: number;
     providerHealth: ProviderHealthStore;
@@ -897,7 +901,7 @@ export class RunGateUnitOfWork {
           artifactHash: review.artifact_hash,
           approvalScope: review.approval_scope,
           model: decision.model,
-          effort: decision.effort as "high" | "xhigh",
+          effort: decision.effort as "high" | "xhigh" | "max",
           policyVersion: decision.policyVersion,
           reasons: decision.reasons,
           sessionId,

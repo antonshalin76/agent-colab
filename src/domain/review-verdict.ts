@@ -27,6 +27,29 @@ export const ReviewVerdictEnvelopeSchema = z.object({
 
 export type ReviewVerdictEnvelope = z.infer<typeof ReviewVerdictEnvelopeSchema>;
 
+export const REVIEW_VERDICT_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    schemaVersion: { const: "review-verdict/v1" },
+    verdict: { enum: ["PASS", "CHANGES_REQUESTED", "INCONCLUSIVE"] },
+    findings: {
+      type: "array",
+      maxItems: 256,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          risk_level: { enum: ["info", "warn", "error"] },
+          message: { type: "string", minLength: 1, maxLength: 8_192 },
+        },
+        required: ["risk_level", "message"],
+      },
+    },
+  },
+  required: ["schemaVersion", "verdict", "findings"],
+} as const;
+
 export const REVIEW_VERDICT_OUTPUT_CONTRACT =
   "Return only one JSON object with no Markdown or surrounding text: " +
   '{"schemaVersion":"review-verdict/v1","verdict":"PASS|CHANGES_REQUESTED|INCONCLUSIVE","findings":[{"risk_level":"info|warn|error","message":"finding"}]}. ' +

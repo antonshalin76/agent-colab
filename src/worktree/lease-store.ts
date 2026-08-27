@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 import type { AgentId } from "../domain/routing.js";
 
-const assertFreshV2Schema = (db: Database.Database): void => {
+const assertFreshV3Schema = (db: Database.Database): void => {
   const row = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worktree_leases'",
   ).get() as { sql: string } | undefined;
   const sql = row?.sql.toLowerCase() ?? "";
-  if (!sql.includes("'grok'") || sql.includes("'claude'")) {
-    throw new Error("worktree_leases requires offline v1-to-v2 migration");
+  if (!sql.includes("'grok'") || !sql.includes("'codex'") || sql.includes("'claude'") ||
+      !sql.includes("authority_policy = 'routing-v5'")) {
+    throw new Error("worktree_leases requires offline routing-v5 migration");
   }
 };
 
@@ -24,7 +25,7 @@ export interface WorktreeLease {
 export interface PolicyFenceRecord {
   kind: "routing_policy_fence";
   from: "grok";
-  policyVersion: "routing-v4";
+  policyVersion: "routing-v5";
   previousLeaseId: string;
   fencingToken: number;
   recordedAt: number;
@@ -77,7 +78,7 @@ export class WorktreeLeaseStore {
     `).get();
     if (existing !== undefined) {
       try {
-        assertFreshV2Schema(this.db);
+        assertFreshV3Schema(this.db);
       } catch (error) {
         this.db.close();
         throw error;
@@ -91,8 +92,8 @@ export class WorktreeLeaseStore {
         holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
         fencing_token INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
-        authority_policy TEXT NOT NULL DEFAULT 'routing-v4'
-          CHECK (authority_policy IN ('routing-v3', 'routing-v4'))
+        authority_policy TEXT NOT NULL DEFAULT 'routing-v5'
+          CHECK (authority_policy = 'routing-v5')
       );
       CREATE TABLE IF NOT EXISTS worktree_handoffs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,51 +104,12 @@ export class WorktreeLeaseStore {
       CREATE INDEX IF NOT EXISTS idx_worktree_handoffs_task
         ON worktree_handoffs(task_id, id);
     `);
-    const leaseColumns = new Set(
-      (this.db.prepare("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>)
-        .map((column) => column.name),
-    );
-    if (!leaseColumns.has("authority_policy")) {
-      this.db.exec(`ALTER TABLE worktree_leases
-        ADD COLUMN authority_policy TEXT NOT NULL DEFAULT 'routing-v3'
-          CHECK (authority_policy IN ('routing-v3', 'routing-v4'))`);
-    }
-    this.fenceLegacyGrokLeases(Date.now());
     try {
-      assertFreshV2Schema(this.db);
+      assertFreshV3Schema(this.db);
     } catch (error) {
       this.db.close();
       throw error;
     }
-  }
-
-  private fenceLegacyGrokLeases(now: number): void {
-    this.db.transaction(() => {
-      const rows = this.db.prepare(`SELECT * FROM worktree_leases
-        WHERE holder='grok' AND authority_policy!='routing-v4'
-        ORDER BY worktree_path`).all() as LeaseRow[];
-      for (const row of rows) {
-        const fencingToken = row.fencing_token + 1;
-        const changed = this.db.prepare(`UPDATE worktree_leases
-          SET fencing_token=?,expires_at=?,authority_policy='routing-v4'
-          WHERE worktree_path=? AND lease_id=? AND holder='grok'
-            AND fencing_token=? AND authority_policy!='routing-v4'`)
-          .run(fencingToken, now, row.worktree_path, row.lease_id, row.fencing_token);
-        if (changed.changes !== 1) throw new Error("legacy Grok lease fencing conflict");
-        const event: PolicyFenceRecord = {
-          kind: "routing_policy_fence",
-          from: "grok",
-          policyVersion: "routing-v4",
-          previousLeaseId: row.lease_id,
-          fencingToken,
-          recordedAt: now,
-        };
-        this.db.prepare("INSERT INTO worktree_handoffs(task_id,recorded_at,payload) VALUES(?,?,?)")
-          .run(row.task_id, now, JSON.stringify(event));
-      }
-      this.db.prepare(`UPDATE worktree_leases SET authority_policy='routing-v4'
-        WHERE holder='codex' AND authority_policy!='routing-v4'`).run();
-    }).immediate();
   }
 
   private assertCodexWriter(holder: AgentId): void {
@@ -196,7 +158,7 @@ export class WorktreeLeaseStore {
         .prepare(
           `INSERT INTO worktree_leases
              (worktree_path, task_id, lease_id, holder, fencing_token, expires_at, authority_policy)
-           VALUES (?, ?, ?, ?, ?, ?, 'routing-v4')
+           VALUES (?, ?, ?, ?, ?, ?, 'routing-v5')
            ON CONFLICT(worktree_path) DO UPDATE SET
              task_id = excluded.task_id,
              lease_id = excluded.lease_id,

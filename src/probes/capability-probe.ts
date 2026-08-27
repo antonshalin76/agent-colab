@@ -4,21 +4,27 @@ import {
   type StartupProbeObserved,
   type StartupProbeResult,
 } from "../domain/outcomes.js";
-import type { ActiveAgentId, Effort } from "../domain/routing.js";
+import type {
+  Effort,
+  ProviderModel,
+  ReviewProviderId,
+} from "../domain/routing.js";
+import { buildClaudeCommand, normalizeClaudeResult } from "../runners/claude.js";
 import { buildCodexCommand, normalizeCodexResult } from "../runners/codex.js";
 import { buildGrokCommand, normalizeGrokResult } from "../runners/grok.js";
+import type { GrokEffort } from "../runners/grok.js";
 
 interface ProviderProbeConfig {
   enabled: boolean;
   binaryPath: string;
   expectedVersion: string;
-  model: "grok-4.6" | "gpt-5.6-sol";
+  model: ProviderModel;
   effort: Effort;
   cwd: string;
 }
 
 export interface CapabilityProbeRequest {
-  agent: ActiveAgentId;
+  agent: ReviewProviderId;
   file: string;
   args: string[];
   cwd: string;
@@ -41,19 +47,31 @@ export interface CapabilityProbeRunner {
 
 const PROTOCOL = "agent-collab/v2";
 
-const probeInput = (effort: Effort): string =>
-  `Capability probe. Do not use tools. Return only valid JSON with exactly these keys: ` +
-  `{"protocolVersion":"${PROTOCOL}","reasoningEffort":"${effort}",` +
-  `"visibleText":"{\\"protocolVersion\\":\\"${PROTOCOL}\\",\\"reasoningEffort\\":\\"${effort}\\",` +
-  `\\"supportsNonInteractive\\":true,\\"supportsResume\\":true}"}.`;
+const capabilityPayload = (effort: Effort): string => JSON.stringify({
+  protocolVersion: PROTOCOL,
+  reasoningEffort: effort,
+  supportsNonInteractive: true,
+  supportsResume: true,
+});
+
+const probeInput = (agent: ReviewProviderId, effort: Effort): string => {
+  if (agent === "claude") {
+    return `Capability probe. Do not use tools. Return a review-verdict/v1 envelope with verdict PASS ` +
+      `and exactly one info finding whose message is exactly this JSON: ${capabilityPayload(effort)}`;
+  }
+  return `Capability probe. Do not use tools. Return only valid JSON with exactly these keys: ` +
+    `{"protocolVersion":"${PROTOCOL}","reasoningEffort":"${effort}",` +
+    `"visibleText":"{\\"protocolVersion\\":\\"${PROTOCOL}\\",\\"reasoningEffort\\":\\"${effort}\\",` +
+    `\\"supportsNonInteractive\\":true,\\"supportsResume\\":true}"}.`;
+};
 
 const requestFor = (
-  agent: ActiveAgentId,
+  agent: ReviewProviderId,
   config: ProviderProbeConfig,
   timeoutMs: number,
   sessionId: string,
 ): CapabilityProbeRequest => {
-  const prompt = probeInput(config.effort);
+  const prompt = probeInput(agent, config.effort);
   const command = agent === "grok"
     ? buildGrokCommand({
         binary: config.binaryPath,
@@ -61,10 +79,20 @@ const requestFor = (
         prompt,
         sessionId,
         approvalScope: "workspace-read",
-        effort: config.effort,
+        effort: config.effort as GrokEffort,
         timeoutMs,
       })
-    : buildCodexCommand({
+    : agent === "claude"
+      ? buildClaudeCommand({
+          binary: config.binaryPath,
+          cwd: config.cwd,
+          prompt,
+          sessionId,
+          approvalScope: "workspace-read",
+          effort: config.effort,
+          timeoutMs,
+        })
+      : buildCodexCommand({
         binary: config.binaryPath,
         cwd: config.cwd,
         prompt,
@@ -129,10 +157,25 @@ const parseCapabilityPayload = (text: string, expectedEffort: Effort) => {
   }
 };
 
+const claudeCapabilityText = (text: string): string | null => {
+  try {
+    const verdict = JSON.parse(text) as Record<string, unknown>;
+    if (verdict.schemaVersion !== "review-verdict/v1" || verdict.verdict !== "PASS" ||
+        !Array.isArray(verdict.findings) || verdict.findings.length !== 1) return null;
+    const finding = verdict.findings[0] as Record<string, unknown> | undefined;
+    return finding?.risk_level === "info" && typeof finding.message === "string"
+      ? finding.message
+      : null;
+  } catch {
+    return null;
+  }
+};
+
 const parseObserved = (
-  agent: ActiveAgentId,
+  agent: ReviewProviderId,
   config: ProviderProbeConfig,
   result: CapabilityProcessResult,
+  sessionId: string,
 ): StartupProbeObserved | null => {
   try {
     const normalized = agent === "grok"
@@ -140,8 +183,17 @@ const parseObserved = (
           expectedEffort: config.effort,
           expectedProtocolVersion: PROTOCOL,
         })
-      : normalizeCodexResult(result.stdout);
-    const parsed = parseCapabilityPayload(normalized.text, config.effort);
+      : agent === "claude"
+        ? normalizeClaudeResult(result.stdout, {
+            expectedSessionId: sessionId,
+            expectedEffort: config.effort,
+          })
+        : normalizeCodexResult(result.stdout);
+    const capabilityText = agent === "claude"
+      ? claudeCapabilityText(normalized.text)
+      : normalized.text;
+    if (capabilityText === null) return null;
+    const parsed = parseCapabilityPayload(capabilityText, config.effort);
     if (parsed === null) return null;
     return {
       binaryPath: config.binaryPath,
@@ -156,7 +208,7 @@ const parseObserved = (
 };
 
 const probeOne = async (
-  agent: ActiveAgentId,
+  agent: ReviewProviderId,
   config: ProviderProbeConfig,
   timeoutMs: number,
   sessionId: string,
@@ -171,7 +223,7 @@ const probeOne = async (
       timeoutMs,
     );
     if (result.exitCode !== 0) return unavailable("cli_failure");
-    const observed = parseObserved(agent, config, result);
+    const observed = parseObserved(agent, config, result, sessionId);
     if (observed === null) return unavailable("response_parse_failed");
     return evaluateStartupProbe({
       agent,
@@ -198,15 +250,16 @@ const probeOne = async (
 };
 
 export async function runCapabilityProbes(input: {
-  providers: Record<ActiveAgentId, ProviderProbeConfig>;
+  providers: Record<ReviewProviderId, ProviderProbeConfig>;
   timeoutMs: number;
   runner: CapabilityProbeRunner;
   sessionIdFactory?: () => string;
-}): Promise<{ results: Record<ActiveAgentId, StartupProbeResult> }> {
+}): Promise<{ results: Record<ReviewProviderId, StartupProbeResult> }> {
   const sessionIdFactory = input.sessionIdFactory ?? randomUUID;
-  const [grok, codex] = await Promise.all([
+  const [grok, claude, codex] = await Promise.all([
     probeOne("grok", input.providers.grok, input.timeoutMs, sessionIdFactory(), input.runner),
+    probeOne("claude", input.providers.claude, input.timeoutMs, sessionIdFactory(), input.runner),
     probeOne("codex", input.providers.codex, input.timeoutMs, sessionIdFactory(), input.runner),
   ]);
-  return { results: { grok, codex } };
+  return { results: { grok, claude, codex } };
 }

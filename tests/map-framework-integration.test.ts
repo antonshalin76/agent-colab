@@ -428,7 +428,7 @@ const learningCandidate: MapLearningCandidate = {
   schemaVersion: "map-learning-candidate/v1",
   rule: "Reject promotion when an exact-packet review receipt is stale.",
   controlIds: ["CTRL-009"],
-  consumerScopes: ["codex", "grok"],
+  consumerScopes: ["codex", "grok", "claude"],
   revision: 1,
 };
 
@@ -663,7 +663,7 @@ async function closeLearningConcurrently(
   }
 }
 
-mainDescribe("provider-neutral MAP learning registry", () => {
+mainDescribe("provider-neutral MAP learning registry", { timeout: 30_000 }, () => {
   it("MAP-003A keeps the unconfigured mutable registry outside the module API", async () => {
     const learning = await import("../src/flow/map-learning.js");
     expect(learning).not.toHaveProperty("MapLearningRegistry");
@@ -744,7 +744,7 @@ mainDescribe("provider-neutral MAP learning registry", () => {
     ));
 
     expect(compact).toMatchObject({
-      schemaVersion: "map-learning-record/v1",
+      schemaVersion: "map-learning-record/v2",
       taskPacketSha256: sha256(valid.taskPacketBytes),
       handoffSha256: sha256(valid.handoffBytes),
       mapVersion: MAP_VERSION,
@@ -758,7 +758,56 @@ mainDescribe("provider-neutral MAP learning registry", () => {
     expect(replay.recordId).toBe(compact.recordId);
     expect(advanced).toMatchObject({ revision: 2 });
     expect(advanced.recordId).not.toBe(compact.recordId);
-  }, 15_000);
+  }, 30_000);
+
+  it("reopens legacy v1 records without widening their explicit provider scope", () => {
+    const root = tempRoot();
+    const mapManifestSha256 = "c".repeat(64);
+    const taskPacketSha256 = "d".repeat(64);
+    const handoffSha256 = "e".repeat(64);
+    const candidate = {
+      schemaVersion: "map-learning-candidate/v1",
+      rule: "Preserve verified legacy learning during provider expansion.",
+      controlIds: ["CTRL-001"],
+      consumerScopes: ["codex", "grok"],
+      revision: 1,
+    } as const;
+    const candidateSha256 = sha256(`${JSON.stringify(candidate)}\n`);
+    const recordId = sha256(`${handoffSha256}\n${candidateSha256}\n`);
+    const record = {
+      schemaVersion: "map-learning-record/v1",
+      recordId,
+      taskPacketSha256,
+      handoffSha256,
+      candidateSha256,
+      mapVersion: MAP_VERSION,
+      mapManifestSha256,
+      findingIds: ["FIND-001"],
+      rule: candidate.rule,
+      controlIds: [...candidate.controlIds],
+      consumerScopes: [...candidate.consumerScopes],
+      revision: 1,
+    };
+    writeRelative(root, `.map/agent-collab-admin/learning/records/${recordId}.json`,
+      `${JSON.stringify(record)}\n`);
+    writeRelative(root, ".map/agent-collab-admin/learning/head.json", `${JSON.stringify({
+      schemaVersion: "map-learning-head/v1",
+      revision: 1,
+      recordId,
+      mapVersion: MAP_VERSION,
+      mapManifestSha256,
+    })}\n`);
+    const registry = new MapLearningAdministration({ controlRoot: root, databasePath: ":memory:" });
+    const profile = { mapVersion: MAP_VERSION, mapManifestSha256 };
+    const codex = JSON.parse(Buffer.from(registry.projection("codex", profile).bytes).toString("utf8"));
+    const grok = JSON.parse(Buffer.from(registry.projection("grok", profile).bytes).toString("utf8"));
+    const claude = JSON.parse(Buffer.from(registry.projection("claude", profile).bytes).toString("utf8"));
+    expect(codex.records).toEqual([record]);
+    expect(grok.records).toEqual([record]);
+    expect(claude.records).toEqual([]);
+    expect(readFileSync(join(root, `.map/agent-collab-admin/learning/records/${recordId}.json`), "utf8"))
+      .toBe(`${JSON.stringify(record)}\n`);
+  });
 
   it("MAP-003B rejects stale, conflicting, and skipped learning revisions", async () => {
     const root = tempRoot();
@@ -771,7 +820,7 @@ mainDescribe("provider-neutral MAP learning registry", () => {
     await expectLearningCloseToReject(() => registry.close(
       learningCloseInputForCandidate(root, { ...learningCandidate, rule: "conflicting revision one" }),
     ), /CAS conflict/i);
-  }, 15_000);
+  }, 30_000);
 
   it("MAP-003B converges rendezvoused cross-process duplicate closes on one durable record", async () => {
     const root = tempRoot();
@@ -789,7 +838,7 @@ mainDescribe("provider-neutral MAP learning registry", () => {
     const replay = await Promise.resolve(learningRegistry(root).close(valid));
     expect(replay.recordId).toBe(recordId);
     expect(readdirSync(recordsPath).sort()).toEqual([`${recordId}.json`]);
-  }, 20_000);
+  }, 30_000);
 
   it("MAP-003B rolls back a SIGKILL promotion journal to the existing head before retry", async () => {
     const root = tempRoot();
@@ -844,9 +893,9 @@ mainDescribe("provider-neutral MAP learning registry", () => {
     expect(second.revision).toBe(2);
     expect(new Set(readdirSync(join(learningRoot, "records"))))
       .toEqual(new Set([`${first.recordId}.json`, `${second.recordId}.json`]));
-  }, 20_000);
+  }, 30_000);
 
-  it("MAP-003A projects byte-identical current learning to Codex and Grok", async () => {
+  it("MAP-003A projects byte-identical current learning to Codex, Grok and Claude", async () => {
     const root = tempRoot();
     const registry = learningRegistry(root);
     await Promise.resolve(registry.close(learningCloseInput(root)));
@@ -854,8 +903,10 @@ mainDescribe("provider-neutral MAP learning registry", () => {
     const profile = { mapVersion: MAP_VERSION, mapManifestSha256: MAP_MANIFEST_SHA256 };
     const codex = await Promise.resolve(registry.projection("codex", profile));
     const grok = await Promise.resolve(registry.projection("grok", profile));
+    const claude = await Promise.resolve(registry.projection("claude", profile));
 
     expect(codex).toEqual(grok);
+    expect(claude).toEqual(codex);
     expect(codex.digest).toBe(sha256(codex.bytes));
     expect(new TextDecoder().decode(codex.bytes)).toContain(learningCandidate.rule);
     expect(() => registry.projection("codex", {

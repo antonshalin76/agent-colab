@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import type { Effort } from "../domain/routing.js";
 import type { CommandSpec } from "./provider-command.js";
 
 export type GrokEffort = "low" | "medium" | "high" | "xhigh";
@@ -158,7 +159,7 @@ export function buildGrokCommand(input: GrokCommandInput): CommandSpec {
 export function normalizeGrokResult(
   stdout: string,
   expected: {
-    expectedEffort: GrokEffort;
+    expectedEffort: Effort;
     expectedProtocolVersion: string;
     includeUsage: true;
     allowPlainVisibleText?: boolean;
@@ -166,17 +167,21 @@ export function normalizeGrokResult(
 ): NormalizedGrokEvalResult;
 export function normalizeGrokResult(
   stdout: string,
-  expected: { expectedEffort: GrokEffort; expectedProtocolVersion: string; includeUsage?: false },
+  expected: { expectedEffort: Effort; expectedProtocolVersion: string; includeUsage?: false },
 ): NormalizedGrokResult;
 export function normalizeGrokResult(
   stdout: string,
   expected: {
-    expectedEffort: GrokEffort;
+    expectedEffort: Effort;
     expectedProtocolVersion: string;
     includeUsage?: boolean;
     allowPlainVisibleText?: boolean;
   },
 ): NormalizedGrokResult | NormalizedGrokEvalResult {
+  if (!EXECUTABLE_EFFORTS.has(expected.expectedEffort)) {
+    throw new Error("Grok result expected effort exceeds provider capability");
+  }
+  const expectedEffort = expected.expectedEffort as GrokEffort;
   if (Buffer.byteLength(stdout, "utf8") > MAX_RESULT_BYTES) {
     throw new Error("Grok result exceeds the bounded parser limit");
   }
@@ -212,7 +217,7 @@ export function normalizeGrokResult(
       }
       payload = {
         protocolVersion: expected.expectedProtocolVersion,
-        reasoningEffort: expected.expectedEffort,
+        reasoningEffort: expectedEffort,
         visibleText: envelope.text,
       };
       visibleTextProvenance = "command_pinned_plain_text";
@@ -221,7 +226,7 @@ export function normalizeGrokResult(
   if (!payload || payload.protocolVersion !== expected.expectedProtocolVersion) {
     throw new Error("Grok protocol mismatch");
   }
-  if (payload.reasoningEffort !== expected.expectedEffort) {
+  if (payload.reasoningEffort !== expectedEffort) {
     throw new Error("Grok reasoning effort mismatch");
   }
   if (typeof payload.visibleText !== "string" || !payload.visibleText.trim()) {
@@ -232,7 +237,7 @@ export function normalizeGrokResult(
     model: MODEL,
     providerReportedModel: providerReportedModel as "grok-4.6" | "grok-4.6-build",
     modelProvenance: "provider_reported_alias",
-    effort: expected.expectedEffort,
+    effort: expectedEffort,
     protocolVersion: expected.expectedProtocolVersion,
   };
   return expected.includeUsage

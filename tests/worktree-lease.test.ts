@@ -18,7 +18,7 @@ afterEach(() => {
 
 const worktreePath = "/repo/worktrees/task-42";
 
-describe("routing-v4 persistent worktree lease store", () => {
+describe("routing-v5 persistent worktree lease store", () => {
   it("rejects a v1 lease schema instead of mutating it in the constructor", () => {
     const path = makeDb();
     const db = new Database(path);
@@ -31,7 +31,7 @@ describe("routing-v4 persistent worktree lease store", () => {
       expires_at INTEGER NOT NULL
     )`);
     db.close();
-    expect(() => new WorktreeLeaseStore(path)).toThrow(/offline v1-to-v2 migration/i);
+    expect(() => new WorktreeLeaseStore(path)).toThrow(/offline routing-v5 migration/i);
     const unchanged = new Database(path, { readonly: true });
     expect(unchanged.prepare(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='worktree_handoffs'",

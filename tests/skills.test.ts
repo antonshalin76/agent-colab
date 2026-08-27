@@ -57,16 +57,18 @@ describe("BDD-2/12 canonical shared skills", () => {
     const root = makeRoot();
     const canonicalRoot = join(root, "canonical");
     const grokRoot = join(root, "grok-skills");
+    const claudeRoot = join(root, "claude-skills");
     const codexRoot = join(root, "codex-skills");
     mkdirSync(canonicalRoot);
     writeSkill(canonicalRoot, "alpha", "# Alpha\n\nFirst contract.\n");
     writeSkill(canonicalRoot, "beta", "# Beta\n\nSecond contract.\n");
     symlinkSync(canonicalRoot, grokRoot, "dir");
+    symlinkSync(canonicalRoot, claudeRoot, "dir");
     symlinkSync(canonicalRoot, codexRoot, "dir");
 
     const result = auditSharedSkills({
       canonicalRoot,
-      agentRoots: { grok: grokRoot, codex: codexRoot },
+      agentRoots: { grok: grokRoot, claude: claudeRoot, codex: codexRoot },
     });
     const manifest = [
       { name: "alpha", sha256: skillHash(canonicalRoot, "alpha") },
@@ -76,6 +78,7 @@ describe("BDD-2/12 canonical shared skills", () => {
       canonicalRoot: realpathSync(canonicalRoot),
       agents: {
         grok: { resolvedRoot: realpathSync(canonicalRoot), manifest },
+        claude: { resolvedRoot: realpathSync(canonicalRoot), manifest },
         codex: { resolvedRoot: realpathSync(canonicalRoot), manifest },
       },
       consistent: true,
@@ -87,12 +90,14 @@ describe("BDD-2/12 canonical shared skills", () => {
     const root = makeRoot();
     const canonicalRoot = join(root, "canonical");
     const grokRoot = join(root, "grok-skills");
+    const claudeRoot = join(root, "claude-skills");
     const codexRoot = join(root, "codex-skills");
     mkdirSync(canonicalRoot);
     writeSkill(canonicalRoot, "shared", "version one\n");
     symlinkSync(canonicalRoot, grokRoot, "dir");
+    symlinkSync(canonicalRoot, claudeRoot, "dir");
     symlinkSync(canonicalRoot, codexRoot, "dir");
-    const options = { canonicalRoot, agentRoots: { grok: grokRoot, codex: codexRoot } } as const;
+    const options = { canonicalRoot, agentRoots: { grok: grokRoot, claude: claudeRoot, codex: codexRoot } } as const;
     const before = auditSharedSkills(options);
 
     writeFileSync(join(canonicalRoot, "shared", "SKILL.md"), "version two\n", { mode: 0o600 });
@@ -101,6 +106,7 @@ describe("BDD-2/12 canonical shared skills", () => {
 
     expect(before.agents.grok.manifest[0]?.sha256).not.toBe(expected);
     expect(after.agents.grok.manifest).toEqual([{ name: "shared", sha256: expected }]);
+    expect(after.agents.claude.manifest).toEqual([{ name: "shared", sha256: expected }]);
     expect(after.agents.codex.manifest).toEqual([{ name: "shared", sha256: expected }]);
     expect(after.consistent).toBe(true);
   });
@@ -110,12 +116,14 @@ describe("BDD-2/12 canonical shared skills", () => {
     const canonicalRoot = join(root, "canonical");
     const externalRoot = join(root, "external-skill");
     const grokRoot = join(root, "grok-skills");
+    const claudeRoot = join(root, "claude-skills");
     const codexRoot = join(root, "codex-skills");
     mkdirSync(canonicalRoot); mkdirSync(externalRoot);
     writeFileSync(join(externalRoot, "SKILL.md"), "version one\n", { mode: 0o600 });
     symlinkSync(externalRoot, join(canonicalRoot, "linked"), "dir");
-    symlinkSync(canonicalRoot, grokRoot, "dir"); symlinkSync(canonicalRoot, codexRoot, "dir");
-    const options = { canonicalRoot, agentRoots: { grok: grokRoot, codex: codexRoot } } as const;
+    symlinkSync(canonicalRoot, grokRoot, "dir"); symlinkSync(canonicalRoot, claudeRoot, "dir");
+    symlinkSync(canonicalRoot, codexRoot, "dir");
+    const options = { canonicalRoot, agentRoots: { grok: grokRoot, claude: claudeRoot, codex: codexRoot } } as const;
     const before = auditSharedSkills(options);
     expect(before.consistent).toBe(true);
     expect(before.agents.grok.manifest.map((entry) => entry.name)).toEqual(["linked"]);
@@ -129,6 +137,7 @@ describe("BDD-2/12 canonical shared skills", () => {
     const root = makeRoot();
     const canonicalRoot = join(root, "canonical");
     const grokRoot = join(root, "grok-skills");
+    const claudeRoot = join(root, "claude-skills");
     const codexRoot = join(root, "codex-skills");
     const missingSkill = join(root, "missing-skill");
     const missingCodexRoot = join(root, "missing-codex-root");
@@ -136,11 +145,12 @@ describe("BDD-2/12 canonical shared skills", () => {
     writeSkill(canonicalRoot, "healthy", "healthy\n");
     symlinkSync(missingSkill, join(canonicalRoot, "broken-skill"), "dir");
     symlinkSync(canonicalRoot, grokRoot, "dir");
+    symlinkSync(canonicalRoot, claudeRoot, "dir");
     symlinkSync(missingCodexRoot, codexRoot, "dir");
 
     const result = auditSharedSkills({
       canonicalRoot,
-      agentRoots: { grok: grokRoot, codex: codexRoot },
+      agentRoots: { grok: grokRoot, claude: claudeRoot, codex: codexRoot },
     });
 
     expect(result.consistent).toBe(false);

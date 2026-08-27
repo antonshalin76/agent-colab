@@ -33,7 +33,7 @@ interface HistoryDump {
   history_issues: Array<Record<string, unknown>>;
 }
 
-type MigrationFaultPoint = "after_state_commit" | "after_history_commit";
+type MigrationFaultPoint = "after_state_commit" | "after_history_commit" | "before_v3_commit";
 
 const normalize = (value: unknown): unknown => {
   if (Buffer.isBuffer(value)) return { blobHex: value.toString("hex") };

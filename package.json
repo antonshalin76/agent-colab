@@ -14,11 +14,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test:flow": "vitest run tests/source-launcher.test.ts tests/map-framework-integration.test.ts tests/map-admin.test.ts tests/map-update.test.ts tests/evidence-ledger.test.ts tests/execution-snapshot.test.ts tests/execution-admission.test.ts tests/execution-owner-contract.test.ts tests/routing-v4-contract.test.ts tests/collaboration-runtime.test.ts tests/runtime-review-barrier.test.ts tests/review-verdict.test.ts tests/runner-commands.test.ts tests/grok-v2.test.ts tests/worker.test.ts tests/app-service.test.ts --maxWorkers=1 --no-file-parallelism",
+    "test:flow": "vitest run tests/source-launcher.test.ts tests/map-framework-integration.test.ts tests/map-admin.test.ts tests/map-update.test.ts tests/evidence-ledger.test.ts tests/execution-snapshot.test.ts tests/execution-admission.test.ts tests/execution-owner-contract.test.ts tests/routing-v5-contract.test.ts tests/collaboration-runtime.test.ts tests/runtime-review-barrier.test.ts tests/runtime-provider-health.test.ts tests/review-lanes.test.ts tests/review-verdict.test.ts tests/runner-commands.test.ts tests/grok-v2.test.ts tests/claude.test.ts tests/effort-policy.test.ts tests/probes.test.ts tests/migration-v3.test.ts tests/worker.test.ts tests/app-service.test.ts tests/mcp.test.ts --maxWorkers=1 --no-file-parallelism",
     "map:verify": "mapify check-installed . && mapify check && npm run build --silent && node dist/flow/map-admin-cli.js verify .",
     "map:update": "npm run build --silent && node dist/flow/map-update-cli.js candidate .",
     "map:project:codex": "npm run build --silent && node dist/flow/map-admin-cli.js project codex .",
     "map:project:grok": "npm run build --silent && node dist/flow/map-admin-cli.js project grok .",
+    "map:project:claude": "npm run build --silent && node dist/flow/map-admin-cli.js project claude .",
     "eval": "node scripts/agent-collab-eval-launcher.mjs",
     "start": "node scripts/agent-collab-launcher.mjs"
   },

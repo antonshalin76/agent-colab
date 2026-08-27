@@ -76,7 +76,7 @@ const makeRun = (root: string): CollaborationRun => {
   const project = join(root, "project");
   mkdirSync(project, { recursive: true });
   return createCollaborationRun({
-    taskId: "task-v4",
+    taskId: "task-v5",
     origin: "grok",
     health: { grok: "healthy", codex: "healthy" },
     stages: [deliveryStage(project)],
@@ -355,9 +355,9 @@ const seedFrozenV3Review = (database: string): void => {
   db.close();
 };
 
-describe("MAP-004C routing-v4 harness authority", () => {
+describe("MAP-004C routing-v5 harness authority", () => {
   it("pins every delivery stage to Codex and never promotes Grok to stage owner", () => {
-    expect(ROUTING_POLICY_VERSION).toBe("routing-v4");
+    expect(ROUTING_POLICY_VERSION).toBe("routing-v5");
     expect(STAGES.every((stage) => STAGE_POLICY[stage].preferredAgent === "codex")).toBe(true);
     expect(providerSupportsApprovalScope("grok", "workspace-read")).toBe(false);
     expect(providerSupportsApprovalScope("grok", "workspace-write")).toBe(false);
@@ -369,7 +369,7 @@ describe("MAP-004C routing-v4 harness authority", () => {
         health: { grok: "healthy", codex: "healthy" },
         trustedInputs: { artifactBytes: 1_024, changedFiles: 2, attemptOrdinal: 0,
           approvalScope: "workspace-read" },
-      })).toMatchObject({ agent: "codex", policyVersion: "routing-v4", degraded: false });
+      })).toMatchObject({ agent: "codex", policyVersion: "routing-v5", degraded: false });
       expect(() => selectStageAssignment({
         stage,
         origin: "codex",
@@ -384,7 +384,7 @@ describe("MAP-004C routing-v4 harness authority", () => {
     expect(() => createReviewPlan({
       stageId: "review",
       artifact: Buffer.from("frozen packet"),
-      health: { grok: "healthy", codex: "healthy" },
+      health: { grok: "healthy", claude: "healthy", codex: "healthy" },
       approvalScope: "workspace-write",
       idempotencyKey: "review:write",
       prompts: { auditor: "audit", critic: "critic" },
@@ -459,11 +459,11 @@ describe("MAP-004C routing-v4 harness authority", () => {
       blockedReason: "routing_policy_upgrade_requires_replan", activeStage: null, pendingStageId: null });
     expect(restored.dispatches).toEqual(legacy.dispatches);
     expect(restored.conflict).toMatchObject({ kind: "routing_policy_upgrade", from: "routing-v3",
-      to: "routing-v4", requiresNewWorkflowIdentity: true });
+      to: "routing-v5", requiresNewWorkflowIdentity: true });
   });
 });
 
-describe("MAP-004C durable v4 authority", () => {
+describe("MAP-004C durable v5 authority", () => {
   it("rejects legacy durable workflow bytes without runtime mutation", () => {
     const root = makeRoot("legacy-outbox");
     const database = join(root, "state.db");
@@ -477,7 +477,7 @@ describe("MAP-004C durable v4 authority", () => {
       FROM collaboration_dispatch_outbox WHERE dispatch_id='legacy:dispatch:1'`)
       .get() as { published_at: number | null; terminal_reason: string | null };
     before.close();
-    expect(() => new CollaborationRunStore(database)).toThrow(/offline routing-v4 migration/i);
+    expect(() => new CollaborationRunStore(database)).toThrow(/offline routing-v5 migration/i);
     const unchanged = new Database(database, { readonly: true });
     expect(unchanged.prepare("SELECT state_json FROM collaboration_runs WHERE workflow_id='legacy'")
       .pluck().get()).toBe(persisted);
@@ -528,36 +528,33 @@ describe("MAP-004C durable v4 authority", () => {
     const before = new Database(database, { readonly: true });
     const rows = before.prepare("SELECT * FROM runtime_review_lanes ORDER BY agent,role").all();
     before.close();
-    expect(() => new RunGateUnitOfWork(database)).toThrow(/current routing-v4 schema/i);
+    expect(() => new RunGateUnitOfWork(database)).toThrow(/current routing-v5 schema/i);
     const unchanged = new Database(database, { readonly: true });
     expect(unchanged.prepare("SELECT * FROM runtime_review_lanes ORDER BY agent,role").all()).toEqual(rows);
     unchanged.close();
   });
 
-  it("fences legacy Grok leases and denies every Grok/cross-provider writer path", async () => {
-    const root = makeRoot("lease-v4");
+  it("rejects legacy Grok lease bytes and denies every Grok writer path", async () => {
+    const root = makeRoot("lease-v5");
     const database = join(root, "state.db");
     const schema = new WorktreeLeaseStore(database);
     schema.close();
     const sqlite = new Database(database);
-    sqlite.prepare(`INSERT INTO worktree_leases
+    expect(() => sqlite.prepare(`INSERT INTO worktree_leases
       (worktree_path,task_id,lease_id,holder,fencing_token,expires_at,authority_policy)
-      VALUES (?,?,?,?,?,?,'routing-v3')`).run(root, "legacy-task", "legacy-grok", "grok", 7, 99_999);
+      VALUES (?,?,?,?,?,?,'routing-v3')`).run(
+        root, "legacy-task", "legacy-grok", "grok", 7, 99_999,
+      )).toThrow(/constraint/i);
     sqlite.close();
     const store = new WorktreeLeaseStore(database);
-    const fenced = await store.get(root);
-    expect(fenced).toMatchObject({ holder: "grok", fencingToken: 8 });
-    expect(fenced!.expiresAt).toBeLessThanOrEqual(Date.now());
-    expect(await store.listHandoffs("legacy-task")).toContainEqual({
-      kind: "routing_policy_fence", from: "grok", policyVersion: "routing-v4",
-      previousLeaseId: "legacy-grok", fencingToken: 8, recordedAt: expect.any(Number),
-    });
+    expect(await store.get(root)).toBeNull();
+    expect(await store.listHandoffs("legacy-task")).toEqual([]);
     await expect(store.acquire({ worktreePath: join(root, "grok-new"), taskId: "grok-new",
       holder: "grok", now: Date.now(), ttlMs: 30_000 }))
       .rejects.toThrow(/codex.*sole writer|grok.*writer/i);
     await expect(store.reuse({
       lease: { worktreePath: root, taskId: "legacy-task", leaseId: "legacy-grok",
-        holder: "grok", fencingToken: 8, expiresAt: fenced!.expiresAt },
+        holder: "grok", fencingToken: 7, expiresAt: 99_999 },
       taskId: "legacy-task", holder: "grok", now: Date.now(), ttlMs: 30_000,
     })).rejects.toThrow(/codex.*sole writer|grok.*writer/i);
     await expect(store.renew({ worktreePath: root, leaseId: "legacy-grok", fencingToken: 8,
@@ -566,11 +563,11 @@ describe("MAP-004C durable v4 authority", () => {
     expect((store as unknown as { transfer?: unknown }).transfer).toBeUndefined();
     const codex = await store.acquire({ worktreePath: root, taskId: "fresh-codex", holder: "codex",
       now: Date.now() + 1, ttlMs: 30_000 });
-    expect(codex).toMatchObject({ status: "acquired", lease: { holder: "codex", fencingToken: 9 } });
+    expect(codex).toMatchObject({ status: "acquired", lease: { holder: "codex", fencingToken: 1 } });
     if (codex.status !== "acquired") throw new Error("expected fresh Codex lease");
     await expect(store.release({ worktreePath: root, leaseId: "legacy-grok",
       fencingToken: 7, holder: "grok" }))
-      .resolves.toMatchObject({ status: "fenced", currentFencingToken: 9 });
+      .resolves.toMatchObject({ status: "fenced", currentFencingToken: 1 });
     store.close();
   });
 });

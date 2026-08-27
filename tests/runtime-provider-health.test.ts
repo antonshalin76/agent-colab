@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe("runtime provider health persistence", () => {
-  it("rejects a v1 Claude schema instead of migrating it in the constructor", () => {
+  it("rejects a pre-v3 provider schema instead of migrating it in the constructor", () => {
     const path = database();
     const db = new Database(path);
     db.exec(`CREATE TABLE runtime_provider_health (
@@ -35,7 +35,7 @@ describe("runtime provider health persistence", () => {
     db.close();
 
     expect(() => new ProviderHealthStore(path, { cooldownMs: 1_000 })).toThrow(
-      /offline v1-to-v2 migration/i,
+      /offline v2-to-v3 migration/i,
     );
     const unchanged = new Database(path, { readonly: true });
     expect((unchanged.prepare(
@@ -47,12 +47,21 @@ describe("runtime provider health persistence", () => {
   it("initializes enabled providers as probing and disabled providers as non-ready", () => {
     const store = new ProviderHealthStore(database(), {
       cooldownMs: 1_000,
-      enabled: { grok: true, codex: false },
+      enabled: { grok: true, claude: true, codex: false },
     });
 
     expect(store.snapshot()).toEqual({
       grok: {
         agent: "grok",
+        health: "probing",
+        retryAt: null,
+        failureCount: 0,
+        attemptClaimed: false,
+        capabilityVerified: false,
+        updatedAt: 0,
+      },
+      claude: {
+        agent: "claude",
         health: "probing",
         retryAt: null,
         failureCount: 0,
@@ -175,19 +184,48 @@ describe("runtime provider health persistence", () => {
     store.close();
   });
 
+  it("persists Claude outage and recovery with the same bounded health lifecycle", () => {
+    const path = database();
+    const store = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    store.recordSuccess("claude", 10);
+    expect(store.recordFailoverFailure("claude", { kind: "network_timeout" }, 20)).toMatchObject({
+      agent: "claude",
+      health: "unavailable",
+      capabilityVerified: true,
+      retryAt: 1_020,
+    });
+    store.close();
+
+    const reopened = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    expect(reopened.canAttempt("claude", 1_019)).toBe(false);
+    expect(reopened.canAttempt("claude", 1_020)).toBe(true);
+    expect(reopened.recordAuthReady("claude", 1_021)).toMatchObject({
+      agent: "claude",
+      health: "healthy",
+      retryAt: null,
+      attemptClaimed: false,
+    });
+    reopened.close();
+  });
+
   it("preserves state on reopen and changes disabled readiness only through configuration", () => {
     const path = database();
     const disabled = new ProviderHealthStore(path, {
       cooldownMs: 1_000,
-      enabled: { grok: false, codex: true },
+      enabled: { grok: false, claude: false, codex: true },
     });
     disabled.close();
 
     const enabled = new ProviderHealthStore(path, {
       cooldownMs: 1_000,
-      enabled: { grok: true, codex: true },
+      enabled: { grok: true, claude: true, codex: true },
     });
     expect(enabled.snapshot().grok).toMatchObject({
+      health: "probing",
+      retryAt: null,
+      attemptClaimed: false,
+    });
+    expect(enabled.snapshot().claude).toMatchObject({
       health: "probing",
       retryAt: null,
       attemptClaimed: false,

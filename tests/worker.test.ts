@@ -339,10 +339,10 @@ describe("worker contention", () => {
       agent: "codex" as const,
       model: "gpt-5.6-sol" as const,
       effort: "medium" as const,
-      policyVersion: "routing-v4" as const,
+      policyVersion: "routing-v5" as const,
       reasons: ["stage_baseline:planning:medium"],
       degraded: false,
-      attemptId: "planning:attempt:0:codex:routing-v4",
+      attemptId: "planning:attempt:0:codex:routing-v5",
       attemptOrdinal: 0,
       sessionId: "11111111-1111-4111-8111-111111111111",
     };
@@ -413,6 +413,23 @@ describe("worker contention", () => {
   it("keeps SQLite contention transient for domain-effect replay", () => {
     expect(isTransientSqliteError(new Error("SQLITE_BUSY: database is locked"))).toBe(true);
     expect(isTransientSqliteError(new Error("unknown persisted review attempt"))).toBe(false);
+  });
+
+  it("persists Claude review effects without granting Claude workflow authority", () => {
+    expect(parsePersistedDomainEffect({
+      type: "review",
+      reviewId: "review-claude",
+      attemptId: "33333333-3333-4333-8333-333333333333",
+      role: "critic",
+      agent: "claude",
+      resultKind: "success",
+      terminalAt: 2,
+    })).toMatchObject({
+      type: "review",
+      reviewId: "review-claude",
+      agent: "claude",
+      role: "critic",
+    });
   });
 
   it("does not cancel descendants after a stale failure lease is fenced", () => {

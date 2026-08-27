@@ -125,7 +125,7 @@ function canonicalExecutor(
           join(projectRoot, "node_modules/vitest/vitest.mjs"),
           "run",
           "tests/app-service.test.ts",
-          "tests/routing-v4-contract.test.ts",
+          "tests/routing-v5-contract.test.ts",
           "--maxWorkers=1",
           "--no-file-parallelism",
           "--reporter=dot",

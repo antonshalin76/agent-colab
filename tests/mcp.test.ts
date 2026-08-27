@@ -25,7 +25,7 @@ const connect = async (service: CollabService) => {
 };
 
 const fakeService = (): CollabService => ({
-  status: vi.fn(async () => ({ providers: { grok: "probing", codex: "healthy" } })),
+  status: vi.fn(async () => ({ providers: { grok: "probing", claude: "probing", codex: "healthy" } })),
   search: vi.fn(async ({ requester, kind }) => [{
     id: "h1",
     requester,
@@ -35,7 +35,7 @@ const fakeService = (): CollabService => ({
     provenance: { sourceAgent: "codex", threadId: "t1", project: "/repo", timestamp: "2026-08-23T00:00:00Z", contentHash: "abc" },
   }]),
   delegate: vi.fn(async (input) => ({ runId: "run-1", assignedAgent: input.preferredAgent })),
-  requestReview: vi.fn(async () => ({ reviewId: "review-1", laneCount: 4 })),
+  requestReview: vi.fn(async () => ({ reviewId: "review-1", laneCount: 6 })),
   runStatus: vi.fn(async ({ runId }) => ({ runId, status: "queued" })),
   indexNow: vi.fn(async () => ({ indexed: 2, warnings: [] })),
 });
@@ -103,7 +103,7 @@ describe("stdio MCP collaboration boundary", () => {
     await client.close(); await server.close();
   });
 
-  it("dispatches the complete four-lane review operation", async () => {
+  it("dispatches the complete six-lane review operation", async () => {
     const service = fakeService(); const { client, server } = await connect(service);
     const artifactContent = "review artifact";
     const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
@@ -119,8 +119,44 @@ describe("stdio MCP collaboration boundary", () => {
     const content = result.content as Array<{ type: string; text?: string }>;
     const text = content[0]?.type === "text" ? content[0].text ?? "" : "";
     expect(result.isError).not.toBe(true);
-    expect(text).toContain('"laneCount":4');
+    expect(text).toContain('"laneCount":6');
     expect(service.requestReview).toHaveBeenCalledOnce();
+    await client.close(); await server.close();
+  });
+
+  it("returns Claude review evidence unchanged through durable run status", async () => {
+    const service = fakeService();
+    service.runStatus = vi.fn(async () => ({
+      review: {
+        reviewId: "review-1",
+        runState: "FULL_CROSS_PROVIDER",
+        lanes: [{
+          agent: "claude",
+          role: "critic",
+          status: "completed",
+          result: {
+            kind: "success",
+            reviewVerdict: {
+              schemaVersion: "review-verdict/v1",
+              verdict: "PASS",
+              findings: [],
+            },
+          },
+        }],
+      },
+      barrier: { satisfied: false, terminalCount: 1, requiredCount: 6 },
+    }));
+    const { client, server } = await connect(service);
+    const result = await client.callTool({
+      name: "collab_run_status",
+      arguments: { runId: "review-1" },
+    });
+    const content = result.content as Array<{ type: string; text?: string }>;
+    const text = content[0]?.type === "text" ? content[0].text ?? "" : "";
+    expect(JSON.parse(text)).toMatchObject({
+      review: { lanes: [{ agent: "claude", role: "critic", status: "completed" }] },
+      barrier: { satisfied: false, requiredCount: 6 },
+    });
     await client.close(); await server.close();
   });
 

@@ -18,6 +18,17 @@ export {
 
 const V1 = 1;
 const V2 = 2;
+const V3 = 3;
+
+const V3_GUARDED_TABLES = [
+  "runs",
+  "collaboration_runs",
+  "collaboration_dispatch_outbox",
+  "runtime_review_barriers",
+  "runtime_review_lanes",
+  "runtime_review_lane_attempts",
+  "worktree_leases",
+] as const;
 
 const MUTABLE_RUNTIME_TABLES = [
   "runs",
@@ -49,7 +60,10 @@ const historyNamespace = (agent: unknown): string => {
   throw new Error(`unsupported history source agent: ${String(agent)}`);
 };
 
-export type MigrationFaultPoint = "after_state_commit" | "after_history_commit";
+export type MigrationFaultPoint =
+  | "after_state_commit"
+  | "after_history_commit"
+  | "before_v3_commit";
 
 export interface MigrationCoordinatorOptions {
   stateDatabase: string;
@@ -60,7 +74,9 @@ export interface MigrationCoordinatorOptions {
 
 export type MigrationResult =
   | { status: "migrated"; fromVersion: 1; toVersion: 2; rollbackBundle: string }
-  | { status: "already_current"; fromVersion: 2; toVersion: 2 };
+  | { status: "already_current"; fromVersion: 2; toVersion: 2 }
+  | { status: "migrated"; fromVersion: 2; toVersion: 3 }
+  | { status: "already_current"; fromVersion: 3; toVersion: 3 };
 
 export interface V1DoctorResult {
   readyForMigration: boolean;
@@ -74,7 +90,7 @@ export class MigrationBlockedError extends Error {
   readonly code = "MUTABLE_RUNTIME_NOT_EMPTY";
 
   constructor(readonly blockingTables: string[]) {
-    super(`v2 migration requires empty mutable runtime tables: ${blockingTables.join(", ")}`);
+    super(`offline migration requires empty mutable runtime tables: ${blockingTables.join(", ")}`);
     this.name = "MigrationBlockedError";
   }
 }
@@ -88,9 +104,12 @@ const EXECUTION_TABLES = [
   "runs",
   "collaboration_runs",
   "collaboration_dispatch_outbox",
+  "runtime_provider_health",
   "runtime_review_barriers",
   "runtime_review_lanes",
   "runtime_review_lane_attempts",
+  "worktree_leases",
+  "worktree_handoffs",
 ] as const;
 
 export function initializeCurrentExecutionSchema(path: string): void {
@@ -102,7 +121,8 @@ export function initializeCurrentExecutionSchema(path: string): void {
     if (existing.length > 0) {
       throw new Error(`execution schema is partial; offline repair required: ${existing.join(", ")}`);
     }
-    db.exec(`
+    const initialize = db.transaction(() => {
+      db.exec(`
       CREATE TABLE runs (
         id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, stage TEXT NOT NULL,
         priority INTEGER NOT NULL, status TEXT NOT NULL, artifact_hash TEXT, approval_scope TEXT,
@@ -127,6 +147,20 @@ export function initializeCurrentExecutionSchema(path: string): void {
       );
       CREATE INDEX collaboration_outbox_pending
         ON collaboration_dispatch_outbox(published_at, dispatch_id);
+      CREATE TABLE runtime_provider_health (
+        agent TEXT PRIMARY KEY CHECK (agent IN ('grok', 'claude', 'codex')),
+        health TEXT NOT NULL CHECK (health IN ('healthy', 'unavailable', 'probing', 'disabled')),
+        retry_at INTEGER,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        attempt_claimed INTEGER NOT NULL DEFAULT 0 CHECK (attempt_claimed IN (0, 1)),
+        capability_verified INTEGER NOT NULL DEFAULT 0 CHECK (capability_verified IN (0, 1)),
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO runtime_provider_health
+        (agent,health,retry_at,failure_count,attempt_claimed,capability_verified,updated_at)
+      VALUES ('grok','probing',NULL,0,0,0,0),
+             ('claude','probing',NULL,0,0,0,0),
+             ('codex','probing',NULL,0,0,0,0);
       CREATE TABLE runtime_review_barriers (
         review_id TEXT PRIMARY KEY,
         stage_id TEXT NOT NULL,
@@ -134,7 +168,7 @@ export function initializeCurrentExecutionSchema(path: string): void {
         artifact_hash TEXT NOT NULL,
         approval_scope TEXT NOT NULL CHECK (approval_scope = 'workspace-read'),
         idempotency_key TEXT NOT NULL,
-        run_state TEXT NOT NULL CHECK (run_state IN ('FULL_CROSS_PROVIDER', 'DEGRADED_SINGLE_PROVIDER')),
+        run_state TEXT NOT NULL CHECK (run_state IN ('FULL_CROSS_PROVIDER', 'DEGRADED_REVIEW_SET')),
         created_at INTEGER NOT NULL,
         project TEXT,
         requester TEXT CHECK (requester IS NULL OR requester IN ('grok', 'codex')),
@@ -143,12 +177,12 @@ export function initializeCurrentExecutionSchema(path: string): void {
       );
       CREATE TABLE runtime_review_lanes (
         review_id TEXT NOT NULL REFERENCES runtime_review_barriers(review_id) ON DELETE CASCADE,
-        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
+        agent TEXT NOT NULL CHECK (agent IN ('grok', 'claude', 'codex')),
         role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
         status TEXT NOT NULL CHECK (status IN ('queued', 'deferred', 'completed', 'failed', 'timed_out', 'stale_artifact')),
-        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
-        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version = 'routing-v4'),
+        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'glm-5.3', 'gpt-5.6-sol')),
+        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh', 'max')),
+        policy_version TEXT NOT NULL CHECK (policy_version = 'routing-v5'),
         reasons TEXT NOT NULL,
         session_id TEXT NOT NULL UNIQUE,
         idempotency_key TEXT NOT NULL UNIQUE,
@@ -162,7 +196,7 @@ export function initializeCurrentExecutionSchema(path: string): void {
       CREATE INDEX runtime_review_lanes_status ON runtime_review_lanes(review_id, status);
       CREATE TABLE runtime_review_lane_attempts (
         review_id TEXT NOT NULL,
-        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
+        agent TEXT NOT NULL CHECK (agent IN ('grok', 'claude', 'codex')),
         role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
         attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
         run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
@@ -189,7 +223,28 @@ export function initializeCurrentExecutionSchema(path: string): void {
         scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
         consumed_at INTEGER NOT NULL
       );
-    `);
+      CREATE TABLE worktree_leases (
+        worktree_path TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        lease_id TEXT NOT NULL,
+        holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
+        fencing_token INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        authority_policy TEXT NOT NULL DEFAULT 'routing-v5'
+          CHECK (authority_policy = 'routing-v5')
+      );
+      CREATE TABLE worktree_handoffs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        payload TEXT NOT NULL
+      );
+      CREATE INDEX idx_worktree_handoffs_task
+        ON worktree_handoffs(task_id, id);
+      PRAGMA user_version = 3;
+      `);
+    });
+    initialize.immediate();
   } finally {
     db.close();
   }
@@ -231,6 +286,13 @@ function createConsistentBackup(db: Database.Database, destination: string): voi
 
 function blockingTables(db: Database.Database): string[] {
   return MUTABLE_RUNTIME_TABLES.filter((table) => {
+    if (!tableExists(db, table)) return false;
+    return Number(db.prepare(`SELECT COUNT(*) FROM "${table}"`).pluck().get()) > 0;
+  });
+}
+
+function blockingV3Tables(db: Database.Database): string[] {
+  return V3_GUARDED_TABLES.filter((table) => {
     if (!tableExists(db, table)) return false;
     return Number(db.prepare(`SELECT COUNT(*) FROM "${table}"`).pluck().get()) > 0;
   });
@@ -527,6 +589,181 @@ function verifyV2(state: Database.Database, history: Database.Database): void {
   }
 }
 
+function schemaSql(db: Database.Database, table: string): string {
+  return (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+  ).get(table) as { sql: string } | undefined)?.sql ?? "";
+}
+
+function verifyV3State(state: Database.Database): void {
+  if (userVersion(state) !== V3) throw new Error("v3 state schema marker mismatch");
+
+  const healthSql = schemaSql(state, "runtime_provider_health");
+  const barrierSql = schemaSql(state, "runtime_review_barriers");
+  const laneSql = schemaSql(state, "runtime_review_lanes");
+  const attemptSql = schemaSql(state, "runtime_review_lane_attempts");
+  const leaseSql = schemaSql(state, "worktree_leases");
+  for (const provider of ["grok", "claude", "codex"]) {
+    if (!healthSql.includes(`'${provider}'`) ||
+        !laneSql.includes(`'${provider}'`) ||
+        !attemptSql.includes(`'${provider}'`)) {
+      throw new Error(`invalid v3 review provider constraint: ${provider}`);
+    }
+  }
+  for (const model of ["grok-4.6", "glm-5.3", "gpt-5.6-sol"]) {
+    if (!laneSql.includes(`'${model}'`)) throw new Error(`invalid v3 review model constraint: ${model}`);
+  }
+  for (const effort of ["high", "xhigh", "max"]) {
+    if (!laneSql.includes(`'${effort}'`)) throw new Error(`invalid v3 review effort constraint: ${effort}`);
+  }
+  if (!barrierSql.includes("'DEGRADED_REVIEW_SET'") ||
+      !laneSql.includes("policy_version = 'routing-v5'") ||
+      !barrierSql.includes("requester IN ('grok', 'codex')") ||
+      !leaseSql.includes("holder IN ('grok', 'codex')") ||
+      leaseSql.includes("'claude'") ||
+      !leaseSql.includes("DEFAULT 'routing-v5'")) {
+    throw new Error("v3 routing-v5 schema constraints are incomplete");
+  }
+  const claude = state.prepare("SELECT agent FROM runtime_provider_health WHERE agent='claude'").get();
+  if (!isDeepStrictEqual(claude, { agent: "claude" })) {
+    throw new Error("v3 Claude provider health row is missing");
+  }
+  if ((state.pragma("foreign_key_check") as unknown[]).length > 0) {
+    throw new Error("v3 state foreign-key verification failed");
+  }
+  for (const index of [
+    "runs_due",
+    "collaboration_outbox_pending",
+    "runtime_review_lanes_status",
+    "runtime_review_attempts_lane",
+  ]) {
+    if (state.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index) === undefined) {
+      throw new Error(`missing v3 index: ${index}`);
+    }
+  }
+}
+
+function verifyInitialClaudeHealth(state: Database.Database): void {
+  const claude = state.prepare(`SELECT agent,health,retry_at,failure_count,
+    attempt_claimed,capability_verified,updated_at
+    FROM runtime_provider_health WHERE agent='claude'`).get();
+  if (!isDeepStrictEqual(claude, {
+    agent: "claude",
+    health: "probing",
+    retry_at: null,
+    failure_count: 0,
+    attempt_claimed: 0,
+    capability_verified: 0,
+    updated_at: 0,
+  })) {
+    throw new Error("v3 Claude provider health initialization mismatch");
+  }
+}
+
+function migrateStateToV3(
+  db: Database.Database,
+  faultInjector?: (point: MigrationFaultPoint) => void,
+): void {
+  const migrate = db.transaction(() => {
+    if (userVersion(db) !== V2) {
+      throw new Error(`state schema changed before v3 migration: ${userVersion(db)}`);
+    }
+    const blocked = blockingV3Tables(db);
+    if (blocked.length > 0) throw new MigrationBlockedError(blocked);
+
+    db.exec(`
+      ALTER TABLE runtime_provider_health RENAME TO runtime_provider_health_v2;
+      CREATE TABLE runtime_provider_health (
+        agent TEXT PRIMARY KEY CHECK (agent IN ('grok', 'claude', 'codex')),
+        health TEXT NOT NULL CHECK (health IN ('healthy', 'unavailable', 'probing', 'disabled')),
+        retry_at INTEGER,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        attempt_claimed INTEGER NOT NULL DEFAULT 0 CHECK (attempt_claimed IN (0, 1)),
+        capability_verified INTEGER NOT NULL DEFAULT 0 CHECK (capability_verified IN (0, 1)),
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO runtime_provider_health
+        (agent,health,retry_at,failure_count,attempt_claimed,capability_verified,updated_at)
+      SELECT agent,health,retry_at,failure_count,attempt_claimed,capability_verified,updated_at
+        FROM runtime_provider_health_v2;
+      INSERT INTO runtime_provider_health
+        (agent,health,retry_at,failure_count,attempt_claimed,capability_verified,updated_at)
+      VALUES ('claude','probing',NULL,0,0,0,0);
+      DROP TABLE runtime_provider_health_v2;
+
+      DROP INDEX runtime_review_attempts_lane;
+      DROP TABLE runtime_review_lane_attempts;
+      DROP INDEX runtime_review_lanes_status;
+      DROP TABLE runtime_review_lanes;
+      DROP TABLE runtime_review_barriers;
+
+      CREATE TABLE runtime_review_barriers (
+        review_id TEXT PRIMARY KEY,
+        stage_id TEXT NOT NULL,
+        artifact BLOB NOT NULL,
+        artifact_hash TEXT NOT NULL,
+        approval_scope TEXT NOT NULL CHECK (approval_scope = 'workspace-read'),
+        idempotency_key TEXT NOT NULL,
+        run_state TEXT NOT NULL CHECK (run_state IN ('FULL_CROSS_PROVIDER', 'DEGRADED_REVIEW_SET')),
+        created_at INTEGER NOT NULL,
+        project TEXT,
+        requester TEXT CHECK (requester IS NULL OR requester IN ('grok', 'codex')),
+        source_fingerprint TEXT,
+        changed_files INTEGER NOT NULL DEFAULT 0 CHECK (changed_files >= 0)
+      );
+      CREATE TABLE runtime_review_lanes (
+        review_id TEXT NOT NULL REFERENCES runtime_review_barriers(review_id) ON DELETE CASCADE,
+        agent TEXT NOT NULL CHECK (agent IN ('grok', 'claude', 'codex')),
+        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
+        status TEXT NOT NULL CHECK (status IN ('queued', 'deferred', 'completed', 'failed', 'timed_out', 'stale_artifact')),
+        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'glm-5.3', 'gpt-5.6-sol')),
+        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh', 'max')),
+        policy_version TEXT NOT NULL CHECK (policy_version = 'routing-v5'),
+        reasons TEXT NOT NULL,
+        session_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        prompt TEXT NOT NULL,
+        degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
+        result TEXT,
+        error TEXT,
+        terminal_at INTEGER,
+        PRIMARY KEY (review_id, agent, role)
+      );
+      CREATE INDEX runtime_review_lanes_status ON runtime_review_lanes(review_id, status);
+      CREATE TABLE runtime_review_lane_attempts (
+        review_id TEXT NOT NULL,
+        agent TEXT NOT NULL CHECK (agent IN ('grok', 'claude', 'codex')),
+        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
+        attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (review_id, agent, role, attempt_ordinal),
+        FOREIGN KEY (review_id, agent, role)
+          REFERENCES runtime_review_lanes(review_id, agent, role) ON DELETE CASCADE
+      );
+      CREATE INDEX runtime_review_attempts_lane
+        ON runtime_review_lane_attempts(review_id, agent, role, attempt_ordinal);
+
+      DROP TABLE worktree_leases;
+      CREATE TABLE worktree_leases (
+        worktree_path TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        lease_id TEXT NOT NULL,
+        holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
+        fencing_token INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        authority_policy TEXT NOT NULL DEFAULT 'routing-v5'
+          CHECK (authority_policy = 'routing-v5')
+      );
+      PRAGMA user_version = 3;
+    `);
+    verifyV3State(db);
+    verifyInitialClaudeHealth(db);
+    faultInjector?.("before_v3_commit");
+  });
+  migrate.exclusive();
+}
+
 export class MigrationCoordinator {
   private readonly options: MigrationCoordinatorOptions;
 
@@ -609,6 +846,31 @@ export class MigrationCoordinator {
       state?.close();
       history?.close();
       if (temporaryBackup && !migrationSucceeded) rmSync(backupRoot, { recursive: true, force: true });
+    }
+  }
+
+  migrateToV3(): MigrationResult {
+    const state = new Database(this.options.stateDatabase);
+    const history = new Database(this.options.historyDatabase, { readonly: true });
+    state.pragma("foreign_keys = ON");
+    try {
+      const stateVersion = userVersion(state);
+      const historyVersion = userVersion(history);
+      if (stateVersion === V3 && historyVersion === V2) {
+        verifyV3State(state);
+        return { status: "already_current", fromVersion: 3, toVersion: 3 };
+      }
+      if (stateVersion !== V2 || historyVersion !== V2) {
+        throw new Error(`unsupported or partial schema versions: state=${stateVersion}, history=${historyVersion}`);
+      }
+
+      migrateStateToV3(state, this.options.faultInjector);
+      verifyV3State(state);
+      if (userVersion(history) !== V2) throw new Error("v3 migration changed the history schema marker");
+      return { status: "migrated", fromVersion: 2, toVersion: 3 };
+    } finally {
+      state.close();
+      history.close();
     }
   }
 }

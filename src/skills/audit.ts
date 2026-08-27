@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
-type AgentId = "grok" | "codex";
+type AgentId = "grok" | "claude" | "codex";
 
 export interface SkillManifestEntry {
   name: string;
@@ -90,7 +90,7 @@ export function auditSharedSkills(input: {
   const canonicalRoot = realpathSync(input.canonicalRoot);
   const brokenLinks = canonicalBrokenLinks(canonicalRoot);
   const agents = {} as Record<AgentId, AgentSkillAudit>;
-  for (const agent of ["grok", "codex"] as const) {
+  for (const agent of ["grok", "claude", "codex"] as const) {
     const configuredRoot = input.agentRoots[agent];
     try {
       const resolvedRoot = realpathSync(configuredRoot);
@@ -108,10 +108,10 @@ export function auditSharedSkills(input: {
       });
     }
   }
-  const manifestsMatch =
-    JSON.stringify(agents.grok.manifest) === JSON.stringify(agents.codex.manifest);
-  const rootsMatch =
-    agents.grok.resolvedRoot === canonicalRoot && agents.codex.resolvedRoot === canonicalRoot;
+  const manifestsMatch = [agents.grok, agents.claude, agents.codex]
+    .every((agent) => JSON.stringify(agent.manifest) === JSON.stringify(agents.grok.manifest));
+  const rootsMatch = [agents.grok, agents.claude, agents.codex]
+    .every((agent) => agent.resolvedRoot === canonicalRoot);
   return {
     canonicalRoot,
     agents,

@@ -3,7 +3,7 @@
 [English](README.md) | [Русский](README.ru.md)
 
 Локальный однопользовательский маршрутизатор совместной работы кодовых агентов
-Grok и Codex.
+Codex, Grok и Claude Code.
 
 Agent Collab предоставляет MCP-сервер с транспортом stdio, надежную рабочую
 очередь в SQLite, нормализованный индекс истории только для чтения и общий
@@ -12,17 +12,18 @@ Agent Collab предоставляет MCP-сервер с транспорто
 ## Возможности
 
 - Направляет каждый изменяющий состояние этап workflow в Codex 5.6 Sol по
-  сохраненным решениям `routing-v4`. Grok 4.6 работает как дополнительный
-  read-only harness для ревью.
+  сохраненным решениям `routing-v5`. Grok 4.6 и Claude Code с GLM-5.3 работают
+  как дополнительные read-only harness для ревью.
 - Адаптивно выбирает effort модели из `low`, `medium`, `high`, `xhigh`, `max`
   и `ultra`.
-- Ограничивает Codex/Sol уровнем `xhigh` согласно policy. Для Grok
-  маршрутизатор не задает отдельный предел: доступны уровни effort,
-  объявленные закрепленной версией модели.
-- Создает изолированные review lanes с ролями аудитора и критика для каждого
-  провайдера.
+- Ограничивает Codex/Sol уровнем `xhigh`. Grok ограничен возможностями
+  закрепленной модели на `xhigh`; Claude/GLM-5.3 принимает `low`–`max` и
+  отклоняет `ultra`.
+- Создает шесть изолированных review lanes: архитектурный аудитор и
+  корректирующий критик для Grok, Claude и Codex. Основной Codex получает их
+  durable-отчеты через `collab_run_status`.
 - Повторно запускает владельца этапа Codex после ограниченных по времени сбоев
-  провайдера, не передавая Grok права на запись.
+  провайдера, не передавая Grok или Claude права на запись.
 - Сохраняет degraded review lanes в durable-хранилище. После восстановления
   провайдер продолжает ту же read-only lane, если артефакт и fingerprint
   рабочей области не изменились.
@@ -42,7 +43,7 @@ Agent Collab предоставляет MCP-сервер с транспорто
 - Node.js 24 или новее
 - npm
 - поддержка SQLite через `better-sqlite3`
-- локально установленные Grok CLI и Codex CLI
+- локально установленные Grok CLI, Claude Code CLI и Codex CLI
 - клиент, способный зарегистрировать stdio MCP command
 
 ## Установка
@@ -68,6 +69,7 @@ Agent Collab использует следующие переменные окр
 ```bash
 export AGENT_COLLAB_STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agent-collab"
 export AGENT_COLLAB_GROK_BIN="$(command -v grok)"
+export AGENT_COLLAB_CLAUDE_BIN="$(command -v claude)"
 export AGENT_COLLAB_CODEX_BIN="$(command -v codex)"
 export AGENT_COLLAB_ALLOWED_ROOTS="$HOME/src:$HOME/work"
 ```
@@ -89,14 +91,14 @@ Linux/macOS и `;` в Windows.
 
 ## MCP command
 
-Зарегистрируйте собранный CLI как stdio MCP command в Grok и Codex:
+Зарегистрируйте собранный CLI как stdio MCP command в Grok, Claude Code и Codex:
 
 ```text
 node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs mcp
 ```
 
 Укажите абсолютный путь к checkout. После изменения регистрации MCP или общих
-скиллов перезапустите Grok и Codex.
+скиллов перезапустите все три harness.
 
 ## Worker
 
@@ -119,6 +121,7 @@ npm run build
 npm start -- doctor
 npm start -- doctor-v1
 npm start -- migrate-v2
+npm start -- migrate-v3
 npm start -- verify-bundle /absolute/rollback/bundle
 npm start -- restore-v1 /absolute/rollback/bundle
 npm start -- reconcile-run <run-id> <completed|failed>
@@ -185,6 +188,15 @@ receipt hashes защищают от случайного drift, но не яв�
 `$AGENT_COLLAB_STATE_DIR/rollback/`. Обычные команды не мигрируют базу v1
 неявно.
 
+`migrate-v3` — офлайн-миграция state-схемы с v2 на v3. Перед запуском нужно
+остановить пользовательский service. Обе базы должны иметь версию v2; history
+останется на v2. Команда откажется выполнять DDL, если хотя бы одна строка,
+включая терминальную, есть в `runs`, `collaboration_runs`,
+`collaboration_dispatch_outbox`, `runtime_review_barriers`,
+`runtime_review_lanes`, `runtime_review_lane_attempts` или `worktree_leases`.
+В отличие от `migrate-v2`, эта команда не создает сохраняемый rollback bundle,
+поэтому перед запуском нужна операторская резервная копия.
+
 `restore-v1` требует подтверждения, что service остановлен. Команда
 восстанавливает пару баз v1, а управление жизненным циклом service оставляет
 оператору.
@@ -221,13 +233,15 @@ npm start -- probe APPROVE_LIVE_CAPABILITY_PROBE
 Codex владеет координацией, планированием, архитектурой, реализацией, проверкой,
 переходами состояния и mutation lease рабочей области задачи.
 
-Grok работает как дополнительный независимый harness для immutable
-`workspace-read` auditor и critic lanes. Он не может стать writer workflow или
+Grok и Claude работают как дополнительные независимые harness для immutable
+`workspace-read` auditor и corrective critic lanes. Claude закреплен за
+`glm-5.3`, новой неперсистентной сессией, пустой MCP-конфигурацией и набором
+инструментов `Read,Glob,Grep`. Ни один из них не может стать writer workflow или
 заменить Codex при сбое.
 
 Control plane MAP 3.28.1 закреплен за провайдером Codex. Planning prompts
 используют его plan contract. Архитектурно значимые этапы и реализация остаются
-в `blocked_map_admission`, пока Codex/Grok auditor и critic lanes не пропустят
+в `blocked_map_admission`, пока Codex/Grok/Claude auditor и critic lanes не пропустят
 barriers точной архитектуры target и implementer readiness. Target связывает
 branch ref, upstream ref и tip, merge base, HEAD, идентичность
 source/index/nested repository, версию и revision активного MAP profile, archive,
@@ -238,7 +252,7 @@ Runtime требует точный promoted-learning snapshot для каждо
 При его отсутствии запись workflow отклоняется, а устаревшая копия outbox
 помещается в quarantine до публикации. Runner синхронно повторяет всю fixed
 admission на последней границе перед spawn: source, learning, profile, durable
-target, review barriers и consumed authority. Оба harness получают promoted MAP
+target, review barriers и consumed authority. Все три harness получают promoted MAP
 learning projection в фактических execution prompts.
 
 Результат ревью использует строгую схему `review-verdict/v1` с каноническим
@@ -288,7 +302,7 @@ mutation input `MapControlPlane` с фиксированным root, поэто�
 authority.
 
 Для promotion нужны canonical task packet, проверенные finding lifecycles и
-четыре запущенные durable строки PASS от Codex/Grok для того же packet. Receipts
+шесть запущенных durable строк PASS от Codex/Grok/Claude для того же packet. Receipts
 для исправления, old-code regression и sibling scan создают три разных
 oracle/control defect-class-specific исполнителя `map-evidence-record`,
 определенных кодом. Их stage, oracle, control, типизированный root-cause class и
@@ -306,7 +320,11 @@ executors. Остальные escaped findings остаются открытым
 прерванной операции или drift выполняет rollback до projection или retry.
 Каждая строка workflow и review queue несет точные bytes promoted projection,
 digest и consumer. Runner сравнивает их с актуальным learning из control root и
-prompt непосредственно перед запуском Codex или Grok.
+prompt непосредственно перед запуском Codex, Grok или Claude.
+
+Существующий evaluation corpus и paired benchmark Grok/Codex не меняются.
+Claude добавлен только в production review routing: новые eval cells не
+создаются, live-вызовы провайдера в рамках этого изменения не выполняются.
 
 Retry, external authority, артефакты размером от 256 KiB и изменения в 20 или
 более файлах повышают запрошенный effort на один уровень до применения лимитов

@@ -1,4 +1,4 @@
-import type { AgentId, ProviderHealth } from "./routing.js";
+import type { ProviderHealth, ReviewProviderId } from "./routing.js";
 
 export const FAILOVER_OUTCOMES = [
   "quota",
@@ -22,6 +22,32 @@ export type OutcomeKind = (typeof FAILOVER_OUTCOMES)[number] | (typeof TERMINAL_
 export type FailoverOutcomeKind = (typeof FAILOVER_OUTCOMES)[number];
 export interface ProviderOutcome {
   kind: OutcomeKind;
+}
+
+export class ProviderTransportFailure extends Error {
+  constructor(
+    message: string,
+    readonly outcome: OutcomeKind = "task_failure",
+  ) {
+    super(message);
+    this.name = "ProviderTransportFailure";
+  }
+}
+
+export function classifyProviderFailure(error: unknown, stderr = ""): OutcomeKind {
+  if (error instanceof ProviderTransportFailure) return error.outcome;
+  const message = `${error instanceof Error ? error.message : String(error)} ${stderr}`.toLowerCase();
+  if (/enoent|not found/.test(message)) return "cli_missing";
+  if (/timed?\s*out|timeout/.test(message)) return "network_timeout";
+  if (/rate.?limit|429/.test(message)) return "rate_limit";
+  if (/quota|usage limit/.test(message)) return "quota";
+  if (/auth|login|not logged|credential/.test(message)) return "auth";
+  if (/overload|unavailable|capacity|model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
+    return "model_unavailable";
+  }
+  if (/permission|denied/.test(message)) return "permission_denial";
+  if (/invalid request|bad request/.test(message)) return "invalid_request";
+  return "task_failure";
 }
 
 const FAILOVER_SET: ReadonlySet<string> = new Set(FAILOVER_OUTCOMES);
@@ -65,7 +91,7 @@ export interface StartupProbeResult {
 }
 
 export function evaluateStartupProbe(input: {
-  agent: AgentId;
+  agent: ReviewProviderId;
   enabled: boolean;
   expected: StartupProbeExpected;
   observed: StartupProbeObserved | null;

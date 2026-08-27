@@ -18,12 +18,15 @@ const delegatedArtifact = (artifactContent: string) => ({
 
 const markCapabilityReady = (service: LocalCollabService): void => {
   service.providers.recordSuccess("grok", 1);
+  service.providers.recordSuccess("claude", 1);
   service.providers.recordSuccess("codex", 1);
 };
 const serviceOptions = (root: string) => {
   initializeCurrentExecutionSchema(join(root, "state.db"));
   return { allowedRoots: [root], agentSkillRoots: {
-    grok: join(homedir(), ".agents", "skills"), codex: join(homedir(), ".agents", "skills"),
+    grok: join(homedir(), ".agents", "skills"),
+    claude: join(homedir(), ".agents", "skills"),
+    codex: join(homedir(), ".agents", "skills"),
   } };
 };
 
@@ -136,7 +139,7 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("blocks planning itself on the exact four-lane MAP architecture gate", async () => {
+  it("blocks planning itself on the exact six-lane MAP architecture gate", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-planning-map-gate-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
@@ -147,10 +150,10 @@ describe("local collaboration service wiring", () => {
         idempotencyKey: "task:planning" });
       expect(result).toMatchObject({ status: "blocked_map_admission", mapAdmission: {
         satisfied: false,
-        gates: [{ name: "architecture", barrier: { requiredCount: 4, satisfied: false } }],
+        gates: [{ name: "architecture", barrier: { requiredCount: 6, satisfied: false } }],
       } });
       expect(service.runtime.workflows.get(result.runId)).toBeNull();
-      expect(service.runs.list()).toHaveLength(4);
+      expect(service.runs.list()).toHaveLength(6);
       expect(service.runs.list().every((run) => String(run.payload?.prompt)
         .includes('"kind":"planning"'))).toBe(true);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
@@ -172,7 +175,7 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("persists exactly four isolated review lanes with distinct provider-role keys", async () => {
+  it("persists exactly six isolated review lanes with distinct provider-role keys", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-review-service-"));
     const project = join(root, "project");
     (await import("node:fs")).mkdirSync(project);
@@ -190,10 +193,10 @@ describe("local collaboration service wiring", () => {
         approvalScope: "workspace-read",
         idempotencyKey: "task:review",
       });
-      expect(result.laneCount).toBe(4);
-      expect(result.activeLaneCount).toBe(4);
+      expect(result.laneCount).toBe(6);
+      expect(result.activeLaneCount).toBe(6);
       expect(result.runState).toBe("FULL_CROSS_PROVIDER");
-      expect(new Set(result.runIds).size).toBe(4);
+      expect(new Set(result.runIds).size).toBe(6);
       expect(service.runs.list().map((run) => [
         run.payload?.preferredAgent,
         run.payload?.reviewRole,
@@ -201,6 +204,8 @@ describe("local collaboration service wiring", () => {
       ]).sort((left, right) => String(left[2]).localeCompare(String(right[2])))).toEqual([
         ["grok", "auditor", "grok:auditor"],
         ["grok", "critic", "grok:critic"],
+        ["claude", "auditor", "claude:auditor"],
+        ["claude", "critic", "claude:critic"],
         ["codex", "auditor", "codex:auditor"],
         ["codex", "critic", "codex:critic"],
       ].sort((left, right) => String(left[2]).localeCompare(String(right[2]))));
@@ -228,9 +233,20 @@ describe("local collaboration service wiring", () => {
         lanes: expect.arrayContaining([
           expect.objectContaining({ agent: "grok", role: "auditor" }),
           expect.objectContaining({ agent: "grok", role: "critic" }),
+          expect.objectContaining({ agent: "claude", role: "auditor" }),
+          expect.objectContaining({ agent: "claude", role: "critic" }),
           expect.objectContaining({ agent: "codex", role: "auditor" }),
           expect.objectContaining({ agent: "codex", role: "critic" }),
         ]),
+      });
+      await expect(service.runStatus({ runId: result.reviewId })).resolves.toMatchObject({
+        review: {
+          lanes: expect.arrayContaining([
+            expect.objectContaining({ agent: "claude", role: "auditor", status: "queued" }),
+            expect.objectContaining({ agent: "claude", role: "critic", status: "queued" }),
+          ]),
+        },
+        barrier: { satisfied: false, terminalCount: 0, requiredCount: 6 },
       });
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
@@ -286,7 +302,7 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("scopes review idempotency and all four lane keys to the canonical project", async () => {
+  it("scopes review idempotency and all six lane keys to the canonical project", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-review-project-scope-"));
     const a = join(root, "a"); const b = join(root, "b");
     (await import("node:fs")).mkdirSync(a); (await import("node:fs")).mkdirSync(b);
@@ -299,8 +315,8 @@ describe("local collaboration service wiring", () => {
       const first = await service.requestReview({ ...common, project: a });
       const second = await service.requestReview({ ...common, project: b });
       expect(first.reviewId).not.toBe(second.reviewId);
-      expect(service.runs.list()).toHaveLength(8);
-      expect(new Set(service.runs.list().map((run) => run.idempotencyKey)).size).toBe(8);
+      expect(service.runs.list()).toHaveLength(12);
+      expect(new Set(service.runs.list().map((run) => run.idempotencyKey)).size).toBe(12);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -437,13 +453,13 @@ describe("local collaboration service wiring", () => {
           satisfied: false,
           profile: { version: "3.28.1", provider: "codex" },
           gates: [
-            { name: "architecture", barrier: { satisfied: false, requiredCount: 4 } },
-            { name: "implementer-readiness", barrier: { satisfied: false, requiredCount: 4 } },
+            { name: "architecture", barrier: { satisfied: false, requiredCount: 6 } },
+            { name: "implementer-readiness", barrier: { satisfied: false, requiredCount: 6 } },
           ],
         },
       });
       expect(service.runtime.workflows.get(first.runId)).toBeNull();
-      expect(service.runs.list()).toHaveLength(8);
+      expect(service.runs.list()).toHaveLength(12);
       expect(service.runs.list().every((run) => run.approvalScope === "workspace-read")).toBe(true);
       expect(service.runs.list().every((run) =>
         String(run.payload?.prompt).includes("review-verdict/v1"),
@@ -572,7 +588,7 @@ describe("local collaboration service wiring", () => {
         terminate: vi.fn(),
       }));
       const admittedRunner = new AgentRunner({
-        binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+        binaries: { grok: "/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/bin/codex" },
         timeoutMs: 90_000,
         authorizationDatabasePath: service.stateDatabase,
         launcher: { launch },
@@ -632,22 +648,25 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
   }, 20_000);
 
-  it("creates two active and two deferred review lanes when one provider is unavailable", async () => {
+  it("creates four active and two deferred review lanes when Claude is unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-degraded-service-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
     markCapabilityReady(service);
     try {
-      service.providers.canAttempt("grok", 0);
-      service.providers.recordFailoverFailure("grok", { kind: "auth" }, 1);
+      service.providers.canAttempt("claude", 0);
+      service.providers.recordFailoverFailure("claude", { kind: "auth" }, 1);
+      service.providers.recordSuccess("grok", 1);
       service.providers.recordSuccess("codex", 1);
       const artifactContent = "degraded immutable artifact";
       const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
       const result = await service.requestReview({ requester: "codex", project, artifactHash, artifactContent,
         prompt: "review", approvalScope: "workspace-read", idempotencyKey: "degraded-review" });
-      expect(result).toMatchObject({ laneCount: 4, activeLaneCount: 2, runState: "DEGRADED_SINGLE_PROVIDER" });
-      expect(service.runs.list().map((run) => run.payload?.preferredAgent)).toEqual(["codex", "codex"]);
-      expect(service.reviews.get(result.reviewId)?.lanes.filter((lane) => lane.agent === "grok")
+      expect(result).toMatchObject({ laneCount: 6, activeLaneCount: 4, runState: "DEGRADED_REVIEW_SET" });
+      expect(service.runs.list().map((run) => run.payload?.preferredAgent)).toEqual([
+        "grok", "grok", "codex", "codex",
+      ]);
+      expect(service.reviews.get(result.reviewId)?.lanes.filter((lane) => lane.agent === "claude")
         .every((lane) => lane.status === "deferred")).toBe(true);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
@@ -666,7 +685,9 @@ describe("local collaboration service wiring", () => {
       const first = await service.delegate(input); const replay = await service.delegate(input);
       expect(first.assignedAgent).toBe("codex");
       expect(replay).toEqual(first);
-      expect(service.runs.list()[0]?.payload?.preferredAgent).toBe("codex");
+      expect(service.runs.list().every((run) =>
+        run.stage?.startsWith("review:") || run.payload?.preferredAgent === "codex",
+      )).toBe(true);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 });

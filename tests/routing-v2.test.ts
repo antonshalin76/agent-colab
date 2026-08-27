@@ -36,9 +36,9 @@ const assignment = (
   trustedInputs: TrustedEffortInputs = BASE_INPUTS,
 ) => selectStageAssignment({ stage, origin, health, trustedInputs });
 
-describe("routing-v4 canonical policy", () => {
-  it("pins the complete policy to routing-v4 with Codex as every stage owner", () => {
-    expect(ROUTING_POLICY_VERSION).toBe("routing-v4");
+describe("routing-v5 canonical policy", () => {
+  it("pins the complete policy to routing-v5 with Codex as every stage owner", () => {
+    expect(ROUTING_POLICY_VERSION).toBe("routing-v5");
     expect(Object.keys(STAGE_POLICY)).toEqual([...STAGES]);
     expect(STAGES).toHaveLength(21);
     expect(STAGES.every((stage) => STAGE_POLICY[stage].preferredAgent === "codex")).toBe(true);
@@ -51,7 +51,7 @@ describe("routing-v4 canonical policy", () => {
         agent: "codex",
         model: "gpt-5.6-sol",
         effort: STAGE_POLICY[stage].baselineEffort.codex,
-        policyVersion: "routing-v4",
+        policyVersion: "routing-v5",
         reasons: [`stage_baseline:${stage}:${STAGE_POLICY[stage].baselineEffort.codex}`],
         degraded: false,
       });
@@ -92,7 +92,7 @@ describe("routing-v4 canonical policy", () => {
       assignedAgent: "codex",
       model: "gpt-5.6-sol",
       effort: "high",
-      policyVersion: "routing-v4",
+      policyVersion: "routing-v5",
       reasons: ["stage_baseline:planning:medium", "external_scope"],
       degraded: false,
       role: "stage-owner",
@@ -135,7 +135,7 @@ describe("routing-v4 canonical policy", () => {
   });
 });
 
-describe("routing-v4 adaptive effort", () => {
+describe("routing-v5 adaptive effort", () => {
   it("keeps modifier order deterministic and caps Codex at xhigh", () => {
     const decision = selectFixedAgentEffort({
       stage: "planning",
@@ -152,7 +152,7 @@ describe("routing-v4 adaptive effort", () => {
       agent: "codex",
       model: "gpt-5.6-sol",
       effort: "xhigh",
-      policyVersion: "routing-v4",
+      policyVersion: "routing-v5",
       reasons: [
         "stage_baseline:planning:medium",
         "retry",
@@ -175,7 +175,7 @@ describe("routing-v4 adaptive effort", () => {
       agent: "grok",
       model: "grok-4.6",
       effort: "xhigh",
-      policyVersion: "routing-v4",
+      policyVersion: "routing-v5",
       reasons: ["stage_baseline:code_critic:xhigh"],
       degraded: false,
     });
@@ -215,7 +215,7 @@ describe("routing-v4 adaptive effort", () => {
   );
 });
 
-describe("routing-v4 provider outcome classification", () => {
+describe("routing-v5 provider outcome classification", () => {
   it.each(FAILOVER_OUTCOMES)("classifies %s as retryable but not transferable", (kind) => {
     expect(classifyOutcome({ kind })).toEqual({
       failoverEligible: true,

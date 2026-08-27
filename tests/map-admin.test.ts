@@ -120,7 +120,7 @@ function learningBytes(root: string, options?: { controlFingerprint?: () => stri
     schemaVersion: "map-learning-candidate/v1",
     rule: "Block promotion when an exact-packet review receipt is stale.",
     controlIds: ["CTRL-009"],
-    consumerScopes: ["codex", "grok"],
+    consumerScopes: ["codex", "grok", "claude"],
     revision: 1,
     },
     ...(options?.controlFingerprint ? { controlFingerprint: options.controlFingerprint } : {}),
@@ -144,7 +144,7 @@ function closeLearning(
   }
 }
 
-describe("local MAP administration adapter", () => {
+describe("local MAP administration adapter", { timeout: 15_000 }, () => {
   it("does not expose generic root-selectable MAP mutation entrypoints", async () => {
     const administration = await import("../src/flow/map-admin.js");
     const learning = await import("../src/flow/map-learning.js");
@@ -293,15 +293,28 @@ describe("local MAP administration adapter", () => {
       .toThrow(/runtime tool tree.*identity/i);
   });
 
-  it("closes exact-byte learning and projects the same records to Codex and Grok", () => {
+  it("closes exact-byte learning and projects the same records to Codex, Grok and Claude", () => {
     const root = createProfileFixture();
     const input = learningBytes(root);
+    const mapConfigBefore = readFileSync(join(root, ".map/config.yaml"));
+    const handoff = JSON.parse(Buffer.from(input.handoffBytes).toString("utf8")) as {
+      reviewReceipts: Array<{ agent: string; role: string }>;
+    };
+    expect(handoff.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort()).toEqual([
+      "claude:auditor",
+      "claude:critic",
+      "codex:auditor",
+      "codex:critic",
+      "grok:auditor",
+      "grok:critic",
+    ]);
     const beforePromotion = createMapLearningLaunchBinding(root, "codex");
     const beforePrompt = `${formatMapLearningLaunchBindingContext(beforePromotion)}\n\nreview`;
 
     const closed = closeLearning(root, input, input.authority);
     const codex = projectMapLearning(root, "codex");
     const grok = projectMapLearning(root, "grok");
+    const claude = projectMapLearning(root, "claude");
 
     expect(closed.record).toMatchObject({
       taskPacketSha256: sha256(input.taskPacketBytes),
@@ -309,10 +322,13 @@ describe("local MAP administration adapter", () => {
       candidateSha256: sha256(input.candidateBytes),
       mapVersion: MAP_VERSION,
       mapManifestSha256: closed.profile.mapManifestSha256,
-      consumerScopes: ["codex", "grok"],
+      consumerScopes: ["codex", "grok", "claude"],
     });
     expect(codex.projection.digest).toBe(grok.projection.digest);
     expect(codex.projection.bytes).toEqual(grok.projection.bytes);
+    expect(claude.projection).toEqual(codex.projection);
+    expect(claude.profile).toEqual(codex.profile);
+    expect(readFileSync(join(root, ".map/config.yaml"))).toEqual(mapConfigBefore);
     expect(JSON.parse(Buffer.from(codex.projection.bytes).toString("utf8")))
       .toMatchObject({ records: [{ recordId: closed.record.recordId }] });
     expect(readdirSync(join(root, ".map/agent-collab-admin/learning/records")))
@@ -329,6 +345,20 @@ describe("local MAP administration adapter", () => {
       "codex",
       current,
       `${formatMapLearningLaunchBindingContext(current)}\n\nreview`,
+    )).not.toThrow();
+    const claudeBinding = createMapLearningLaunchBinding(root, "claude");
+    expect(claudeBinding.consumer).toBe("claude");
+    expect(Object.keys(claudeBinding).sort()).toEqual([
+      "consumer",
+      "digest",
+      "projectionBase64",
+      "schemaVersion",
+    ]);
+    expect(() => assertCurrentMapLearningLaunchBinding(
+      root,
+      "claude",
+      claudeBinding,
+      `${formatMapLearningLaunchBindingContext(claudeBinding)}\n\nread-only review`,
     )).not.toThrow();
   });
 
@@ -391,7 +421,7 @@ describe("local MAP administration adapter", () => {
       expect(readFileSync(outside)).toEqual(before);
       expect(statSync(outside).mode & 0o777).toBe(beforeMode);
     }
-  });
+  }, 15_000);
 
   it("rejects a promotion-state journal symlink before recovery or publication", () => {
     const root = createProfileFixture();
@@ -468,7 +498,7 @@ describe("local MAP administration adapter", () => {
         schemaVersion: "map-learning-candidate/v1",
         rule: "Reject learning evidence that does not resolve its canonical process execution.",
         controlIds: ["CTRL-014"],
-        consumerScopes: ["codex", "grok"],
+        consumerScopes: ["codex", "grok", "claude"],
         revision: 1,
       },
       findingSpec: {

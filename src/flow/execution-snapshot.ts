@@ -18,7 +18,7 @@ const Workspace = z.object({
 }).strict();
 const MapLearning = z.object({
   schemaVersion: z.literal("map-learning-launch-binding/v1"),
-  consumer: z.enum(["codex", "grok"]), projectionBase64: z.string().min(1), digest: Sha256,
+  consumer: z.enum(["codex", "grok", "claude"]), projectionBase64: z.string().min(1), digest: Sha256,
 }).strict();
 const MapProfile = z.object({
   version: z.string().min(1), sourceRevision: z.string().regex(/^[a-f0-9]{40}$/u),
@@ -42,7 +42,7 @@ const SnapshotStage = z.object({
 
 export const ExecutionSnapshotSchema = z.object({
   schemaVersion: z.literal("execution-snapshot/v1"), workflowId: z.string().min(1),
-  taskId: z.string().min(1), origin: z.enum(["grok", "codex"]), policyVersion: z.literal("routing-v4"),
+  taskId: z.string().min(1), origin: z.enum(["grok", "codex"]), policyVersion: z.literal("routing-v5"),
   workspace: Workspace, mapProfile: MapProfile, stage: SnapshotStage,
 }).strict();
 export type ExecutionSnapshot = z.infer<typeof ExecutionSnapshotSchema>;

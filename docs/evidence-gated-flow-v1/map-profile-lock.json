@@ -60,7 +60,7 @@
     "AGENTS.md": "a3837472543d188dc979d50962aba78c2b9269885026e58766a73094d053eee2"
   },
   "outsideScopeSha256": {
-    ".agents/skills/map-learn/SKILL.md": "964e9ea23b9f9570c26f2d85fcad93a7dc385f4f47b27044c7e2ad7dd2512e7d",
+    ".agents/skills/map-learn/SKILL.md": "1fe978536e7b7bd4bc98ff1f0a7343caced2d6533d4eb5e68dde77a74bfde1d3",
     ".codex/hooks/agent-collab-map-gate.py": "efb5f9f9ac514f0e8f47df13e6685f88c70a3f67bb50485dd93dfe2a125e28b3"
   }
 }

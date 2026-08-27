@@ -11,6 +11,14 @@ const providers = {
     effort: "high" as const,
     cwd: "/repo",
   },
+  claude: {
+    enabled: true,
+    binaryPath: "/home/anton/.local/bin/claude",
+    expectedVersion: "2.1.247 (Claude Code)",
+    model: "glm-5.3" as const,
+    effort: "max" as const,
+    cwd: "/repo",
+  },
   codex: {
     enabled: true,
     binaryPath: "/opt/agent-collab/bin/codex",
@@ -21,20 +29,23 @@ const providers = {
   },
 };
 
-const probeInput = (effort: "high" | "xhigh") =>
-  `Capability probe. Do not use tools. Return only valid JSON with exactly these keys: ` +
-  `{"protocolVersion":"agent-collab/v2","reasoningEffort":"${effort}",` +
-  `"visibleText":"{\\"protocolVersion\\":\\"agent-collab/v2\\",\\"reasoningEffort\\":\\"${effort}\\",` +
-  `\\"supportsNonInteractive\\":true,\\"supportsResume\\":true}"}.`;
-
-const capabilityPayload = (effort: "high" | "xhigh") => JSON.stringify({
+const capabilityPayload = (effort: "high" | "xhigh" | "max") => JSON.stringify({
   protocolVersion: "agent-collab/v2",
   reasoningEffort: effort,
   supportsNonInteractive: true,
   supportsResume: true,
 });
 
-const success = (agent: "grok" | "codex") => {
+const probeInput = (agent: "grok" | "claude" | "codex", effort: "high" | "xhigh" | "max") =>
+  agent === "claude"
+    ? `Capability probe. Do not use tools. Return a review-verdict/v1 envelope with verdict PASS ` +
+      `and exactly one info finding whose message is exactly this JSON: ${capabilityPayload(effort)}`
+    : `Capability probe. Do not use tools. Return only valid JSON with exactly these keys: ` +
+      `{"protocolVersion":"agent-collab/v2","reasoningEffort":"${effort}",` +
+      `"visibleText":"{\\"protocolVersion\\":\\"agent-collab/v2\\",\\"reasoningEffort\\":\\"${effort}\\",` +
+      `\\"supportsNonInteractive\\":true,\\"supportsResume\\":true}"}.`;
+
+const success = (agent: "grok" | "claude" | "codex") => {
   if (agent === "grok") {
     return {
       exitCode: 0,
@@ -50,6 +61,26 @@ const success = (agent: "grok" | "codex") => {
         }),
         thought: "PRIVATE_PROBE_THOUGHT",
         tool_result: "PRIVATE_PROBE_TOOL_RESULT",
+      }),
+      stderr: "",
+    };
+  }
+  if (agent === "claude") {
+    const verdict = {
+      schemaVersion: "review-verdict/v1",
+      verdict: "PASS",
+      findings: [{ risk_level: "info", message: capabilityPayload("max") }],
+    };
+    return {
+      exitCode: 0,
+      version: "2.1.247 (Claude Code)",
+      stdout: JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: sessionId,
+        result: JSON.stringify(verdict),
+        structured_output: verdict,
       }),
       stderr: "",
     };
@@ -87,7 +118,7 @@ const pending = <T>() => {
   return { promise, resolve };
 };
 
-const run = (runner: { execute: (request: { agent: "grok" | "codex" }) => Promise<ReturnType<typeof success>> }) =>
+const run = (runner: { execute: (request: { agent: "grok" | "claude" | "codex" }) => Promise<ReturnType<typeof success>> }) =>
   runCapabilityProbes({
     providers,
     timeoutMs: 3_000,
@@ -97,18 +128,34 @@ const run = (runner: { execute: (request: { agent: "grok" | "codex" }) => Promis
 
 afterEach(() => vi.useRealTimers());
 
-describe("BDD-9 executable bounded Grok/Codex capability probes", () => {
-  it("invokes both enabled providers once with exact v2 no-shell process contracts", async () => {
+describe("BDD-9 executable bounded review-provider capability probes", () => {
+  it("invokes all enabled providers once with exact v2 no-shell process contracts", async () => {
     const gates = {
       grok: pending<ReturnType<typeof success>>(),
+      claude: pending<ReturnType<typeof success>>(),
       codex: pending<ReturnType<typeof success>>(),
     };
-    const execute = vi.fn((request: { agent: "grok" | "codex" }) => gates[request.agent].promise);
+    const execute = vi.fn((request: { agent: "grok" | "claude" | "codex" }) => gates[request.agent].promise);
 
     const result = run({ execute });
-    await expect.poll(() => execute.mock.calls.length).toBe(2);
+    await expect.poll(() => execute.mock.calls.length).toBe(3);
     expect(execute.mock.calls.map(([request]) => request).sort((a, b) =>
       a.agent.localeCompare(b.agent))).toEqual([
+      {
+        agent: "claude",
+        file: "/home/anton/.local/bin/claude",
+        args: expect.arrayContaining([
+          "-p", "--model", "glm-5.3", "--effort", "max",
+          "--session-id", sessionId, "--no-session-persistence", "--safe-mode",
+          "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+          "--output-format", "json",
+        ]),
+        cwd: "/repo",
+        stdin: probeInput("claude", "max"),
+        timeoutMs: 3_000,
+        shell: false,
+        killProcessGroup: true,
+      },
       {
         agent: "codex",
         file: "/opt/agent-collab/bin/codex",
@@ -117,7 +164,7 @@ describe("BDD-9 executable bounded Grok/Codex capability probes", () => {
           "-C", "/repo", "-s", "read-only", "--json", "-",
         ],
         cwd: "/repo",
-        stdin: probeInput("xhigh"),
+        stdin: probeInput("codex", "xhigh"),
         timeoutMs: 3_000,
         shell: false,
         killProcessGroup: true,
@@ -133,33 +180,35 @@ describe("BDD-9 executable bounded Grok/Codex capability probes", () => {
           "--tools", "read_file,grep,list_dir",
         ],
         cwd: "/repo",
-        stdin: probeInput("high"),
+        stdin: probeInput("grok", "high"),
         timeoutMs: 3_000,
         shell: false,
         killProcessGroup: true,
       },
     ]);
 
+    gates.claude.resolve(success("claude"));
     gates.codex.resolve(success("codex"));
     gates.grok.resolve(success("grok"));
     await expect(result).resolves.toEqual({
       results: {
         grok: { health: "healthy", ready: true, failures: [] },
+        claude: { health: "healthy", ready: true, failures: [] },
         codex: { health: "healthy", ready: true, failures: [] },
       },
     });
   });
 
   it("never invokes a disabled provider", async () => {
-    const execute = vi.fn(async (request: { agent: "grok" | "codex" }) => success(request.agent));
+    const execute = vi.fn(async (request: { agent: "grok" | "claude" | "codex" }) => success(request.agent));
     const result = await runCapabilityProbes({
       providers: { ...providers, grok: { ...providers.grok, enabled: false } },
       timeoutMs: 3_000,
       runner: { execute },
       sessionIdFactory: () => sessionId,
     });
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(execute.mock.calls[0]![0]).toMatchObject({ agent: "codex" });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute.mock.calls.map(([request]) => request.agent).sort()).toEqual(["claude", "codex"]);
     expect(result.results.grok).toEqual({
       health: "disabled",
       ready: false,
@@ -170,19 +219,21 @@ describe("BDD-9 executable bounded Grok/Codex capability probes", () => {
   it("bounds hung probes and classifies missing CLIs without retrying", async () => {
     vi.useFakeTimers();
     const never = new Promise<ReturnType<typeof success>>(() => undefined);
-    const execute = vi.fn((request: { agent: "grok" | "codex" }) =>
-      request.agent === "grok"
-        ? never
-        : Promise.reject(Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" })));
+    const execute = vi.fn((request: { agent: "grok" | "claude" | "codex" }) => {
+      if (request.agent === "grok") return never;
+      if (request.agent === "claude") return Promise.resolve(success("claude"));
+      return Promise.reject(Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }));
+    });
     const result = run({ execute });
     await vi.advanceTimersByTimeAsync(3_000);
     await expect(result).resolves.toEqual({
       results: {
         grok: { health: "unavailable", ready: false, failures: ["probe_timeout"] },
+        claude: { health: "healthy", ready: true, failures: [] },
         codex: { health: "unavailable", ready: false, failures: ["cli_missing"] },
       },
     });
-    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenCalledTimes(3);
   });
 
   it.each([
@@ -202,8 +253,13 @@ describe("BDD-9 executable bounded Grok/Codex capability probes", () => {
     ],
     ["codex model drift", "codex", '{"type":"session_meta","payload":{"model":"gpt-5.7"}}\n'],
     ["codex malformed", "codex", '{"type":"session_meta"}\nnot-json\n'],
+    ["claude malformed", "claude", "not-json"],
+    ["claude session drift", "claude", JSON.stringify({
+      ...JSON.parse(success("claude").stdout),
+      session_id: "123e4567-e89b-42d3-a456-426614174999",
+    })],
   ] as const)("fails closed for %s", async (_name, agent, stdout) => {
-    const execute = vi.fn(async (request: { agent: "grok" | "codex" }) =>
+    const execute = vi.fn(async (request: { agent: "grok" | "claude" | "codex" }) =>
       request.agent === agent
         ? { ...success(request.agent), stdout }
         : success(request.agent));
@@ -222,8 +278,8 @@ describe("BDD-9 executable bounded Grok/Codex capability probes", () => {
       supportsNonInteractive: true,
       supportsResume: true,
     });
-    const execute = vi.fn(async (request: { agent: "grok" | "codex" }) => {
-      if (request.agent === "grok") return success("grok");
+    const execute = vi.fn(async (request: { agent: "grok" | "claude" | "codex" }) => {
+      if (request.agent !== "codex") return success(request.agent);
       return {
         ...success("codex"),
         stdout: [

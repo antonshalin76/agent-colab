@@ -73,7 +73,7 @@ const beginPlanning = (run = makeRun()): CollaborationRun =>
 
 afterEach(() => vi.useRealTimers());
 
-describe("routing-v4 Codex stage ownership", () => {
+describe("routing-v5 Codex stage ownership", () => {
   it.each(["grok", "codex"] as const)(
     "inserts one Codex-owned coordination stage for %s origin",
     (origin) => {
@@ -89,7 +89,7 @@ describe("routing-v4 Codex stage ownership", () => {
         agent: "codex",
         model: "gpt-5.6-sol",
         effort: "medium",
-        policyVersion: "routing-v4",
+        policyVersion: "routing-v5",
         reasons: ["stage_baseline:coordination:medium"],
         attemptOrdinal: 0,
         degraded: false,
@@ -103,7 +103,7 @@ describe("routing-v4 Codex stage ownership", () => {
         agent: "codex",
         model: "gpt-5.6-sol",
         effort: "medium",
-        policyVersion: "routing-v4",
+        policyVersion: "routing-v5",
         reasons: ["stage_baseline:planning:medium"],
         attemptOrdinal: 0,
         degraded: false,
@@ -158,7 +158,7 @@ describe("routing-v4 Codex stage ownership", () => {
   });
 });
 
-describe("routing-v4 outcome and recovery boundaries", () => {
+describe("routing-v5 outcome and recovery boundaries", () => {
   it.each([
     "quota",
     "rate_limit",
@@ -312,7 +312,7 @@ describe("routing-v4 outcome and recovery boundaries", () => {
   });
 });
 
-describe("routing-v4 persistence and stage ordering", () => {
+describe("routing-v5 persistence and stage ordering", () => {
   it("blocks ambiguous post-launch reconciliation without synthesizing provider evidence", () => {
     const running = beginPlanning();
     const blocked = transitionCollaborationRun(running, {

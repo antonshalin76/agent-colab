@@ -140,12 +140,22 @@ describe("process-only AgentRunner", () => {
     projectionBase64: Buffer.from(codexProjection.bytes).toString("base64"),
     digest: codexProjection.digest,
   } as const;
+  const claudeProjection = projectMapLearning(runnerProject, "claude").projection;
+  const claudeLearningContext = `Promoted MAP learning projection for claude (${claudeProjection.digest}):\n${Buffer.from(
+    claudeProjection.bytes,
+  ).toString("utf8").trimEnd()}`;
+  const claudeLearningBinding = {
+    schemaVersion: "map-learning-launch-binding/v1",
+    consumer: "claude",
+    projectionBase64: Buffer.from(claudeProjection.bytes).toString("base64"),
+    digest: claudeProjection.digest,
+  } as const;
   const task = (overrides: Record<string, unknown> = {}) => {
     const decision = {
       agent: "codex",
       model: "gpt-5.6-sol",
       effort: "high",
-      policyVersion: "routing-v4",
+      policyVersion: "routing-v5",
       reasons: ["stage_baseline:code_audit:high"],
     } as const;
     const sessionId = "123e4567-e89b-42d3-a456-426614174000";
@@ -160,7 +170,7 @@ describe("process-only AgentRunner", () => {
         prompt: `${codexLearningContext}\n\nreview`,
         approvalScope: "workspace-read",
         requester: "codex",
-        reviewAttemptId: "review:attempt:0:codex:routing-v4",
+        reviewAttemptId: "review:attempt:0:codex:routing-v5",
         reviewAttemptOrdinal: 0,
         reviewDispatchId: "workflow:dispatch:0",
         sourceFingerprint: captureWorkspaceFingerprint(runnerProject).fingerprint,
@@ -170,7 +180,7 @@ describe("process-only AgentRunner", () => {
         reviewDispatchIdentity: {
           ...decision,
           sessionId,
-          attemptId: "review:attempt:0:codex:routing-v4",
+          attemptId: "review:attempt:0:codex:routing-v5",
           attemptOrdinal: 0,
           degraded: false,
         },
@@ -187,7 +197,7 @@ describe("process-only AgentRunner", () => {
     }));
     const launcher: ProcessLauncher = { launch };
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher,
     });
@@ -198,7 +208,7 @@ describe("process-only AgentRunner", () => {
       agent: "codex",
       model: "gpt-5.6-sol",
       effort: "high",
-      policyVersion: "routing-v4",
+      policyVersion: "routing-v5",
       reasons: ["stage_baseline:code_audit:high"],
       text: "visible Codex answer",
     });
@@ -211,16 +221,82 @@ describe("process-only AgentRunner", () => {
     });
     expect(onLaunch.mock.calls).toEqual([
       [{ phase: "started", pid: 4321, agent: "codex", model: "gpt-5.6-sol",
-        effort: "high", policyVersion: "routing-v4", sessionId: "123e4567-e89b-42d3-a456-426614174000" }],
+        effort: "high", policyVersion: "routing-v5", sessionId: "123e4567-e89b-42d3-a456-426614174000" }],
     ]);
     expect(runner).not.toHaveProperty("close");
     expect(runner).not.toHaveProperty("releaseHandoffLease");
   });
 
+  it("drives a valid Claude review task through the runner and returns its structured report to Codex", async () => {
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    const attemptId = "123e4567-e89b-42d3-a456-426614174001";
+    const verdict = {
+      schemaVersion: "review-verdict/v1",
+      verdict: "CHANGES_REQUESTED",
+      findings: [{ risk_level: "error", message: "architecture boundary leak" }],
+    };
+    const stdout = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      session_id: sessionId,
+      result: JSON.stringify(verdict),
+      structured_output: verdict,
+    });
+    const launch = vi.fn((_command: CommandSpec) => ({
+      pid: 4322,
+      result: Promise.resolve({ exitCode: 0, stdout, stderr: "" }),
+      terminate: vi.fn(),
+    }));
+    const decision = {
+      agent: "claude",
+      model: "glm-5.3",
+      effort: "high",
+      policyVersion: "routing-v5",
+      reasons: ["stage_baseline:code_audit:high"],
+    } as const;
+    const runner = new AgentRunner({
+      binaries: { grok: "/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/bin/codex" },
+      timeoutMs: 90_000,
+      launcher: { launch },
+    });
+    const candidate = task({
+      prompt: `${claudeLearningContext}\n\nreview`,
+      mapLearning: claudeLearningBinding,
+      decision,
+      sessionId,
+      reviewAttemptId: attemptId,
+      reviewDispatchIdentity: {
+        ...decision,
+        sessionId,
+        attemptId,
+        attemptOrdinal: 0,
+        degraded: false,
+      },
+    });
+
+    await expect(runner.run(candidate)).resolves.toEqual({
+      kind: "success",
+      agent: "claude",
+      model: "glm-5.3",
+      effort: "high",
+      policyVersion: "routing-v5",
+      reasons: ["stage_baseline:code_audit:high"],
+      text: JSON.stringify(verdict),
+    });
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch.mock.calls[0]![0]).toMatchObject({
+      file: "/home/anton/.local/bin/claude",
+      cwd: runnerProject,
+      stdin: `${claudeLearningContext}\n\nreview`,
+      killProcessGroup: true,
+    });
+  });
+
   it("rejects a review attempt id detached from its immutable dispatch identity", async () => {
     const launch = vi.fn();
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -238,7 +314,7 @@ describe("process-only AgentRunner", () => {
       terminate: vi.fn(),
     }));
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -284,7 +360,7 @@ describe("process-only AgentRunner", () => {
     const launch = vi.fn();
     const onLaunch = vi.fn();
     const runner = new AgentRunner({
-      binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+      binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
       preLaunchMapLearningCheckpoint: (binding: { digest: string }) => {
@@ -316,7 +392,7 @@ describe("process-only AgentRunner", () => {
       }));
       const onLaunch = vi.fn();
       const runner = new AgentRunner({
-        binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+        binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
         timeoutMs: 90_000,
         launcher: { launch },
         preLaunchMapLearningCheckpoint: () => {
@@ -343,7 +419,7 @@ describe("process-only AgentRunner", () => {
       const candidate = task({ project,
         sourceFingerprint: captureWorkspaceFingerprint(project).fingerprint });
       const launch = vi.fn(); const onLaunch = vi.fn(); const onProvenNoSpawn = vi.fn();
-      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
         timeoutMs: 90_000, launcher: { launch } });
       await expect(runner.run(candidate, onLaunch, () => {
         writeFileSync(join(project, "drift-after-intent.txt"), "changed\n");
@@ -358,7 +434,7 @@ describe("process-only AgentRunner", () => {
   it.each([undefined, "legacy-stage"])("rejects missing or unknown stage %s before launch", async (stage) => {
     const launch = vi.fn();
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -368,6 +444,60 @@ describe("process-only AgentRunner", () => {
     await expect(runner.run(invalid)).resolves.toMatchObject({
       kind: "invalid_request",
       error: expect.stringMatching(/canonical|stage/i),
+    });
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["grok", "grok-4.6"],
+    ["claude", "glm-5.3"],
+  ] as const)("rejects %s from a non-review workflow before any process can start", async (agent, model) => {
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    const launch = vi.fn(() => {
+      throw new Error("POISON: a real provider process must never start");
+    });
+    const runner = new AgentRunner({
+      binaries: {
+        grok: "/home/anton/.local/bin/grok",
+        claude: "/home/anton/.local/bin/claude",
+        codex: "/opt/codex",
+      },
+      timeoutMs: 90_000,
+      launcher: { launch },
+    });
+    const identity = {
+      agent,
+      model,
+      effort: "medium",
+      policyVersion: "routing-v5",
+      reasons: ["stage_baseline:ui_ux:medium"],
+      sessionId,
+      attemptId: `ui:attempt:0:${agent}:routing-v5`,
+      attemptOrdinal: 0,
+      degraded: false,
+    } as const;
+
+    await expect(runner.run({
+      id: `${agent}-workflow`,
+      stage: "ui_ux",
+      idempotencyKey: "workflow:dispatch:0",
+      approvalScope: "workspace-write",
+      payload: {
+        project: "/repo",
+        prompt: "implement UI",
+        approvalScope: "workspace-write",
+        requester: "codex",
+        workflowId: "workflow",
+        workflowStageId: "ui_ux",
+        workflowDispatchId: "workflow:dispatch:0",
+        sourceFingerprint: "f".repeat(64),
+        decision: identity,
+        workflowDispatchIdentity: identity,
+        sessionId,
+      },
+    })).resolves.toMatchObject({
+      kind: "invalid_request",
+      error: expect.stringMatching(/review-only|isolated review|Codex.*workflow/i),
     });
     expect(launch).not.toHaveBeenCalled();
   });
@@ -383,7 +513,7 @@ describe("process-only AgentRunner", () => {
       terminate: vi.fn(),
     }));
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -391,11 +521,11 @@ describe("process-only AgentRunner", () => {
       id: "grok-write", stage: "ui_ux", approvalScope: "workspace-write",
       payload: { project: "/repo", prompt: "implement UI", approvalScope: "workspace-write",
         approvalReference: "approval:grok-write", sessionId: "123e4567-e89b-42d3-a456-426614174000",
-        decision: { agent: "grok", model: "grok-4.6", effort: "high", policyVersion: "routing-v4",
+        decision: { agent: "grok", model: "grok-4.6", effort: "high", policyVersion: "routing-v5",
           reasons: ["stage_baseline:ui_ux:medium", "broad_change_set"] },
         workflowDispatchIdentity: { agent: "grok", model: "grok-4.6", effort: "high",
-          policyVersion: "routing-v4", reasons: ["stage_baseline:ui_ux:medium", "broad_change_set"],
-          sessionId: "123e4567-e89b-42d3-a456-426614174000", attemptId: "ui:attempt:0:grok:routing-v4",
+          policyVersion: "routing-v5", reasons: ["stage_baseline:ui_ux:medium", "broad_change_set"],
+          sessionId: "123e4567-e89b-42d3-a456-426614174000", attemptId: "ui:attempt:0:grok:routing-v5",
           attemptOrdinal: 0, degraded: false } },
     });
     expect(result).toMatchObject({
@@ -409,7 +539,7 @@ describe("process-only AgentRunner", () => {
       payload: { project: "/repo", prompt: "implement UI", approvalScope: "workspace-write",
         approvalReference: "approval:grok-write", sessionId: "123e4567-e89b-42d3-a456-426614174001",
         toolAllowlist: ["run_terminal_cmd"],
-        decision: { agent: "grok", model: "grok-4.6", effort: "high", policyVersion: "routing-v4",
+        decision: { agent: "grok", model: "grok-4.6", effort: "high", policyVersion: "routing-v5",
           reasons: ["stage_baseline:ui_ux:high"] } },
     });
     expect(forged).toMatchObject({ kind: "invalid_request" });
@@ -425,7 +555,7 @@ describe("process-only AgentRunner", () => {
   ] as const)("rejects malformed saved decisions before launch", async (decisionOverride, error) => {
     const launch = vi.fn();
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -443,7 +573,7 @@ describe("process-only AgentRunner", () => {
       terminate,
     }));
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -459,7 +589,7 @@ describe("process-only AgentRunner", () => {
     const onLaunchIntent = vi.fn();
     const onProvenNoSpawn = vi.fn();
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch: () => { throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }); } },
     });
@@ -479,7 +609,7 @@ describe("process-only AgentRunner", () => {
     const terminate = vi.fn();
     const result = Promise.reject(Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }));
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/missing/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/missing/codex" },
       timeoutMs: 90_000,
       launcher: {
         launch: () => ({ pid: undefined, result, terminate }) as unknown as ReturnType<ProcessLauncher["launch"]>,
@@ -506,7 +636,7 @@ describe("process-only AgentRunner", () => {
       terminate: vi.fn(),
     }));
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -518,7 +648,7 @@ describe("process-only AgentRunner", () => {
 
   it("rejects a copied durable payload under a fresh queue identity before launch", async () => {
     const launch = vi.fn();
-    const runner = new AgentRunner({ binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+    const runner = new AgentRunner({ binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
       timeoutMs: 90_000, launcher: { launch } });
     const copied = structuredClone(task());
     copied.idempotencyKey = "forged:dispatch:1";
@@ -535,7 +665,7 @@ describe("process-only AgentRunner", () => {
       const sourceFingerprint = captureWorkspaceFingerprint(project).fingerprint;
       writeFileSync(join(project, "drift.txt"), "changed after admission\n");
       const launch = vi.fn();
-      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
         timeoutMs: 90_000, launcher: { launch } });
       await expect(runner.run(task({ project, sourceFingerprint }))).resolves.toMatchObject({
         kind: "invalid_request",
@@ -554,7 +684,7 @@ describe("process-only AgentRunner", () => {
       agent: "codex",
       model: "gpt-5.6-sol",
       effort: "medium",
-      policyVersion: "routing-v4",
+      policyVersion: "routing-v5",
       reasons: ["stage_baseline:planning:medium"],
     };
     payload.decision = decision;
@@ -568,13 +698,13 @@ describe("process-only AgentRunner", () => {
     payload.workflowDispatchIdentity = {
       ...decision,
       sessionId: payload.sessionId,
-      attemptId: "planning:attempt:0:codex:routing-v4",
+      attemptId: "planning:attempt:0:codex:routing-v5",
       attemptOrdinal: 0,
       degraded: false,
     };
     const launch = vi.fn();
     const runner = new AgentRunner({
-      binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+      binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
       timeoutMs: 90_000,
       launcher: { launch },
     });
@@ -613,7 +743,7 @@ describe("process-only AgentRunner", () => {
       forged.payload!.sessionId = forgedSession;
       forged.payload!.workflowDispatchIdentity = { ...identity, sessionId: forgedSession };
       const launch = vi.fn(); const onLaunch = vi.fn();
-      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", codex: "/bin/codex" },
+      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
         timeoutMs: 90_000, authorizationDatabasePath: database, launcher: { launch } });
       await expect(runner.run(forged, onLaunch)).resolves.toMatchObject({
         kind: "invalid_request", error: expect.stringMatching(/assignment|durable dispatch/i),
@@ -628,7 +758,7 @@ describe("process-only AgentRunner", () => {
     const terminate = vi.fn();
     const never = new Promise<ProcessResult>(() => undefined);
     const runner = new AgentRunner({
-      binaries: { grok: "/home/anton/.local/bin/grok", codex: "/opt/codex" },
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
       timeoutMs: 250,
       launcher: { launch: () => ({ pid: 4321, result: never, terminate }) },
     });

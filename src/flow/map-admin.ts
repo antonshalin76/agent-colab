@@ -354,7 +354,7 @@ function parseCanonicalCandidate(bytes: Uint8Array): MapLearningCandidate {
   const candidate: MapLearningCandidate = {
     ...parsed.data,
     controlIds: [...parsed.data.controlIds].sort(),
-    consumerScopes: [...parsed.data.consumerScopes].sort() as LearningConsumer[],
+    consumerScopes: ["codex", "grok", "claude"],
   };
   const canonicalBytes = encoder.encode(`${JSON.stringify(candidate)}\n`);
   if (!Buffer.from(bytes).equals(Buffer.from(canonicalBytes))) {
@@ -514,7 +514,7 @@ function parseMapLearningLaunchBinding(input: unknown): MapLearningLaunchBinding
   const binding = input as Record<string, unknown>;
   if (
     binding.schemaVersion !== "map-learning-launch-binding/v1" ||
-    (binding.consumer !== "codex" && binding.consumer !== "grok") ||
+    (binding.consumer !== "codex" && binding.consumer !== "grok" && binding.consumer !== "claude") ||
     typeof binding.projectionBase64 !== "string" ||
     binding.projectionBase64.length === 0 ||
     binding.projectionBase64.length > MAX_TASK_PACKET_BYTES * 2 ||

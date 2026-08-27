@@ -34,7 +34,7 @@ export interface StageDefinition {
   executionSnapshot?: ExecutionSnapshotBinding;
 }
 
-export interface AttemptAssignment extends EffortDecision {
+export interface AttemptAssignment extends EffortDecision<ActiveAgentId> {
   attemptId: string;
   attemptOrdinal: number;
   sessionId: string;

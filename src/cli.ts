@@ -12,7 +12,11 @@ import { isFailoverOutcome } from "./domain/outcomes.js";
 import {
   normalizeReviewProviderResult,
 } from "./domain/review-verdict.js";
-import type { ActiveAgentId, ProviderHealthSnapshot } from "./domain/routing.js";
+import {
+  REVIEW_PROVIDER_IDS,
+  type ProviderHealthSnapshot,
+  type ReviewProviderId,
+} from "./domain/routing.js";
 import { doctorV1, initializeCurrentExecutionSchema, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle } from "./migration/coordinator.js";
 import { startStdioCollabServer } from "./mcp/server.js";
 import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
@@ -40,10 +44,14 @@ import {
 const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local", "share", "agent-collab");
 const layout = ensureStateLayout(stateRoot);
 const grokBinary = process.env.AGENT_COLLAB_GROK_BIN ?? join(homedir(), ".local", "bin", "grok");
+const claudeBinary = process.env.AGENT_COLLAB_CLAUDE_BIN ?? join(homedir(), ".local", "bin", "claude");
 const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".local", "bin", "codex");
 const allowedProjectRoots = defaultAllowedProjectRoots();
 const command = process.argv[2] ?? "status";
-const AGENTS: readonly ActiveAgentId[] = ["grok", "codex"];
+const REVIEW_PROVIDERS = REVIEW_PROVIDER_IDS;
+
+const isReviewProviderId = (value: unknown): value is ReviewProviderId =>
+  typeof value === "string" && REVIEW_PROVIDERS.some((agent) => agent === value);
 
 const tableExists = (database: string, table: string): boolean => {
   const db = new Database(database, { readonly: true });
@@ -57,9 +65,9 @@ const schemaVersion = (database: string): number => {
   finally { db.close(); }
 };
 
-const markV2 = (database: string): void => {
+const markVersion = (database: string, version: 2 | 3): void => {
   const db = new Database(database);
-  try { db.pragma("user_version = 2"); } finally { db.close(); }
+  try { db.pragma(`user_version = ${version}`); } finally { db.close(); }
 };
 
 const prepareDatabases = (): void => {
@@ -69,14 +77,15 @@ const prepareDatabases = (): void => {
   if (hasState) {
     const stateVersion = schemaVersion(layout.database);
     const historyVersion = schemaVersion(layout.historyDatabase);
-    if (stateVersion === 2 && historyVersion === 2) return;
-    throw new Error(`offline migration required: state=${stateVersion}, history=${historyVersion}; run migrate-v2 while the service is stopped`);
+    if (stateVersion === 3 && historyVersion === 2) return;
+    const migration = stateVersion === 2 && historyVersion === 2 ? "migrate-v3" : "migrate-v2";
+    throw new Error(`offline migration required: state=${stateVersion}, history=${historyVersion}; run ${migration} while the service is stopped`);
   }
   initializeCurrentExecutionSchema(layout.database);
   const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
   service.close();
-  markV2(layout.database);
-  markV2(layout.historyDatabase);
+  markVersion(layout.database, 3);
+  markVersion(layout.historyDatabase, 2);
 };
 
 if (command === "map-learn-close") {
@@ -177,6 +186,16 @@ if (command === "migrate-v2") {
   process.exit(0);
 }
 
+if (command === "migrate-v3") {
+  assertServiceInactive();
+  const result = new MigrationCoordinator({
+    stateDatabase: layout.database,
+    historyDatabase: layout.historyDatabase,
+  }).migrateToV3();
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(0);
+}
+
 prepareDatabases();
 
 const requireUserApproval = (reference: string, project: string, scope: string): void => {
@@ -241,7 +260,7 @@ if (command === "reconcile-run") {
   const assignment = assignmentFrom(run.payload?.workflowDispatchIdentity);
   let effect: Record<string, unknown>;
   if (reviewId && reviewAttemptId && (role === "auditor" || role === "critic") &&
-      (agent === "grok" || agent === "codex")) {
+      isReviewProviderId(agent)) {
     if (resolution === "completed") {
       store.close();
       throw new Error("review reconciliation cannot synthesize completed evidence; resolve as failed and replay a new lane");
@@ -261,7 +280,7 @@ if (command === "reconcile-run") {
     store.close(); throw new Error("reconciliation payload has no supported domain identity");
   }
   store.resolveReconciliation({ id: run.id,
-    providerResult: { kind: "task_failure", ...(agent === "grok" || agent === "codex" ? { agent } : {}),
+    providerResult: { kind: "task_failure", ...(isReviewProviderId(agent) ? { agent } : {}),
       reconciledByOperator: true, reconciledAt: Date.now() },
     effect: { terminalAt: Date.now(), ...effect }, status: resolution });
   console.log(JSON.stringify({ runId, resolution, domainEffect: "pending_worker_replay" }, null, 2));
@@ -304,7 +323,9 @@ if (command === "mcp") {
 
   const refreshHealth = (now: number): void => {
     for (const [agent, binary, args] of [
-      ["grok", grokBinary, ["models"]], ["codex", codexBinary, ["login", "status"]],
+      ["grok", grokBinary, ["models"]],
+      ["claude", claudeBinary, ["auth", "status"]],
+      ["codex", codexBinary, ["login", "status"]],
     ] as const) {
       const state = health.get(agent);
       if (state.health === "healthy" || state.health === "disabled" ||
@@ -319,7 +340,11 @@ if (command === "mcp") {
   };
 
   refreshHealth(Date.now());
-  const runner = new AgentRunner({ binaries: { grok: grokBinary, codex: codexBinary },
+  const runner = new AgentRunner({ binaries: {
+    grok: grokBinary,
+    claude: claudeBinary,
+    codex: codexBinary,
+  },
     timeoutMs: 30 * 60_000, authorizationDatabasePath: layout.database });
   const effectStore = new RunStore(layout.database);
   const domainReplayOwner = `domain-replay:${process.pid}:${randomUUID()}`;
@@ -393,7 +418,7 @@ if (command === "mcp") {
       const role = effect.role;
       const agent = effect.agent;
       const resultKind = String(effect.resultKind);
-      if ((role !== "auditor" && role !== "critic") || (agent !== "grok" && agent !== "codex")) {
+      if ((role !== "auditor" && role !== "critic") || !isReviewProviderId(agent)) {
         poison("invalid persisted review effect");
       }
       const attempt = reviews.attempts(reviewId, agent, role).find((item) => item.attemptId === attemptId);
@@ -486,7 +511,7 @@ if (command === "mcp") {
       const role = run.payload?.reviewRole;
       const decision = asObject(run.payload?.decision);
       const agent = decision?.agent;
-      if (reviewId && (role === "auditor" || role === "critic") && (agent === "grok" || agent === "codex")) {
+      if (reviewId && (role === "auditor" || role === "critic") && isReviewProviderId(agent)) {
         const existing = reviews.get(reviewId)?.lanes.find((lane) => lane.agent === agent && lane.role === role);
         if (existing && ["completed", "failed", "timed_out", "stale_artifact"].includes(existing.status)) {
           return { kind: "success", reconciledTerminalLane: true, priorStatus: existing.status, result: existing.result };
@@ -544,7 +569,7 @@ if (command === "mcp") {
       if (rawResult.agent !== undefined && rawResult.agent !== agent) {
         throw new Error("runner result agent does not match the durable assignment");
       }
-      let result = (agent === "grok" || agent === "codex")
+      let result = isReviewProviderId(agent)
         ? { ...rawResult, agent }
         : rawResult;
       if (
@@ -568,8 +593,8 @@ if (command === "mcp") {
       if (durableLaunch?.launched && durableLaunchInfo?.phase !== "started") {
         return result;
       }
-      if ((agent === "grok" || agent === "codex") && resultKind === "success") health.recordSuccess(agent, Date.now());
-      if ((agent === "grok" || agent === "codex") && isFailoverOutcome(resultKind)) {
+      if (isReviewProviderId(agent) && resultKind === "success") health.recordSuccess(agent, Date.now());
+      if (isReviewProviderId(agent) && isFailoverOutcome(resultKind)) {
         health.recordFailoverFailure(agent, { kind: resultKind }, Date.now());
       }
 
@@ -615,7 +640,7 @@ if (command === "mcp") {
               runId: run.id, reason: resultKind, prelaunchReceipt, terminalAt,
               ...(lease ? { lease } : {}) };
       } else if (reviewId && reviewAttemptId && (role === "auditor" || role === "critic") &&
-          (agent === "grok" || agent === "codex")) {
+          isReviewProviderId(agent)) {
         effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
           resultKind, terminalAt: Date.now() };
       }
@@ -658,7 +683,7 @@ if (command === "mcp") {
       }
       const recoveredQueue = new RunStore(layout.database);
       collaborationRuntime.drainDispatchOutbox(recoveredQueue, now); recoveredQueue.close();
-      for (const agent of AGENTS) {
+      for (const agent of REVIEW_PROVIDERS) {
         const provider = health.get(agent);
         if (provider.health !== "healthy") continue;
         for (const reviewId of reviews.deferredReviewIds(agent)) {
@@ -685,12 +710,15 @@ if (command === "mcp") {
     }
     const versions = {
       grok: process.env.AGENT_COLLAB_GROK_VERSION ?? "grok 1.0.5 (5115b46bc9)",
+      claude: process.env.AGENT_COLLAB_CLAUDE_VERSION ?? "2.1.247 (Claude Code)",
       codex: process.env.AGENT_COLLAB_CODEX_VERSION ?? "codex-cli 0.147.0",
     };
     const result = await runCapabilityProbes({
       providers: {
         grok: { enabled: true, binaryPath: grokBinary, expectedVersion: versions.grok,
           model: "grok-4.6", effort: "high", cwd: process.cwd() },
+        claude: { enabled: true, binaryPath: claudeBinary, expectedVersion: versions.claude,
+          model: "glm-5.3", effort: "max", cwd: process.cwd() },
         codex: { enabled: true, binaryPath: codexBinary, expectedVersion: versions.codex,
           model: "gpt-5.6-sol", effort: "high", cwd: process.cwd() },
       },
@@ -712,13 +740,17 @@ if (command === "mcp") {
         },
       },
     });
-    for (const agent of AGENTS) {
+    for (const agent of REVIEW_PROVIDERS) {
       if (result.results[agent].ready) service.providers.recordSuccess(agent, Date.now());
       else service.providers.recordFailoverFailure(agent, { kind: "model_unavailable" }, Date.now());
     }
     console.log(JSON.stringify(result, null, 2));
   } else if (command === "doctor") {
-    const binaries = Object.fromEntries(([{ agent: "grok", path: grokBinary }, { agent: "codex", path: codexBinary }]).map(({ agent, path }) => {
+    const binaries = Object.fromEntries(([
+      { agent: "grok", path: grokBinary },
+      { agent: "claude", path: claudeBinary },
+      { agent: "codex", path: codexBinary },
+    ]).map(({ agent, path }) => {
       try { accessSync(path, constants.X_OK); return [agent, { path, executable: true }]; }
       catch { return [agent, { path, executable: false }]; }
     }));

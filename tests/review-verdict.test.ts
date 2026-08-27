@@ -56,14 +56,14 @@ describe("review verdict composition boundary", () => {
       approvalScope: "workspace-read",
       idempotencyKey: "review-verdict-composition:v1",
       prompts: { auditor: "audit", critic: "critic" },
-      health: { grok: "healthy", codex: "healthy" },
+      health: { grok: "healthy", claude: "healthy", codex: "healthy" },
       project,
       requester: "codex",
       sourceFingerprint,
       createdAt: 1,
     });
 
-    for (const agent of ["grok", "codex"] as const) {
+    for (const agent of ["grok", "claude", "codex"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         const attempt = store.attempts(reviewId, agent, role).at(-1)!;
         const result = normalizeReviewProviderResult({ kind: "success", agent, text: passText });

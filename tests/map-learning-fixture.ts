@@ -111,7 +111,7 @@ function seedReviewEvidence(databasePath: string, input: {
     reviewId: input.reviewId,
     stageId: "90_learning_close",
     artifact: Buffer.from(input.taskPacketBytes),
-    health: { codex: "healthy", grok: "healthy" },
+    health: { codex: "healthy", grok: "healthy", claude: "healthy" },
     approvalScope: "workspace-read",
     idempotencyKey: `${input.reviewId}:task-packet`,
     prompts: {
@@ -212,7 +212,7 @@ export function prepareLearningFixture(input: {
   const candidate: MapLearningCandidate = {
     ...input.candidate,
     controlIds: [...input.candidate.controlIds].sort(),
-    consumerScopes: [...input.candidate.consumerScopes].sort() as Array<"codex" | "grok">,
+    consumerScopes: ["codex", "grok", "claude"],
   };
   const candidateBytes = jsonBytes(candidate);
   const candidateSha256 = sha256(candidateBytes);

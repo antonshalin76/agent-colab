@@ -71,6 +71,11 @@ const routingHealth = (snapshot: ReturnType<ProviderHealthStore["snapshot"]>) =>
   grok: snapshot.grok.health,
   codex: snapshot.codex.health,
 }) as const;
+const reviewHealth = (snapshot: ReturnType<ProviderHealthStore["snapshot"]>) => ({
+  grok: snapshot.grok.health,
+  claude: snapshot.claude.health,
+  codex: snapshot.codex.health,
+}) as const;
 
 export const grokSessionProject = (path: string): string | null => {
   const encodedProject = basename(dirname(dirname(path)));
@@ -135,9 +140,9 @@ export class LocalCollabService implements CollabService {
   private readonly mapControl: MapControlPlane;
   private readonly projects: ProjectPolicy;
   private readonly sharedSkillsRoot = join(homedir(), ".agents", "skills");
-  private readonly agentSkillRoots: Readonly<Record<"grok" | "codex", string>>;
+  private readonly agentSkillRoots: Readonly<Record<"grok" | "claude" | "codex", string>>;
   constructor(readonly stateDatabase: string, options?: { allowedRoots?: string[]; historyDatabase?: string;
-    agentSkillRoots?: Readonly<Record<"grok" | "codex", string>> }) {
+    agentSkillRoots?: Readonly<Record<"grok" | "claude" | "codex", string>> }) {
     this.runs = new RunStore(stateDatabase);
     const historyDatabase = options?.historyDatabase ?? join(dirname(stateDatabase), "history.db");
     this.history = new HistoryIndex(historyDatabase, { visibilityPolicy: new HistoryVisibilityPolicy() });
@@ -149,7 +154,9 @@ export class LocalCollabService implements CollabService {
     this.runtime = new CollaborationRuntime(stateDatabase);
     this.projects = new ProjectPolicy(options?.allowedRoots ?? defaultAllowedProjectRoots());
     this.agentSkillRoots = options?.agentSkillRoots ?? {
-      grok: join(homedir(), ".grok", "skills"), codex: join(homedir(), ".codex", "skills"),
+      grok: join(homedir(), ".grok", "skills"),
+      claude: join(homedir(), ".claude", "skills"),
+      codex: join(homedir(), ".codex", "skills"),
     };
   }
   async status() {
@@ -229,7 +236,7 @@ export class LocalCollabService implements CollabService {
     const source = snapshot.workspace;
     const gates = mapAdmissionGates(input.stage);
     if (gates.length === 0) return { satisfied: true, profile, gates: [] };
-    const health = routingHealth(this.providers.snapshot());
+    const health = reviewHealth(this.providers.snapshot());
     const snapshots = gates.map((gate) => {
       const expectation = mapAdmissionReviewExpectation({
         project,
@@ -352,7 +359,7 @@ export class LocalCollabService implements CollabService {
     const actualHash = createHash("sha256").update(artifact).digest("hex");
     if (actualHash !== input.artifactHash) throw new Error("review artifact hash mismatch");
     const snapshot = this.providers.snapshot();
-    const health = routingHealth(snapshot);
+    const health = reviewHealth(snapshot);
     const reviewId = scopedIdempotencyKey(project, input.idempotencyKey);
     const safePrompt = redactSensitive(input.prompt);
     const source = captureWorkspaceFingerprint(project);
@@ -362,7 +369,7 @@ export class LocalCollabService implements CollabService {
       createdAt: Date.now(), project, requester: input.requester,
       sourceFingerprint: source.fingerprint, changedFiles: source.changedFiles.length });
     const runs = this.reviewRuns(reviewId, input.requester);
-    return { reviewId, laneCount: 4, activeLaneCount: runs.length, runState: review.runState, runIds: runs.map((lane) => lane.id) };
+    return { reviewId, laneCount: 6, activeLaneCount: runs.length, runState: review.runState, runIds: runs.map((lane) => lane.id) };
   }
   async runStatus(input: { runId: string }) {
     const run = this.runs.get(input.runId); if (run) return run;

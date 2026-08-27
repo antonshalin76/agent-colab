@@ -8,7 +8,7 @@ import {
 const usage = [
   "Usage:",
   "  map-admin verify [project-root]",
-  "  map-admin project <codex|grok> [project-root]",
+  "  map-admin project <codex|grok|claude> [project-root]",
 ].join("\n");
 
 const command = process.argv[2];
@@ -29,7 +29,7 @@ try {
     print(verifyInstalledMapProfile(resolve(root)));
   } else if (command === "project") {
     const [consumer, root = process.cwd()] = exactArgs(1, 2);
-    if (consumer !== "codex" && consumer !== "grok") throw new Error(usage);
+    if (consumer !== "codex" && consumer !== "grok" && consumer !== "claude") throw new Error(usage);
     const receipt = projectMapLearning(resolve(root), consumer);
     print({
       profile: receipt.profile,
