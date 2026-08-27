@@ -12,9 +12,23 @@ import {
   type Stage,
 } from "../domain/routing.js";
 import { redactSensitive } from "../security/redaction.js";
+import { ApprovalLedger } from "../security/approval-ledger.js";
+import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
 import { normalizeCodexResult } from "./codex.js";
-import { grokWorkspaceWriteToolAllowlist, normalizeGrokResult } from "./grok.js";
+import { normalizeGrokResult } from "./grok.js";
 import { buildProviderCommand, type CommandSpec } from "./provider-command.js";
+import {
+  assertCurrentControlMapLearningLaunchBinding,
+  verifyCurrentMapProfile,
+  type VerifiedMapProfile,
+} from "../flow/map-admin.js";
+import { isDeepStrictEqual } from "node:util";
+import Database from "better-sqlite3";
+import { CollaborationRunStore } from "../store/collaboration-run-store.js";
+import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
+import { ExecutionAdmission } from "../runtime/execution-admission.js";
+import { ExecutionSnapshotBindingSchema } from "../flow/execution-snapshot.js";
+import type { AttemptAssignment } from "../workflow/workflow.js";
 
 const PROTOCOL = "agent-collab/v2";
 const EFFORTS = new Set<Effort>(["low", "medium", "high", "xhigh"]);
@@ -38,6 +52,8 @@ export interface SavedRunnerDecision {
 export interface ProcessTask {
   id: string;
   stage?: string;
+  artifactHash?: string;
+  idempotencyKey?: string;
   approvalScope?: string;
   payload?: Record<string, unknown>;
 }
@@ -45,10 +61,11 @@ export interface ProcessTask {
 interface TaskPayload {
   project: string;
   prompt: string;
+  sourceFingerprint: string;
   approvalScope: ApprovalScope;
-  approvalReference?: string;
+  authorizationConsumerKey?: string;
   sessionId?: string;
-  toolAllowlist?: readonly string[];
+  mapLearning: ReturnType<typeof assertCurrentControlMapLearningLaunchBinding>;
   decision: SavedRunnerDecision;
 }
 
@@ -59,7 +76,7 @@ export interface ProcessResult {
 }
 
 export interface LaunchedProcess {
-  pid?: number;
+  pid: number;
   result: Promise<ProcessResult>;
   terminate(signal: "SIGTERM" | "SIGKILL"): void | Promise<void>;
 }
@@ -71,7 +88,11 @@ export interface ProcessLauncher {
 export interface AgentRunnerConfig {
   binaries: Readonly<Record<ActiveAgentId, string>>;
   timeoutMs: number;
+  authorizationDatabasePath?: string;
   launcher?: ProcessLauncher;
+  mapProfileVerifier?: () => VerifiedMapProfile;
+  /** @internal */
+  preLaunchMapLearningCheckpoint?: (binding: TaskPayload["mapLearning"]) => void;
 }
 
 async function terminateProcess(
@@ -184,7 +205,11 @@ const parseDispatchIdentity = (value: unknown): {
   };
 };
 
-function taskPayload(run: ProcessTask): TaskPayload {
+function taskPayload(
+  run: ProcessTask,
+  verifyMapProfile: () => VerifiedMapProfile,
+  trustedDatabasePath?: string,
+): TaskPayload {
   const payload = run.payload ?? {};
   const scope = approvalScope(payload.approvalScope);
   if (typeof payload.project !== "string" || typeof payload.prompt !== "string" || !scope) {
@@ -209,6 +234,17 @@ function taskPayload(run: ProcessTask): TaskPayload {
     throw new Error("saved provider decision baseline does not match the queued stage");
   }
   const workflowRun = !run.stage!.startsWith("review:");
+  if (workflowRun && decision.agent !== "codex") {
+    throw new Error("routing-v4 permits Grok only in isolated review lanes");
+  }
+  if (decision.agent === "grok" && scope !== "workspace-read") {
+    throw new Error("Grok review lanes are read-only");
+  }
+  const mapLearning = assertCurrentControlMapLearningLaunchBinding(
+    decision.agent,
+    payload.mapLearning,
+    payload.prompt,
+  );
   if (workflowRun || payload.workflowDispatchIdentity !== undefined) {
     if (payload.workflowDispatchIdentity === undefined) {
       throw new Error("canonical workflow stage requires immutable dispatch identity");
@@ -220,6 +256,11 @@ function taskPayload(run: ProcessTask): TaskPayload {
     if (payload.sessionId !== identity.sessionId) {
       throw new Error("workflow session does not match immutable dispatch identity");
     }
+    if (typeof run.idempotencyKey !== "string" ||
+        typeof payload.workflowDispatchId !== "string" ||
+        run.idempotencyKey !== payload.workflowDispatchId) {
+      throw new Error("workflow queue identity does not match its immutable dispatch id");
+    }
   }
   if (run.stage === "review:auditor" || run.stage === "review:critic") {
     const identity = parseDispatchIdentity(payload.reviewDispatchIdentity);
@@ -229,31 +270,63 @@ function taskPayload(run: ProcessTask): TaskPayload {
     if (
       payload.sessionId !== identity.sessionId ||
       payload.reviewAttemptId !== identity.attemptId ||
-      payload.reviewAttemptOrdinal !== identity.attemptOrdinal
+      payload.reviewAttemptOrdinal !== identity.attemptOrdinal ||
+      typeof run.idempotencyKey !== "string" || payload.reviewDispatchId !== run.idempotencyKey
     ) {
       throw new Error("review attempt does not match immutable dispatch identity");
     }
   }
-  const approvalReference =
-    typeof payload.approvalReference === "string" ? payload.approvalReference : undefined;
+  const authorizationConsumerKey = typeof payload.authorizationConsumerKey === "string"
+    ? payload.authorizationConsumerKey
+    : undefined;
   const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : undefined;
   if (payload.toolAllowlist !== undefined) {
     throw new Error("tool allowlist must be derived by the trusted runner");
   }
-  const stage = STAGES.includes(run.stage as Stage) ? run.stage as Stage : null;
-  if (decision.agent === "grok" && scope === "workspace-write" && stage === null) {
-    throw new Error("Grok workspace-write requires a canonical stage");
+  if (typeof payload.sourceFingerprint !== "string" ||
+      (payload.requester !== "grok" && payload.requester !== "codex")) {
+    throw new Error("run source or requester identity is missing");
   }
-  const toolAllowlist = decision.agent === "grok" && scope === "workspace-write"
-    ? grokWorkspaceWriteToolAllowlist(stage!)
-    : undefined;
+  if (workflowRun) {
+    if (typeof payload.workflowId !== "string" || typeof payload.workflowStageId !== "string" ||
+        typeof run.artifactHash !== "string" || trustedDatabasePath === undefined) {
+      throw new Error("workflow run lacks trusted durable execution identity");
+    }
+    const binding = ExecutionSnapshotBindingSchema.parse(payload.executionSnapshot);
+    const db = new Database(trustedDatabasePath);
+    const workflows = new CollaborationRunStore(db);
+    const reviews = new RunGateUnitOfWork(db);
+    const approvals = new ApprovalLedger(db);
+    try {
+      const identity = parseDispatchIdentity(payload.workflowDispatchIdentity);
+      new ExecutionAdmission(db, workflows, reviews, approvals, verifyMapProfile)
+        .assertQueued({ workflowId: payload.workflowId, stageId: payload.workflowStageId,
+          dispatchId: run.idempotencyKey!, assignment: { ...identity.decision,
+            sessionId: identity.sessionId, attemptId: identity.attemptId,
+            attemptOrdinal: identity.attemptOrdinal, degraded: identity.degraded } as AttemptAssignment,
+          agent: decision.agent, artifactHash: run.artifactHash, project: payload.project,
+          prompt: payload.prompt, requester: payload.requester,
+          sourceFingerprint: payload.sourceFingerprint, approvalScope: scope,
+          ...(authorizationConsumerKey ? { authorizationConsumerKey } : {}), binding });
+    } finally {
+      approvals.close(); reviews.close(); workflows.close(); db.close();
+    }
+  } else {
+    if (payload.executionSnapshot !== undefined || authorizationConsumerKey !== undefined) {
+      throw new Error("read-only review lane cannot carry workflow snapshot or authority");
+    }
+    if (captureWorkspaceFingerprint(payload.project).fingerprint !== payload.sourceFingerprint) {
+      throw new Error("review source fingerprint is stale before provider launch");
+    }
+  }
   return {
     project: payload.project,
     prompt: payload.prompt,
+    sourceFingerprint: payload.sourceFingerprint,
     approvalScope: scope,
-    ...(approvalReference ? { approvalReference } : {}),
+    ...(authorizationConsumerKey ? { authorizationConsumerKey } : {}),
     ...(sessionId ? { sessionId } : {}),
-    ...(toolAllowlist ? { toolAllowlist } : {}),
+    mapLearning,
     decision,
   };
 }
@@ -270,8 +343,14 @@ class ExecaProcessLauncher implements ProcessLauncher {
       cleanup: true,
       env: { AGENT_COLLAB_PROTOCOL: PROTOCOL },
     });
+    if (subprocess.pid === undefined) {
+      void subprocess.catch(() => undefined);
+      throw Object.assign(new Error(`agent process did not start: ${command.file}`), {
+        code: "ENOENT",
+      });
+    }
     return {
-      ...(subprocess.pid === undefined ? {} : { pid: subprocess.pid }),
+      pid: subprocess.pid,
       result: subprocess.then((result) => ({
         exitCode: result.exitCode ?? -1,
         stdout: result.stdout,
@@ -318,35 +397,49 @@ export class AgentRunner {
       ? `${payload.prompt}\n\nReturn the visible final answer only as valid JSON with exactly these keys: ` +
         `{"protocolVersion":"${PROTOCOL}","reasoningEffort":"${payload.decision.effort}","visibleText":"<your final answer>"}.`
       : payload.prompt;
-    const common = {
-      binary: this.config.binaries[payload.decision.agent],
-      cwd: payload.project,
-      prompt,
-      approvalScope: payload.approvalScope,
-      ...(payload.approvalReference ? { approvalReference: payload.approvalReference } : {}),
-      effort: payload.decision.effort,
-      timeoutMs: this.config.timeoutMs,
-    };
     return payload.decision.agent === "grok"
       ? buildProviderCommand({
           agent: "grok",
           command: {
-            ...common,
+            binary: this.config.binaries.grok,
+            cwd: payload.project,
+            prompt,
+            approvalScope: "workspace-read",
             sessionId: payload.sessionId ?? "",
-            ...(payload.toolAllowlist ? { toolAllowlist: payload.toolAllowlist } : {}),
+            effort: payload.decision.effort,
+            timeoutMs: this.config.timeoutMs,
           },
         })
-      : buildProviderCommand({ agent: "codex", command: common });
+      : buildProviderCommand({
+          agent: "codex",
+          command: {
+            binary: this.config.binaries.codex,
+            cwd: payload.project,
+            prompt,
+            approvalScope: payload.approvalScope,
+            ...(payload.authorizationConsumerKey
+              ? { authorizationConsumerKey: payload.authorizationConsumerKey }
+              : {}),
+            effort: payload.decision.effort,
+            timeoutMs: this.config.timeoutMs,
+          },
+        });
   }
 
   async run(
     run: ProcessTask,
     onLaunch: (info: Record<string, unknown>) => void = () => undefined,
+    onLaunchIntent: (info: Record<string, unknown>) => void = () => undefined,
+    onProvenNoSpawn: () => void = () => undefined,
   ): Promise<Record<string, unknown>> {
     let payload: TaskPayload;
     let command: CommandSpec;
     try {
-      payload = taskPayload(run);
+      payload = taskPayload(
+        run,
+        this.config.mapProfileVerifier ?? verifyCurrentMapProfile,
+        this.config.authorizationDatabasePath,
+      );
       command = this.command(payload);
     } catch (error) {
       return {
@@ -356,9 +449,25 @@ export class AgentRunner {
     }
 
     try {
-      onLaunch({
-        phase: "intent",
-        pid: null,
+      this.config.preLaunchMapLearningCheckpoint?.(payload.mapLearning);
+      const revalidated = taskPayload(
+        run,
+        this.config.mapProfileVerifier ?? verifyCurrentMapProfile,
+        this.config.authorizationDatabasePath,
+      );
+      if (!isDeepStrictEqual(revalidated, payload)) {
+        throw new Error("run admission payload changed before provider launch");
+      }
+    } catch (error) {
+      return {
+        kind: "invalid_request",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    try {
+      onLaunchIntent({
+        phase: "launching",
         agent: payload.decision.agent,
         model: payload.decision.model,
         effort: payload.decision.effort,
@@ -373,10 +482,39 @@ export class AgentRunner {
       };
     }
 
+    try {
+      const finalAdmission = taskPayload(
+        run,
+        this.config.mapProfileVerifier ?? verifyCurrentMapProfile,
+        this.config.authorizationDatabasePath,
+      );
+      if (!isDeepStrictEqual(finalAdmission, payload)) {
+        throw new Error("run admission payload changed after launch intent");
+      }
+    } catch (error) {
+      try {
+        onProvenNoSpawn();
+      } catch (clearError) {
+        return { kind: "task_failure", agent: payload.decision.agent,
+          error: clearError instanceof Error ? clearError.message : String(clearError) };
+      }
+      return { kind: "invalid_request", agent: payload.decision.agent,
+        error: error instanceof Error ? error.message : String(error) };
+    }
+
     let launched: LaunchedProcess;
     try {
       launched = this.launcher.launch(command);
     } catch (error) {
+      try {
+        onProvenNoSpawn();
+      } catch (clearError) {
+        return {
+          kind: "task_failure",
+          agent: payload.decision.agent,
+          error: clearError instanceof Error ? clearError.message : String(clearError),
+        };
+      }
       const kind = classifyRunnerFailure(error);
       return {
         kind,
@@ -384,10 +522,19 @@ export class AgentRunner {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+    if (!Number.isSafeInteger(launched.pid) || launched.pid <= 0) {
+      void launched.result.catch(() => undefined);
+      await terminateProcess(launched, "SIGTERM");
+      return {
+        kind: "cli_missing",
+        agent: payload.decision.agent,
+        error: "agent launcher returned without a started process id",
+      };
+    }
     try {
       onLaunch({
         phase: "started",
-        pid: launched.pid ?? null,
+        pid: launched.pid,
         agent: payload.decision.agent,
         model: payload.decision.model,
         effort: payload.decision.effort,

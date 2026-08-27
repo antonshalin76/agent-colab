@@ -26,6 +26,8 @@ const MUTABLE_RUNTIME_TABLES = [
   "runtime_review_barriers",
   "runtime_review_lanes",
   "runtime_review_lane_attempts",
+  "approval_grants",
+  "approval_consumptions",
   "worktree_leases",
   "worktree_handoffs",
   "approval_grants",
@@ -80,6 +82,117 @@ export class MigrationBlockedError extends Error {
 interface TableDigest {
   count: number;
   sha256: string;
+}
+
+const EXECUTION_TABLES = [
+  "runs",
+  "collaboration_runs",
+  "collaboration_dispatch_outbox",
+  "runtime_review_barriers",
+  "runtime_review_lanes",
+  "runtime_review_lane_attempts",
+] as const;
+
+export function initializeCurrentExecutionSchema(path: string): void {
+  const db = new Database(path);
+  db.pragma("foreign_keys = ON");
+  try {
+    const existing = EXECUTION_TABLES.filter((table) => tableExists(db, table));
+    if (existing.length === EXECUTION_TABLES.length) return;
+    if (existing.length > 0) {
+      throw new Error(`execution schema is partial; offline repair required: ${existing.join(", ")}`);
+    }
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, stage TEXT NOT NULL,
+        priority INTEGER NOT NULL, status TEXT NOT NULL, artifact_hash TEXT, approval_scope TEXT,
+        created_at INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL,
+        lease_token TEXT, lease_expires_at INTEGER, worker_id TEXT, launched INTEGER NOT NULL DEFAULT 0,
+        launch_info TEXT, result TEXT, cancel_reason TEXT, payload TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+        depends_on_run_id TEXT
+      );
+      CREATE INDEX runs_due ON runs(status, next_attempt_at, priority, created_at);
+      CREATE TABLE collaboration_runs (
+        workflow_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE collaboration_dispatch_outbox (
+        dispatch_id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL REFERENCES collaboration_runs(workflow_id) ON DELETE CASCADE,
+        payload_json TEXT NOT NULL,
+        published_at INTEGER,
+        terminal_reason TEXT
+      );
+      CREATE INDEX collaboration_outbox_pending
+        ON collaboration_dispatch_outbox(published_at, dispatch_id);
+      CREATE TABLE runtime_review_barriers (
+        review_id TEXT PRIMARY KEY,
+        stage_id TEXT NOT NULL,
+        artifact BLOB NOT NULL,
+        artifact_hash TEXT NOT NULL,
+        approval_scope TEXT NOT NULL CHECK (approval_scope = 'workspace-read'),
+        idempotency_key TEXT NOT NULL,
+        run_state TEXT NOT NULL CHECK (run_state IN ('FULL_CROSS_PROVIDER', 'DEGRADED_SINGLE_PROVIDER')),
+        created_at INTEGER NOT NULL,
+        project TEXT,
+        requester TEXT CHECK (requester IS NULL OR requester IN ('grok', 'codex')),
+        source_fingerprint TEXT,
+        changed_files INTEGER NOT NULL DEFAULT 0 CHECK (changed_files >= 0)
+      );
+      CREATE TABLE runtime_review_lanes (
+        review_id TEXT NOT NULL REFERENCES runtime_review_barriers(review_id) ON DELETE CASCADE,
+        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
+        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
+        status TEXT NOT NULL CHECK (status IN ('queued', 'deferred', 'completed', 'failed', 'timed_out', 'stale_artifact')),
+        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
+        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
+        policy_version TEXT NOT NULL CHECK (policy_version = 'routing-v4'),
+        reasons TEXT NOT NULL,
+        session_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        prompt TEXT NOT NULL,
+        degraded INTEGER NOT NULL CHECK (degraded IN (0, 1)),
+        result TEXT,
+        error TEXT,
+        terminal_at INTEGER,
+        PRIMARY KEY (review_id, agent, role)
+      );
+      CREATE INDEX runtime_review_lanes_status ON runtime_review_lanes(review_id, status);
+      CREATE TABLE runtime_review_lane_attempts (
+        review_id TEXT NOT NULL,
+        agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
+        role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
+        attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (review_id, agent, role, attempt_ordinal),
+        FOREIGN KEY (review_id, agent, role)
+          REFERENCES runtime_review_lanes(review_id, agent, role) ON DELETE CASCADE
+      );
+      CREATE INDEX runtime_review_attempts_lane
+        ON runtime_review_lane_attempts(review_id, agent, role, attempt_ordinal);
+      CREATE TABLE approval_grants (
+        reference TEXT NOT NULL,
+        project TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
+        expires_at INTEGER NOT NULL,
+        max_uses INTEGER NOT NULL CHECK (max_uses > 0),
+        used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0 AND used_count <= max_uses),
+        PRIMARY KEY (reference, project, scope)
+      );
+      CREATE TABLE approval_consumptions (
+        consumer_key TEXT PRIMARY KEY,
+        reference TEXT NOT NULL,
+        project TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
+        consumed_at INTEGER NOT NULL
+      );
+    `);
+  } finally {
+    db.close();
+  }
 }
 
 type HistoryDigest = Record<keyof typeof HISTORY_TABLES, TableDigest>;
@@ -190,6 +303,8 @@ function migrateState(db: Database.Database): void {
         (agent,health,retry_at,failure_count,attempt_claimed,capability_verified,updated_at)
       VALUES ('grok','probing',NULL,0,0,0,0), ('codex','probing',NULL,0,0,0,0);
 
+      ALTER TABLE collaboration_dispatch_outbox ADD COLUMN terminal_reason TEXT;
+
       DROP INDEX runtime_review_lanes_status;
       DROP TABLE runtime_review_lanes;
       DROP TABLE runtime_review_barriers;
@@ -214,7 +329,7 @@ function migrateState(db: Database.Database): void {
         status TEXT NOT NULL CHECK (status IN ('queued', 'deferred', 'completed', 'failed', 'timed_out', 'stale_artifact')),
         model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
         effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version IN ('routing-v2', 'routing-v3')),
+        policy_version TEXT NOT NULL CHECK (policy_version = 'routing-v4'),
         reasons TEXT NOT NULL,
         session_id TEXT NOT NULL UNIQUE,
         idempotency_key TEXT NOT NULL UNIQUE,
@@ -231,24 +346,14 @@ function migrateState(db: Database.Database): void {
         agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex')),
         role TEXT NOT NULL CHECK (role IN ('auditor', 'critic')),
         attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
-        attempt_id TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL CHECK (status IN ('scheduled', 'completed', 'provider_unavailable', 'failed', 'timed_out', 'needs_reconciliation')),
-        model TEXT NOT NULL CHECK (model IN ('grok-4.6', 'gpt-5.6-sol')),
-        effort TEXT NOT NULL CHECK (effort IN ('high', 'xhigh')),
-        policy_version TEXT NOT NULL CHECK (policy_version IN ('routing-v2', 'routing-v3')),
-        reasons TEXT NOT NULL,
-        session_id TEXT NOT NULL UNIQUE,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        result TEXT,
-        error TEXT,
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
         created_at INTEGER NOT NULL,
-        terminal_at INTEGER,
         PRIMARY KEY (review_id, agent, role, attempt_ordinal),
         FOREIGN KEY (review_id, agent, role)
           REFERENCES runtime_review_lanes(review_id, agent, role) ON DELETE CASCADE
       );
-      CREATE INDEX runtime_review_attempts_status
-        ON runtime_review_lane_attempts(review_id, agent, role, status);
+      CREATE INDEX runtime_review_attempts_lane
+        ON runtime_review_lane_attempts(review_id, agent, role, attempt_ordinal);
 
       DROP TABLE worktree_leases;
       CREATE TABLE worktree_leases (
@@ -257,7 +362,9 @@ function migrateState(db: Database.Database): void {
         lease_id TEXT NOT NULL,
         holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
         fencing_token INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        authority_policy TEXT NOT NULL DEFAULT 'routing-v4'
+          CHECK (authority_policy IN ('routing-v3', 'routing-v4'))
       );
       CREATE TABLE approval_consumptions (
         consumer_key TEXT PRIMARY KEY,
@@ -377,6 +484,25 @@ function verifyV2(state: Database.Database, history: Database.Database): void {
   for (const table of ["runtime_provider_health", "runtime_review_barriers", "runtime_review_lanes", "runtime_review_lane_attempts", "worktree_leases"]) {
     requireAgentConstraint(state, table);
   }
+  const reviewLaneSql = (state.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='runtime_review_lanes'",
+  ).get() as { sql: string } | undefined)?.sql ?? "";
+  const reviewAttemptSql = (state.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='runtime_review_lane_attempts'",
+  ).get() as { sql: string } | undefined)?.sql ?? "";
+  if (!reviewLaneSql.includes("'routing-v4'") || !reviewAttemptSql.includes("run_id") ||
+      reviewAttemptSql.includes("policy_version") || reviewAttemptSql.includes("status TEXT")) {
+    throw new Error("v2 review schema is not routing-v4 capable");
+  }
+  const leaseColumns = new Set(
+    (state.prepare("PRAGMA table_info(worktree_leases)").all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  const outboxColumns = new Set(
+    (state.prepare("PRAGMA table_info(collaboration_dispatch_outbox)").all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (!leaseColumns.has("authority_policy") || !outboxColumns.has("terminal_reason")) {
+    throw new Error("v2 routing-v4 durability columns are missing");
+  }
   for (const table of ["sources", "history_rows", "pending_tools"]) requireAgentConstraint(history, table, true);
   if (!tableExists(history, "memory_source_health")) throw new Error("missing v2 memory source health table");
   const historyRowsSql = (history.prepare(
@@ -391,7 +517,7 @@ function verifyV2(state: Database.Database, history: Database.Database): void {
       (history.pragma("foreign_key_check") as unknown[]).length > 0) {
     throw new Error("v2 foreign-key verification failed");
   }
-  for (const [db, indexes] of [[state, ["runs_due", "collaboration_outbox_pending", "runtime_review_lanes_status", "runtime_review_attempts_status", "idx_worktree_handoffs_task"]],
+  for (const [db, indexes] of [[state, ["runs_due", "collaboration_outbox_pending", "runtime_review_lanes_status", "runtime_review_attempts_lane", "idx_worktree_handoffs_task"]],
     [history, ["history_rows_project"]]] as const) {
     for (const index of indexes) {
       if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index) === undefined) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { accessSync, constants, mkdirSync } from "node:fs";
+import { accessSync, constants, mkdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -8,22 +8,34 @@ import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { execa } from "execa";
 import { LocalCollabService } from "./app/service.js";
-import type { ProviderOutcome } from "./domain/outcomes.js";
+import { isFailoverOutcome } from "./domain/outcomes.js";
+import {
+  normalizeReviewProviderResult,
+} from "./domain/review-verdict.js";
 import type { ActiveAgentId, ProviderHealthSnapshot } from "./domain/routing.js";
-import { doctorV1, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle } from "./migration/coordinator.js";
+import { doctorV1, initializeCurrentExecutionSchema, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle } from "./migration/coordinator.js";
 import { startStdioCollabServer } from "./mcp/server.js";
 import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
 import { captureWorkspaceFingerprint } from "./runtime/workspace-fingerprint.js";
-import { CollaborationRuntime } from "./runtime/collaboration-runtime.js";
+import {
+  CollaborationRuntime,
+  RunnerOutcomeEvidenceError,
+} from "./runtime/collaboration-runtime.js";
 import { ProviderHealthStore } from "./runtime/provider-health-store.js";
-import { ReviewBarrierStore, type LaneEnqueueDescriptor } from "./runtime/review-barrier-store.js";
+import { RunGateUnitOfWork } from "./runtime/run-gate-unit-of-work.js";
 import { defaultAllowedProjectRoots, ProjectPolicy } from "./security/project-policy.js";
 import { runCapabilityProbes } from "./probes/capability-probe.js";
 import { ensureStateLayout } from "./store/state-layout.js";
 import { RunStore, type RunRecord } from "./store/run-store.js";
 import { DurableWorker } from "./worker/durable-worker.js";
 import { WorktreeLeaseStore, type WorktreeLease } from "./worktree/lease-store.js";
-import type { AttemptAssignment, CheckpointEvidence, ObservedWorktree } from "./workflow/workflow.js";
+import type { AttemptAssignment } from "./workflow/workflow.js";
+import {
+  parsePersistedDomainEffect,
+  assertPersistedDomainEffectMatchesRun,
+  isTransientSqliteError,
+  type PersistedDomainEffect,
+} from "./worker/domain-effect.js";
 
 const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local", "share", "agent-collab");
 const layout = ensureStateLayout(stateRoot);
@@ -32,7 +44,6 @@ const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".loca
 const allowedProjectRoots = defaultAllowedProjectRoots();
 const command = process.argv[2] ?? "status";
 const AGENTS: readonly ActiveAgentId[] = ["grok", "codex"];
-const FAILOVER = new Set(["quota", "rate_limit", "overload", "network_timeout", "model_unavailable", "cli_missing", "auth"]);
 
 const tableExists = (database: string, table: string): boolean => {
   const db = new Database(database, { readonly: true });
@@ -61,11 +72,62 @@ const prepareDatabases = (): void => {
     if (stateVersion === 2 && historyVersion === 2) return;
     throw new Error(`offline migration required: state=${stateVersion}, history=${historyVersion}; run migrate-v2 while the service is stopped`);
   }
+  initializeCurrentExecutionSchema(layout.database);
   const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
   service.close();
   markV2(layout.database);
   markV2(layout.historyDatabase);
 };
+
+if (command === "map-learn-close") {
+  const taskPacketPath = resolve(process.argv[3] ?? "");
+  const handoffPath = resolve(process.argv[4] ?? "");
+  const candidatePath = resolve(process.argv[5] ?? "");
+  if (!process.argv[3] || !process.argv[4] || !process.argv[5] || process.argv.length > 6) {
+    throw new Error("Usage: agent-collab map-learn-close <task-packet> <handoff> <candidate>");
+  }
+  prepareDatabases();
+  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  try {
+    console.log(JSON.stringify(service.closeMapLearning({
+      taskPacketBytes: readFileSync(taskPacketPath),
+      handoffBytes: readFileSync(handoffPath),
+      candidateBytes: readFileSync(candidatePath),
+    }), null, 2));
+  } finally {
+    service.close();
+  }
+  process.exit(0);
+}
+
+if (command === "map-evidence-record") {
+  const findingPath = resolve(process.argv[3] ?? "");
+  const purpose = process.argv[4];
+  const evidenceId = process.argv[5];
+  const artifactHash = process.argv[6];
+  if (!process.argv[3] || !purpose || !evidenceId || !artifactHash || process.argv.length > 7 || ![
+    "code_or_artifact_fix",
+    "old_code_sensitive_regression",
+    "sibling_surface_scan",
+  ].includes(purpose)) {
+    throw new Error("Usage: agent-collab map-evidence-record <finding-lifecycle.json> <code_or_artifact_fix|old_code_sensitive_regression|sibling_surface_scan> <evidence-id> <candidate-sha256>");
+  }
+  prepareDatabases();
+  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  try {
+    const receipt = service.recordMapLearningEvidence({
+      purpose: purpose as "code_or_artifact_fix" | "old_code_sensitive_regression" | "sibling_surface_scan",
+      id: evidenceId,
+      artifactHash,
+      finding: JSON.parse(readFileSync(findingPath, "utf8")),
+    });
+    console.log(JSON.stringify(receipt, null, 2));
+    if (receipt.result !== "PASS") process.exitCode = 1;
+  } finally {
+    service.close();
+  }
+  process.exit(process.exitCode ?? 0);
+}
 
 const assertServiceInactive = (): void => {
   const state = spawnSync("systemctl", ["--user", "is-active", "agent-collab.service"], {
@@ -154,23 +216,10 @@ const assignmentFrom = (value: unknown): AttemptAssignment | null => {
 const processTask = (run: RunRecord): ProcessTask => ({
   id: run.id,
   stage: run.stage,
+  ...(run.artifactHash === undefined ? {} : { artifactHash: run.artifactHash }),
+  idempotencyKey: run.idempotencyKey,
   ...(run.approvalScope === undefined ? {} : { approvalScope: run.approvalScope }),
   ...(run.payload === undefined ? {} : { payload: run.payload }),
-});
-
-const enqueueReviewLane = (store: RunStore, lane: LaneEnqueueDescriptor) => store.enqueueExact({
-  idempotencyKey: lane.idempotencyKey, stage: `review:${lane.role}`, priority: 5,
-  artifactHash: lane.artifactHash, approvalScope: "workspace-read",
-  payload: { requester: lane.requester ?? "codex", preferredAgent: lane.agent, project: lane.project,
-    prompt: `${lane.prompt}\n\nImmutable artifact (${lane.artifactHash}):\n${lane.artifact.toString("utf8")}`,
-    approvalScope: "workspace-read", allowFallback: false, reviewRole: lane.role,
-    reviewId: lane.reviewId, sessionId: lane.sessionId, artifactHash: lane.artifactHash,
-    reviewAttemptId: lane.attemptId, reviewAttemptOrdinal: lane.attemptOrdinal,
-    decision: { agent: lane.agent, model: lane.model, effort: lane.effort,
-      policyVersion: lane.policyVersion, reasons: lane.reasons },
-    reviewDispatchIdentity: { agent: lane.agent, model: lane.model, effort: lane.effort,
-      policyVersion: lane.policyVersion, reasons: lane.reasons, sessionId: lane.sessionId,
-      attemptId: lane.attemptId, attemptOrdinal: lane.attemptOrdinal, degraded: lane.degraded } },
 });
 
 if (command === "reconcile-run") {
@@ -199,18 +248,20 @@ if (command === "reconcile-run") {
     }
     effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
       resultKind: "task_failure" };
-  } else if (workflowId && stageId && assignment && (agent === "grok" || agent === "codex")) {
+  } else if (workflowId && stageId && assignment && agent === "codex") {
+    if (resolution === "completed") {
+      store.close();
+      throw new Error("workflow reconciliation cannot synthesize completed runner evidence; resolve as failed and start a fresh workflow identity");
+    }
     const executionContext = asObject(asObject(run.launchInfo)?.executionContext);
     const lease = asObject(executionContext?.lease);
-    if (!lease) { store.close(); throw new Error("workflow reconciliation is missing persisted lease identity"); }
-    effect = { type: "workflow", workflowId, stageId, assignment, agent,
-      resultKind: resolution === "completed" ? "success" : "task_failure", lease,
-      terminalAt: Date.now() };
+    effect = { type: "workflow_reconciliation_block", workflowId, stageId, runId: run.id,
+      ...(lease ? { lease } : {}), terminalAt: Date.now() };
   } else {
     store.close(); throw new Error("reconciliation payload has no supported domain identity");
   }
   store.resolveReconciliation({ id: run.id,
-    providerResult: { kind: resolution === "completed" ? "success" : "task_failure",
+    providerResult: { kind: "task_failure", ...(agent === "grok" || agent === "codex" ? { agent } : {}),
       reconciledByOperator: true, reconciledAt: Date.now() },
     effect: { terminalAt: Date.now(), ...effect }, status: resolution });
   console.log(JSON.stringify({ runId, resolution, domainEffect: "pending_worker_replay" }, null, 2));
@@ -224,24 +275,29 @@ if (command === "mcp") {
   const recovery = new RunStore(layout.database);
   recovery.recoverExpired(); recovery.close();
   const health = new ProviderHealthStore(layout.database, { cooldownMs: 60_000 });
-  const reviews = new ReviewBarrierStore(layout.database);
-  const markReviewReconciliation = (at: number): void => {
+  const reviews = new RunGateUnitOfWork(layout.database);
+  const collaborationRuntime = new CollaborationRuntime(layout.database);
+  const markStartupReconciliation = (at: number): void => {
     const store = new RunStore(layout.database);
     for (const run of store.needsReconciliation()) {
-      const reviewId = typeof run.payload?.reviewId === "string" ? run.payload.reviewId : null;
-      const attemptId = typeof run.payload?.reviewAttemptId === "string" ? run.payload.reviewAttemptId : null;
-      const role = run.payload?.reviewRole;
       const decision = asObject(run.payload?.decision);
       const agent = decision?.agent;
-      if (reviewId && attemptId && (role === "auditor" || role === "critic") &&
-          (agent === "grok" || agent === "codex")) {
-        reviews.markAttemptNeedsReconciliation({ reviewId, agent, role, attemptId, at });
+      const workflowId = typeof run.payload?.workflowId === "string" ? run.payload.workflowId : null;
+      const workflowStageId = typeof run.payload?.workflowStageId === "string"
+        ? run.payload.workflowStageId
+        : null;
+      if (workflowId && workflowStageId && agent === "codex") {
+        collaborationRuntime.blockRunnerReconciliation(
+          workflowId,
+          workflowStageId,
+          run.id,
+          at,
+        );
       }
     }
     store.close();
   };
-  markReviewReconciliation(Date.now());
-  const collaborationRuntime = new CollaborationRuntime(layout.database);
+  markStartupReconciliation(Date.now());
   const worktreeLeases = new WorktreeLeaseStore(layout.database);
   const startupOutbox = new RunStore(layout.database);
   collaborationRuntime.drainDispatchOutbox(startupOutbox); startupOutbox.close();
@@ -263,8 +319,12 @@ if (command === "mcp") {
   };
 
   refreshHealth(Date.now());
-  const runner = new AgentRunner({ binaries: { grok: grokBinary, codex: codexBinary }, timeoutMs: 30 * 60_000 });
+  const runner = new AgentRunner({ binaries: { grok: grokBinary, codex: codexBinary },
+    timeoutMs: 30 * 60_000, authorizationDatabasePath: layout.database });
   const effectStore = new RunStore(layout.database);
+  const domainReplayOwner = `domain-replay:${process.pid}:${randomUUID()}`;
+  class PersistedDomainEffectError extends Error {}
+  function poison(message: string): never { throw new PersistedDomainEffectError(message); }
   const releaseRecordedLease = async (value: unknown): Promise<void> => {
     const lease = asObject(value) as unknown as WorktreeLease | null;
     if (!lease) return;
@@ -274,35 +334,52 @@ if (command === "mcp") {
   const applyDomainEffect = async (
     run: RunRecord,
     providerResult: Record<string, unknown>,
-    effect: Record<string, unknown>,
+    effect: PersistedDomainEffect,
   ): Promise<void> => {
     const type = effect.type;
     const terminalAt = Number(effect.terminalAt);
-    if (!Number.isSafeInteger(terminalAt) || terminalAt < 0) throw new Error("invalid persisted domain-effect time");
+    if (!Number.isSafeInteger(terminalAt) || terminalAt < 0) poison("invalid persisted domain-effect time");
+    if (type === "workflow_reconciliation_block") {
+      const workflowId = String(effect.workflowId);
+      const stageId = String(effect.stageId);
+      const runId = String(effect.runId);
+      try {
+        collaborationRuntime.blockRunnerReconciliation(workflowId, stageId, runId, terminalAt);
+      } catch (error) {
+        if (isTransientSqliteError(error)) throw error;
+        poison(error instanceof Error ? error.message : String(error));
+      }
+      await releaseRecordedLease(effect.lease);
+      return;
+    }
+    if (type === "workflow_dispatch_rejected") {
+      const workflowId = String(effect.workflowId);
+      const stageId = String(effect.stageId);
+      const runId = String(effect.runId);
+      const reason = String(effect.reason);
+      try {
+        collaborationRuntime.recordPrelaunchOutcome(workflowId, effect.prelaunchReceipt, terminalAt);
+      } catch (error) {
+        if (error instanceof RunnerOutcomeEvidenceError) poison(error.message);
+        throw error;
+      }
+      await releaseRecordedLease(effect.lease);
+      return;
+    }
     if (type === "workflow") {
       const workflowId = String(effect.workflowId);
       const stageId = String(effect.stageId);
       const assignment = assignmentFrom(effect.assignment);
       const agent = effect.agent;
       const resultKind = String(effect.resultKind);
-      if (!assignment || (agent !== "grok" && agent !== "codex")) throw new Error("invalid persisted workflow effect");
+      if (!assignment || agent !== "codex") poison("invalid persisted workflow effect");
       const disposition = collaborationRuntime.dispatchDisposition(workflowId, stageId, assignment);
       if (disposition === "execute") {
-        if (resultKind === "success") {
-          collaborationRuntime.completeStage(workflowId, stageId, assignment, providerResult, terminalAt);
-        } else if (FAILOVER.has(resultKind)) {
-          const checkpoint = effect.checkpoint as unknown as CheckpointEvidence;
-          const observed = effect.observed as unknown as ObservedWorktree;
-          const lease = effect.lease as unknown as WorktreeLease;
-          collaborationRuntime.recordProviderOutcome(workflowId, {
-            from: agent, outcome: { kind: resultKind } as ProviderOutcome,
-            health: effect.health as ProviderHealthSnapshot, checkpoint, lease,
-            observed, assignment, outcomeEventId: `${run.id}:${run.attemptCount}`,
-          }, terminalAt);
-        } else {
-          collaborationRuntime.recordTerminalOutcome(
-            workflowId, assignment, { kind: resultKind as ProviderOutcome["kind"] }, terminalAt,
-          );
+        try {
+          collaborationRuntime.recordRunnerOutcome(workflowId, effect.runnerReceipt, terminalAt);
+        } catch (error) {
+          if (error instanceof RunnerOutcomeEvidenceError) poison(error.message);
+          throw error;
         }
       }
       const queue = new RunStore(layout.database);
@@ -317,44 +394,93 @@ if (command === "mcp") {
       const agent = effect.agent;
       const resultKind = String(effect.resultKind);
       if ((role !== "auditor" && role !== "critic") || (agent !== "grok" && agent !== "codex")) {
-        throw new Error("invalid persisted review effect");
+        poison("invalid persisted review effect");
       }
       const attempt = reviews.attempts(reviewId, agent, role).find((item) => item.attemptId === attemptId);
-      if (!attempt) throw new Error("unknown persisted review attempt");
-      if (attempt.status === "needs_reconciliation") {
-        reviews.resolveAttemptReconciliation({ reviewId, agent, role, attemptId,
-          status: resultKind === "success" ? "completed" : "failed",
-          evidence: providerResult, at: terminalAt });
-      } else if (attempt.status === "scheduled") {
-        if (resultKind === "success") {
-          reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "completed",
-            result: providerResult, terminalAt });
-        } else if (FAILOVER.has(resultKind)) {
-          reviews.recordProviderUnavailable({ reviewId, agent, role, attemptId,
-            error: providerResult, terminalAt });
-        } else {
-          reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "failed",
-            error: providerResult, terminalAt });
-        }
+      if (!attempt) poison("unknown persisted review attempt");
+      if (resultKind === "success") {
+        reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "completed",
+          result: providerResult, terminalAt });
+      } else if (isFailoverOutcome(resultKind)) {
+        reviews.recordProviderUnavailable({ reviewId, agent, role, attemptId,
+          error: providerResult, terminalAt });
+      } else {
+        reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "failed",
+          error: providerResult, terminalAt });
       }
       return;
     }
-    throw new Error("unknown persisted domain effect");
+    poison("unknown persisted domain effect");
+  };
+  const replayClaimedDomainEffect = async (
+    pending: RunRecord,
+    providerResult: Record<string, unknown>,
+    effectInput: unknown,
+  ): Promise<void> => {
+    try {
+      let effect: PersistedDomainEffect;
+      try {
+        effect = parsePersistedDomainEffect(effectInput);
+      } catch (error) {
+        poison(error instanceof Error ? error.message : String(error));
+      }
+      try {
+        assertPersistedDomainEffectMatchesRun(pending, providerResult, effect);
+      } catch (error) {
+        poison(error instanceof Error ? error.message : String(error));
+      }
+      await applyDomainEffect(pending, providerResult, effect);
+      if (!effectStore.markDomainEffectApplied(pending.id, domainReplayOwner)) {
+        const latest = effectStore.get(pending.id)?.result as { domainEffect?: unknown } | undefined;
+        if (latest?.domainEffect !== "applied") {
+          throw new Error(`domain effect lost its replay claim: ${pending.id}`);
+        }
+      }
+    } catch (error) {
+      if (error instanceof PersistedDomainEffectError) {
+        effectStore.quarantineDomainEffect(pending.id, domainReplayOwner, error);
+      } else {
+        effectStore.releaseDomainEffectClaim(pending.id, domainReplayOwner, error);
+      }
+      throw error;
+    }
   };
   const replayPendingDomainEffects = async (): Promise<void> => {
-    for (const pending of effectStore.pendingDomainEffects()) {
-      const envelope = asObject(pending.result);
-      const providerResult = asObject(envelope?.providerResult);
-      const effect = asObject(envelope?.effect);
-      if (!providerResult || !effect) throw new Error(`invalid pending domain effect: ${pending.id}`);
-      await applyDomainEffect(pending, providerResult, effect);
-      effectStore.markDomainEffectApplied(pending.id);
+    const now = Date.now();
+    for (const pending of effectStore.pendingDomainEffects(now)) {
+      if (!effectStore.claimDomainEffect(pending.id, {
+        owner: domainReplayOwner,
+        now,
+        leaseMs: 30_000,
+      })) continue;
+      try {
+        const envelope = asObject(pending.result);
+        const providerResult = asObject(envelope?.providerResult);
+        const effect = envelope?.effect;
+        if (!providerResult || effect === undefined) {
+          poison(`invalid pending domain effect: ${pending.id}`);
+        }
+        await replayClaimedDomainEffect(pending, providerResult, effect);
+      } catch (error) {
+        if (error instanceof PersistedDomainEffectError) {
+          effectStore.quarantineDomainEffect(pending.id, domainReplayOwner, error);
+        } else {
+          effectStore.releaseDomainEffectClaim(pending.id, domainReplayOwner, error);
+        }
+      }
     }
   };
   await replayPendingDomainEffects();
   const workers = Array.from({ length: 4 }, (_unused, index) => new DurableWorker({
     store: new RunStore(layout.database), workerId: `worker:${process.pid}:${index}`,
-    runner: async (run, onLaunch, commitDomainEffect, persistExecutionContext) => {
+    runner: async (
+      run,
+      onLaunch,
+      commitDomainEffect,
+      persistExecutionContext,
+      onLaunchIntent,
+      onProvenNoSpawn,
+    ) => {
       const reviewId = typeof run.payload?.reviewId === "string" ? run.payload.reviewId : null;
       const reviewAttemptId = typeof run.payload?.reviewAttemptId === "string" ? run.payload.reviewAttemptId : null;
       const role = run.payload?.reviewRole;
@@ -376,11 +502,9 @@ if (command === "mcp") {
         if (current?.status === "blocked_no_provider" && current.recovery !== null &&
             current.recovery.nextRetryAt !== null && current.recovery.nextRetryAt <= now) {
           const available = routingHealth(health, now);
-          collaborationRuntime.workflows.applyMany(workflowId, [
-            { type: "PROVIDER_HEALTH_CHANGED", agent: "grok", health: available.grok },
-            { type: "PROVIDER_HEALTH_CHANGED", agent: "codex", health: available.codex },
-            { type: "RECOVERY_TIMER_FIRED", eventId: `${workflowId}:recovery:${now}`, now },
-          ], now);
+          collaborationRuntime.recordProviderHealth(workflowId, "grok", available.grok, now);
+          collaborationRuntime.recordProviderHealth(workflowId, "codex", available.codex, now);
+          collaborationRuntime.retryBlockedStage(workflowId, now);
           const queue = new RunStore(layout.database);
           collaborationRuntime.drainDispatchOutbox(queue, now); queue.close();
         }
@@ -388,18 +512,16 @@ if (command === "mcp") {
         if (disposition !== "execute") {
           return disposition === "terminal"
             ? { kind: "task_failure", reconciledDispatch: disposition }
-            : { kind: "handoff_dispatched", reconciledDispatch: disposition };
+            : { kind: "success", reconciledDispatch: disposition };
         }
       }
 
       let lease: WorktreeLease | null = null;
       const project = typeof run.payload?.project === "string" ? run.payload.project : null;
-      if (workflowId && project && (agent === "grok" || agent === "codex")) {
-        const handedOff = asObject(run.payload?.handoffLease);
+      if (workflowId && project && agent === "codex") {
         const priorContext = asObject(asObject(run.launchInfo)?.executionContext);
         const priorLease = asObject(priorContext?.lease) as unknown as WorktreeLease | null;
-        if (handedOff) lease = handedOff as unknown as WorktreeLease;
-        else if (priorLease) {
+        if (priorLease) {
           const reused = await worktreeLeases.reuse({ lease: priorLease, taskId: workflowId,
             holder: agent, now, ttlMs: 31 * 60_000 });
           if (reused.status !== "acquired") return { kind: "task_failure", error: "persisted worktree lease is fenced" };
@@ -413,38 +535,85 @@ if (command === "mcp") {
         persistExecutionContext({ lease });
       }
 
-      const result = await runner.run(processTask(run), onLaunch);
+      const rawResult = await runner.run(
+        processTask(run),
+        onLaunch,
+        onLaunchIntent,
+        onProvenNoSpawn,
+      );
+      if (rawResult.agent !== undefined && rawResult.agent !== agent) {
+        throw new Error("runner result agent does not match the durable assignment");
+      }
+      let result = (agent === "grok" || agent === "codex")
+        ? { ...rawResult, agent }
+        : rawResult;
+      if (
+        reviewId &&
+        (role === "auditor" || role === "critic") &&
+        result.kind === "success"
+      ) {
+        try {
+          result = normalizeReviewProviderResult(result);
+        } catch (error) {
+          result = {
+            kind: "task_failure",
+            agent,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
       const resultKind = typeof result.kind === "string" ? result.kind : "task_failure";
+      const durableLaunch = effectStore.get(run.id);
+      const durableLaunchInfo = asObject(durableLaunch?.launchInfo);
+      if (durableLaunch?.launched && durableLaunchInfo?.phase !== "started") {
+        return result;
+      }
       if ((agent === "grok" || agent === "codex") && resultKind === "success") health.recordSuccess(agent, Date.now());
-      if ((agent === "grok" || agent === "codex") && FAILOVER.has(resultKind)) {
-        health.recordFailoverFailure(agent, { kind: resultKind } as ProviderOutcome, Date.now());
+      if ((agent === "grok" || agent === "codex") && isFailoverOutcome(resultKind)) {
+        health.recordFailoverFailure(agent, { kind: resultKind }, Date.now());
       }
 
       let effect: Record<string, unknown> | null = null;
-      if (workflowId && workflowStageId && queuedAssignment && (agent === "grok" || agent === "codex")) {
-        effect = { type: "workflow", workflowId, stageId: workflowStageId,
-          assignment: queuedAssignment, agent, resultKind, terminalAt: Date.now(), ...(lease ? { lease } : {}) };
-        if (FAILOVER.has(resultKind)) {
-          const active = collaborationRuntime.workflows.get(workflowId)?.activeStage;
-          if (!active) throw new Error("failover workflow has no active stage");
-          const observed = project ? captureWorkspaceFingerprint(project) : {
-            headSha: "not-applicable", diffHash: "not-applicable", changedFiles: [], fingerprint: "not-applicable",
-          };
-          if (!lease) throw new Error("workflow failover requires a durable worktree lease");
-          const handoffLease = lease;
-          const checkpoint: CheckpointEvidence & { workspaceFingerprint: string } = {
-            artifactHash: active.artifactHash, headSha: observed.headSha, diffHash: observed.diffHash,
-            changedFiles: observed.changedFiles, testEvidence: [],
-            sourceSessionId: typeof run.payload?.sessionId === "string" ? run.payload.sessionId : `run:${run.id}`,
-            approvals: [], nextAction: { kind: "continue_stage", stageId: active.id,
-              instruction: "continue from verified provider failover" }, workspaceFingerprint: observed.fingerprint,
-          };
-          const observedWorktree: ObservedWorktree = { artifactHash: active.artifactHash,
-            headSha: observed.headSha, diffHash: observed.diffHash, leaseId: handoffLease.leaseId,
-            fencingToken: handoffLease.fencingToken };
-          effect = { ...effect, checkpoint, observed: observedWorktree,
-            health: routingHealth(health, Date.now()), lease: handoffLease };
-        }
+      if (workflowId && workflowStageId && queuedAssignment && agent === "codex") {
+        const terminalAt = Date.now();
+        const launched = effectStore.get(run.id)?.launched === true;
+        const runnerReceipt = !launched ? null : {
+          schemaVersion: "runner-outcome/v1",
+          runId: run.id,
+          runAttemptCount: run.attemptCount,
+          dispatchId: run.idempotencyKey,
+          workflowId,
+          stageId: workflowStageId,
+          attemptId: queuedAssignment.attemptId,
+          attemptOrdinal: queuedAssignment.attemptOrdinal,
+          agent: queuedAssignment.agent,
+          model: queuedAssignment.model,
+          policyVersion: queuedAssignment.policyVersion,
+          sessionId: queuedAssignment.sessionId,
+          resultKind,
+        };
+        const prelaunchReceipt = launched ? null : {
+          schemaVersion: "prelaunch-outcome/v1",
+          runId: run.id,
+          runAttemptCount: run.attemptCount,
+          dispatchId: run.idempotencyKey,
+          workflowId,
+          stageId: workflowStageId,
+          attemptId: queuedAssignment.attemptId,
+          attemptOrdinal: queuedAssignment.attemptOrdinal,
+          agent: queuedAssignment.agent,
+          model: queuedAssignment.model,
+          policyVersion: queuedAssignment.policyVersion,
+          sessionId: queuedAssignment.sessionId,
+          resultKind,
+        };
+        effect = launched
+          ? { type: "workflow", workflowId, stageId: workflowStageId,
+              assignment: queuedAssignment, agent, resultKind, terminalAt,
+              ...(runnerReceipt ? { runnerReceipt } : {}), ...(lease ? { lease } : {}) }
+          : { type: "workflow_dispatch_rejected", workflowId, stageId: workflowStageId,
+              runId: run.id, reason: resultKind, prelaunchReceipt, terminalAt,
+              ...(lease ? { lease } : {}) };
       } else if (reviewId && reviewAttemptId && (role === "auditor" || role === "critic") &&
           (agent === "grok" || agent === "codex")) {
         effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
@@ -452,9 +621,14 @@ if (command === "mcp") {
       }
       if (!effect) return result;
       commitDomainEffect({ providerResult: result, effect,
-        status: resultKind === "success" || FAILOVER.has(resultKind) ? "completed" : "failed" });
-      await applyDomainEffect(run, result, effect);
-      effectStore.markDomainEffectApplied(run.id);
+        status: resultKind === "success" || isFailoverOutcome(resultKind) ? "completed" : "failed" });
+      const committed = effectStore.get(run.id)!;
+      if (!effectStore.claimDomainEffect(run.id, {
+        owner: domainReplayOwner,
+        now: Date.now(),
+        leaseMs: 30_000,
+      })) throw new Error("committed domain effect could not be claimed");
+      await replayClaimedDomainEffect(committed, result, effect);
       return result;
     }, leaseMs: 31 * 60_000,
   }));
@@ -467,25 +641,20 @@ if (command === "mcp") {
     if (now - lastRecovery >= 30_000) {
       const store = new RunStore(layout.database);
       store.recoverExpired(now); store.close();
-      markReviewReconciliation(now);
+      await replayPendingDomainEffects();
+      markStartupReconciliation(now);
       await replayPendingDomainEffects();
       const outboxQueue = new RunStore(layout.database);
       collaborationRuntime.drainDispatchOutbox(outboxQueue, now); outboxQueue.close();
       refreshHealth(now);
       const available = routingHealth(health, now);
       for (const recoverable of collaborationRuntime.workflows.recoverable()) {
-        const events = [
-          { type: "PROVIDER_HEALTH_CHANGED" as const, agent: "grok" as const, health: available.grok },
-          { type: "PROVIDER_HEALTH_CHANGED" as const, agent: "codex" as const, health: available.codex },
-        ];
         const recovery = recoverable.state.recovery;
-        collaborationRuntime.workflows.applyMany(recoverable.workflowId, [
-          ...events,
-          ...(recovery?.nextRetryAt !== null && recovery?.nextRetryAt !== undefined && recovery.nextRetryAt <= now
-            ? [{ type: "RECOVERY_TIMER_FIRED" as const,
-                eventId: `${recoverable.workflowId}:recovery:${recovery.attempt}:${recovery.nextRetryAt}`, now }]
-            : []),
-        ], now);
+        collaborationRuntime.recordProviderHealth(recoverable.workflowId, "grok", available.grok, now);
+        collaborationRuntime.recordProviderHealth(recoverable.workflowId, "codex", available.codex, now);
+        if (recovery?.nextRetryAt !== null && recovery?.nextRetryAt !== undefined && recovery.nextRetryAt <= now) {
+          collaborationRuntime.retryBlockedStage(recoverable.workflowId, now);
+        }
       }
       const recoveredQueue = new RunStore(layout.database);
       collaborationRuntime.drainDispatchOutbox(recoveredQueue, now); recoveredQueue.close();
@@ -495,13 +664,8 @@ if (command === "mcp") {
         for (const reviewId of reviews.deferredReviewIds(agent)) {
           const snapshot = reviews.get(reviewId); if (!snapshot) continue;
           const currentSourceFingerprint = snapshot.project ? captureWorkspaceFingerprint(snapshot.project).fingerprint : undefined;
-          const activated = reviews.activateDeferred({ reviewId, agent, currentArtifactHash: snapshot.artifactHash,
+          reviews.activateDeferred({ reviewId, agent,
             ...(currentSourceFingerprint ? { currentSourceFingerprint } : {}), now, providerHealth: health });
-          if (activated.status === "activated") {
-            const queue = new RunStore(layout.database);
-            for (const lane of activated.lanes) enqueueReviewLane(queue, lane);
-            queue.close(); reviews.confirmDeferredEnqueued(reviewId, agent);
-          }
         }
       }
       lastRecovery = now;

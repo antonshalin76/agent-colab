@@ -7,7 +7,7 @@ export interface CodexCommandInput {
   cwd: string;
   prompt: string;
   approvalScope: ApprovalScope;
-  approvalReference?: string;
+  authorizationConsumerKey?: string;
   effort: Effort;
   timeoutMs: number;
 }
@@ -16,10 +16,70 @@ const MODEL = "gpt-5.6-sol";
 const MAX_RESULT_BYTES = 1024 * 1024;
 const EXECUTABLE_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh"]);
 
+export type UsageProvenance = "provider_reported" | "derived" | "unavailable";
+export interface UsageTelemetry {
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+  costUsd: number | null;
+  provenance: Record<
+    "inputTokens" | "cachedInputTokens" | "outputTokens" | "reasoningTokens" | "totalTokens" | "costUsd",
+    UsageProvenance
+  >;
+}
+
+export interface NormalizedCodexBaseResult {
+  text: string;
+  model: "gpt-5.6-sol";
+}
+export interface NormalizedCodexResult extends NormalizedCodexBaseResult {
+  usage: UsageTelemetry;
+}
+export interface NormalizedCodexEvalResult extends NormalizedCodexResult {
+  modelProvenance: "command_pinned";
+  effort: Effort;
+  protocolVersion: string;
+}
+
+interface CodexEvalNormalizationOptions {
+  includeUsage: true;
+  expectedEffort: Effort;
+  expectedProtocolVersion: string;
+  pinnedModel: "gpt-5.6-sol";
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function reportedNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function usageTelemetry(source: Record<string, unknown> | null): UsageTelemetry {
+  const values = {
+    inputTokens: reportedNumber(source?.input_tokens),
+    cachedInputTokens: reportedNumber(source?.cached_input_tokens),
+    outputTokens: reportedNumber(source?.output_tokens),
+    reasoningTokens: reportedNumber(source?.reasoning_output_tokens),
+    totalTokens: reportedNumber(source?.total_tokens),
+    costUsd: reportedNumber(source?.cost_usd),
+  };
+  return {
+    ...values,
+    provenance: {
+      inputTokens: values.inputTokens === null ? "unavailable" : "provider_reported",
+      cachedInputTokens: values.cachedInputTokens === null ? "unavailable" : "provider_reported",
+      outputTokens: values.outputTokens === null ? "unavailable" : "provider_reported",
+      reasoningTokens: values.reasoningTokens === null ? "unavailable" : "provider_reported",
+      totalTokens: values.totalTokens === null ? "unavailable" : "provider_reported",
+      costUsd: values.costUsd === null ? "unavailable" : "provider_reported",
+    },
+  };
 }
 
 export function buildCodexCommand(input: CodexCommandInput): CommandSpec {
@@ -30,8 +90,8 @@ export function buildCodexCommand(input: CodexCommandInput): CommandSpec {
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
     throw new Error("Codex timeout must be a positive integer");
   }
-  if (input.approvalScope !== "workspace-read" && !input.approvalReference?.trim()) {
-    throw new Error(`${input.approvalScope} execution requires an explicit approval reference`);
+  if (input.approvalScope !== "workspace-read" && !input.authorizationConsumerKey?.trim()) {
+    throw new Error(`${input.approvalScope} execution requires a consumed authority receipt`);
   }
   const sandbox =
     input.approvalScope === "workspace-read"
@@ -63,7 +123,19 @@ export function buildCodexCommand(input: CodexCommandInput): CommandSpec {
   };
 }
 
-export function normalizeCodexResult(stdout: string): { text: string; model: "gpt-5.6-sol" } {
+export function normalizeCodexResult(stdout: string): NormalizedCodexBaseResult;
+export function normalizeCodexResult(
+  stdout: string,
+  options: { includeUsage: true },
+): NormalizedCodexResult;
+export function normalizeCodexResult(
+  stdout: string,
+  options: CodexEvalNormalizationOptions,
+): NormalizedCodexEvalResult;
+export function normalizeCodexResult(
+  stdout: string,
+  options?: { includeUsage?: boolean } | CodexEvalNormalizationOptions,
+): NormalizedCodexBaseResult | NormalizedCodexResult | NormalizedCodexEvalResult {
   if (Buffer.byteLength(stdout, "utf8") > MAX_RESULT_BYTES) {
     throw new Error("Codex result exceeds the bounded parser limit");
   }
@@ -76,22 +148,74 @@ export function normalizeCodexResult(stdout: string): { text: string; model: "gp
     });
   }
   catch { throw new Error("malformed Codex JSONL parse"); }
-  const sessions = records
-    .filter((item) => item.type === "session_meta")
-    .map((item) => record(item.payload));
-  if (sessions.length !== 1 || sessions[0]?.model !== MODEL) {
-    throw new Error(`model identity mismatch: ${String(sessions[0]?.model)}`);
-  }
+  const current = records.some((item) => item.type === "thread.started");
   const texts: string[] = [];
-  for (const item of records) {
-    if (item.type !== "response_item") continue;
-    const payload = record(item.payload);
-    if (payload?.type !== "message" || payload.role !== "assistant" || !Array.isArray(payload.content)) continue;
-    for (const rawPart of payload.content) {
-      const part = record(rawPart);
-      if (part?.type === "output_text" && typeof part.text === "string") texts.push(part.text);
+  let usageSource: Record<string, unknown> | null = null;
+  if (current) {
+    if (records.filter((item) => item.type === "thread.started").length !== 1) {
+      throw new Error("incomplete Codex stream: invalid thread identity");
+    }
+    for (const event of records) {
+      if (event.type === "item.completed") {
+        const item = record(event.item);
+        if (item?.type === "agent_message" && typeof item.text === "string") texts.push(item.text);
+      }
+      if (event.type === "turn.completed") usageSource = record(event.usage);
+    }
+  } else {
+    const sessions = records
+      .filter((item) => item.type === "session_meta")
+      .map((item) => record(item.payload));
+    if (sessions.length !== 1 || sessions[0]?.model !== MODEL) {
+      throw new Error(`model identity mismatch: ${String(sessions[0]?.model)}`);
+    }
+    for (const event of records) {
+      if (event.type === "response_item") {
+        const payload = record(event.payload);
+        if (payload?.type !== "message" || payload.role !== "assistant" || !Array.isArray(payload.content)) continue;
+        for (const rawPart of payload.content) {
+          const part = record(rawPart);
+          if (part?.type === "output_text" && typeof part.text === "string") texts.push(part.text);
+        }
+      }
+      if (event.type === "event_msg") {
+        const payload = record(event.payload);
+        if (payload?.type !== "token_count") continue;
+        const info = record(payload.info);
+        usageSource = record(info?.last_token_usage);
+      }
     }
   }
   if (!texts.length) throw new Error("incomplete Codex stream: missing result");
-  return { text: texts.join("\n"), model: MODEL };
+  let text = texts.join("\n");
+  if (options && "expectedProtocolVersion" in options) {
+    if (options.pinnedModel !== MODEL) throw new Error("Codex command-pinned model mismatch");
+    // Structured Codex runs may emit schema-valid progress messages before the
+    // terminal schema-valid message. Only the last completed agent message is
+    // the final response contract; joining them creates invalid JSON.
+    text = texts.at(-1)!;
+    let payload: Record<string, unknown> | null;
+    try { payload = record(JSON.parse(text)); }
+    catch { throw new Error("malformed Codex visible result parse"); }
+    if (!payload || payload.protocolVersion !== options.expectedProtocolVersion) {
+      throw new Error("Codex protocol mismatch");
+    }
+    if (payload.reasoningEffort !== options.expectedEffort) {
+      throw new Error("Codex reasoning effort mismatch");
+    }
+    if (typeof payload.visibleText !== "string" || !payload.visibleText.trim()) {
+      throw new Error("incomplete Codex result: missing visible text");
+    }
+    text = payload.visibleText;
+    return {
+      text,
+      model: MODEL,
+      modelProvenance: "command_pinned",
+      effort: options.expectedEffort,
+      protocolVersion: options.expectedProtocolVersion,
+      usage: usageTelemetry(usageSource),
+    };
+  }
+  const base: NormalizedCodexBaseResult = { text, model: MODEL };
+  return options?.includeUsage ? { ...base, usage: usageTelemetry(usageSource) } : base;
 }

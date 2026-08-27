@@ -1,27 +1,72 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import type { ProviderOutcome } from "../domain/outcomes.js";
+import Database from "better-sqlite3";
+import { z } from "zod";
+import { FAILOVER_OUTCOMES, TERMINAL_OUTCOMES, isFailoverOutcome } from "../domain/outcomes.js";
 import type {
   ActiveAgentId,
   EffortDecision,
-  ProviderHealthSnapshot,
+  ProviderHealth,
 } from "../domain/routing.js";
 import { sanitizeResult } from "../security/redaction.js";
 import { CollaborationRunStore } from "../store/collaboration-run-store.js";
-import type { RunRecord, RunStore } from "../store/run-store.js";
+import { RunStore, type RunRecord } from "../store/run-store.js";
 import type {
+  ActiveStage,
   AttemptAssignment,
-  CheckpointEvidence,
   CollaborationRun,
-  ObservedWorktree,
 } from "../workflow/workflow.js";
-import { WorktreeLeaseStore } from "../worktree/lease-store.js";
+import { RunGateUnitOfWork } from "./run-gate-unit-of-work.js";
+import type { MapAdmissionProof } from "../flow/map-admission.js";
+import { ApprovalLedger } from "../security/approval-ledger.js";
+import { ExecutionAdmission } from "./execution-admission.js";
 
 export type DispatchDisposition =
   | "execute"
   | "completed"
   | "superseded"
   | "terminal";
+
+export const RunnerOutcomeReceiptSchema = z.object({
+  schemaVersion: z.literal("runner-outcome/v1"),
+  runId: z.uuid(),
+  runAttemptCount: z.number().int().positive(),
+  dispatchId: z.string().min(1),
+  workflowId: z.string().min(1),
+  stageId: z.string().min(1),
+  attemptId: z.string().min(1),
+  attemptOrdinal: z.number().int().nonnegative(),
+  agent: z.literal("codex"),
+  model: z.literal("gpt-5.6-sol"),
+  policyVersion: z.literal("routing-v4"),
+  sessionId: z.uuid(),
+  resultKind: z.enum(["success", ...FAILOVER_OUTCOMES, ...TERMINAL_OUTCOMES]),
+}).strict();
+
+export const PrelaunchOutcomeReceiptSchema = RunnerOutcomeReceiptSchema.omit({
+  schemaVersion: true,
+}).extend({
+  schemaVersion: z.literal("prelaunch-outcome/v1"),
+  resultKind: z.enum([...FAILOVER_OUTCOMES, ...TERMINAL_OUTCOMES]),
+}).strict();
+
+export type RunnerOutcomeReceipt = z.infer<typeof RunnerOutcomeReceiptSchema>;
+
+export class RunnerOutcomeEvidenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunnerOutcomeEvidenceError";
+  }
+}
+
+function invalidRunnerOutcomeEvidence(message: string): never {
+  throw new RunnerOutcomeEvidenceError(message);
+}
+
+const asObject = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 
 const effortDecision = (assignment: AttemptAssignment): EffortDecision => ({
   agent: assignment.agent,
@@ -33,30 +78,61 @@ const effortDecision = (assignment: AttemptAssignment): EffortDecision => ({
 });
 
 export class CollaborationRuntime {
-  readonly workflows: CollaborationRunStore;
-  private readonly leases: WorktreeLeaseStore;
+  readonly workflows: Readonly<Pick<CollaborationRunStore, "get" | "recoverable" | "pendingDispatches">>;
+  private readonly workflowStore: CollaborationRunStore;
+  private readonly reviews: RunGateUnitOfWork;
+  private readonly approvals: ApprovalLedger;
+  private readonly admission: ExecutionAdmission;
+  private readonly db: Database.Database;
+  private readonly databasePath: string;
 
   constructor(path: string) {
-    this.workflows = new CollaborationRunStore(path);
-    this.leases = new WorktreeLeaseStore(path);
+    this.databasePath = path;
+    this.db = new Database(path);
+    this.db.pragma("journal_mode = WAL");
+    this.db.pragma("busy_timeout = 5000");
+    this.db.pragma("foreign_keys = ON");
+    this.workflowStore = new CollaborationRunStore(this.db);
+    this.workflows = Object.freeze({
+      get: (workflowId: string) => this.workflowStore.get(workflowId),
+      recoverable: () => this.workflowStore.recoverable(),
+      pendingDispatches: () => this.workflowStore.pendingDispatches(),
+    });
+    this.reviews = new RunGateUnitOfWork(this.db);
+    this.approvals = new ApprovalLedger(this.db);
+    this.admission = new ExecutionAdmission(this.db, this.workflowStore, this.reviews, this.approvals);
   }
 
   createAndStart(
     workflowId: string,
     run: CollaborationRun,
-    now = Date.now(),
+    mapAdmissionsOrNow: readonly MapAdmissionProof[] | number = [],
+    explicitNow = Date.now(),
+    approvalReference?: string,
   ): CollaborationRun {
-    return this.workflows.createStartedIfAbsent(
-      workflowId,
-      run,
-      {
+    const mapAdmissions = Array.isArray(mapAdmissionsOrNow) ? mapAdmissionsOrNow : [];
+    const now = typeof mapAdmissionsOrNow === "number" ? mapAdmissionsOrNow : explicitNow;
+    const admittedRun = this.admission.prepareCandidate(workflowId, run);
+    return this.admission.startAdmittedWorkflow({ workflowId, run: admittedRun, proofs: mapAdmissions,
+      ...(approvalReference ? { approvalReference } : {}),
+      event: {
         type: "BEGIN_STAGE",
         stageId: run.stages[0]!.id,
         now,
         eventId: `${workflowId}:begin:0`,
       },
-      now,
-    );
+      now });
+  }
+
+  prepareCandidate(workflowId: string, run: CollaborationRun): CollaborationRun {
+    return this.admission.prepareCandidate(workflowId, run);
+  }
+
+  reviewTarget(run: CollaborationRun, stageId: string) {
+    const bytes = this.admission.snapshotBytes(run, stageId);
+    const stage = run.stages.find(({ id }) => id === stageId);
+    if (!stage?.executionSnapshot) throw new Error(`execution snapshot is missing for stage: ${stageId}`);
+    return { bytes, binding: structuredClone(stage.executionSnapshot) };
   }
 
   dispatchDisposition(
@@ -64,13 +140,14 @@ export class CollaborationRuntime {
     stageId: string,
     queuedAssignment: AttemptAssignment,
   ): DispatchDisposition {
-    const state = this.workflows.get(workflowId);
+    const state = this.workflowStore.get(workflowId);
     if (!state) return "terminal";
     if (state.completedStageIds.includes(stageId)) return "completed";
     if (
       state.status === "terminal_outcome" ||
-      state.status === "blocked_handoff_conflict" ||
-      state.status === "blocked_retry_exhausted"
+      state.status === "blocked_retry_exhausted" ||
+      state.status === "blocked_policy_upgrade" ||
+      state.status === "blocked_reconciliation"
     ) {
       return "terminal";
     }
@@ -88,14 +165,14 @@ export class CollaborationRuntime {
     return "execute";
   }
 
-  completeStage(
+  private completeStage(
     workflowId: string,
     stageId: string,
     assignment: AttemptAssignment,
     result: unknown,
     now = Date.now(),
   ): CollaborationRun {
-    const current = this.workflows.get(workflowId);
+    const current = this.workflowStore.get(workflowId);
     if (!current) {
       throw new Error(`Unknown collaboration workflow: ${workflowId}`);
     }
@@ -115,7 +192,7 @@ export class CollaborationRuntime {
         stage.id !== stageId &&
         !current.completedStageIds.includes(stage.id),
     );
-    return this.workflows.applyMany(
+    return this.workflowStore.applyMany(
       workflowId,
       [
         {
@@ -139,119 +216,241 @@ export class CollaborationRuntime {
     );
   }
 
-  recordTerminalOutcome(
+  recordRunnerOutcome(
     workflowId: string,
-    assignment: AttemptAssignment,
-    outcome: ProviderOutcome,
+    input: unknown,
     now = Date.now(),
   ): CollaborationRun {
-    const current = this.workflows.get(workflowId);
-    if (!current?.activeStage || !isDeepStrictEqual(current.activeStage.assignment, assignment)) {
-      throw new Error(`Workflow has no active stage: ${workflowId}`);
+    const parsed = RunnerOutcomeReceiptSchema.safeParse(input);
+    if (!parsed.success) {
+      invalidRunnerOutcomeEvidence(`invalid runner receipt: ${parsed.error.message}`);
     }
-    const active = current.activeStage;
-    return this.workflows.apply(
+    const receipt = parsed.data;
+    if (receipt.workflowId !== workflowId) {
+      invalidRunnerOutcomeEvidence("runner receipt workflow mismatch");
+    }
+    const current = this.workflowStore.get(workflowId);
+    const active = current?.activeStage;
+    if (!active || current.status !== "running") {
+      invalidRunnerOutcomeEvidence(`runner receipt has no active workflow stage: ${workflowId}`);
+    }
+    const expectedIdentity = active.assignment;
+    const dispatchIndex = current.dispatches.findIndex(
+      (dispatch) =>
+        dispatch.stageId === active.id &&
+        isDeepStrictEqual(dispatch.assignment, expectedIdentity),
+    );
+    if (dispatchIndex < 0) {
+      invalidRunnerOutcomeEvidence("active attempt has no canonical dispatch");
+    }
+    const expectedDispatchId = `${workflowId}:dispatch:${dispatchIndex}`;
+    if (
+      receipt.dispatchId !== expectedDispatchId ||
+      receipt.stageId !== active.id ||
+      receipt.attemptId !== expectedIdentity.attemptId ||
+      receipt.attemptOrdinal !== expectedIdentity.attemptOrdinal ||
+      receipt.agent !== expectedIdentity.agent ||
+      receipt.model !== expectedIdentity.model ||
+      receipt.policyVersion !== expectedIdentity.policyVersion ||
+      receipt.sessionId !== expectedIdentity.sessionId
+    ) {
+      invalidRunnerOutcomeEvidence("runner receipt does not match the active attempt identity");
+    }
+
+    const runs = new RunStore(this.databasePath);
+    let run: RunRecord | undefined;
+    try {
+      run = runs.get(receipt.runId);
+    } finally {
+      runs.close();
+    }
+    if (
+      !run ||
+      !run.launched ||
+      run.attemptCount !== receipt.runAttemptCount ||
+      run.idempotencyKey !== receipt.dispatchId
+    ) {
+      invalidRunnerOutcomeEvidence("runner receipt does not match a launched durable run");
+    }
+    const launch = asObject(run.launchInfo);
+    if (
+      launch?.phase !== "started" ||
+      !Number.isSafeInteger(launch.pid) ||
+      Number(launch.pid) <= 0 ||
+      launch.agent !== expectedIdentity.agent ||
+      launch.model !== expectedIdentity.model ||
+      launch.effort !== expectedIdentity.effort ||
+      launch.policyVersion !== expectedIdentity.policyVersion ||
+      launch.sessionId !== expectedIdentity.sessionId
+    ) {
+      invalidRunnerOutcomeEvidence("runner receipt does not match exact durable launch evidence");
+    }
+    const expectedStatus = receipt.resultKind === "success" || isFailoverOutcome(receipt.resultKind)
+      ? "completed" : "failed";
+    if (run.status !== expectedStatus) {
+      invalidRunnerOutcomeEvidence("runner receipt lifecycle status mismatch");
+    }
+    const payload = run.payload ?? {};
+    if (
+      payload.workflowId !== workflowId ||
+      payload.workflowStageId !== active.id ||
+      payload.workflowDispatchId !== receipt.dispatchId ||
+      !isDeepStrictEqual(payload.workflowDispatchIdentity, expectedIdentity)
+    ) {
+      invalidRunnerOutcomeEvidence("runner receipt queue payload mismatch");
+    }
+    const envelope = asObject(run.result);
+    const providerResult = asObject(envelope?.providerResult);
+    const effect = asObject(envelope?.effect);
+    if (
+      (envelope?.domainEffect !== "pending" && envelope?.domainEffect !== "applying" &&
+        envelope?.domainEffect !== "applied") ||
+      providerResult?.kind !== receipt.resultKind ||
+      providerResult?.agent !== receipt.agent ||
+      effect?.type !== "workflow" ||
+      effect?.workflowId !== workflowId ||
+      effect?.stageId !== active.id ||
+      effect?.resultKind !== receipt.resultKind ||
+      !isDeepStrictEqual(effect?.assignment, expectedIdentity) ||
+      !isDeepStrictEqual(effect?.runnerReceipt, receipt)
+    ) {
+      invalidRunnerOutcomeEvidence("runner receipt does not match persisted broker evidence");
+    }
+    if (receipt.resultKind === "success") {
+      return this.completeStage(
+        workflowId,
+        active.id,
+        active.assignment,
+        providerResult,
+        now,
+      );
+    }
+    return this.workflowStore.apply(
       workflowId,
       {
         type: "PROVIDER_OUTCOME",
-        eventId: `${workflowId}:terminal:${active.id}:${active.assignment.attemptId}:${outcome.kind}`,
-        agent: active.assignment.agent,
-        outcome,
+        eventId: `${receipt.runId}:${receipt.runAttemptCount}:${receipt.resultKind}`,
+        agent: receipt.agent,
+        outcome: { kind: receipt.resultKind },
         now,
-        handoffEvidence: {
-          checkpoint: {
-            artifactHash: active.artifactHash,
-            headSha: "not-applicable",
-            diffHash: "not-applicable",
-            changedFiles: [],
-            testEvidence: [],
-            sourceSessionId: `workflow:${workflowId}`,
-            approvals: [],
-            nextAction: {
-              kind: "continue_stage",
-              stageId: active.id,
-              instruction: "terminal outcome; do not continue",
-            },
-          },
-          worktreeLease: {
-            path: active.project ?? "",
-            leaseId: "not-applicable",
-            holder: active.assignment.agent,
-            fencingToken: 0,
-          },
-        },
-        observedWorktree: {
-          artifactHash: active.artifactHash,
-          headSha: "not-applicable",
-          diffHash: "not-applicable",
-          leaseId: "not-applicable",
-          fencingToken: 0,
-        },
       },
       now,
     );
   }
 
-  recordProviderOutcome(
+  recordProviderHealth(
     workflowId: string,
-    input: {
-      from: ActiveAgentId;
-      outcome: ProviderOutcome;
-      health: ProviderHealthSnapshot;
-      checkpoint: CheckpointEvidence;
-      lease: {
-        worktreePath: string;
-        leaseId: string;
-        holder: ActiveAgentId;
-        fencingToken: number;
-      };
-      observed: ObservedWorktree;
-      assignment: AttemptAssignment;
-      outcomeEventId: string;
-    },
+    agent: ActiveAgentId,
+    health: ProviderHealth,
     now = Date.now(),
   ): CollaborationRun {
-    const current = this.workflows.get(workflowId);
-    if (
-      !current?.activeStage ||
-      current.activeStage.assignment.agent !== input.from ||
-      !isDeepStrictEqual(current.activeStage.assignment, input.assignment)
-    ) {
-      throw new Error(
-        "failover source does not match the active workflow assignment",
-      );
-    }
-    return this.workflows.applyMany(
+    return this.workflowStore.apply(
       workflowId,
-      [
-        {
-          type: "PROVIDER_HEALTH_CHANGED",
-          agent: "grok",
-          health: input.health.grok,
-        },
-        {
-          type: "PROVIDER_HEALTH_CHANGED",
-          agent: "codex",
-          health: input.health.codex,
-        },
+      { type: "PROVIDER_HEALTH_CHANGED", agent, health },
+      now,
+    );
+  }
+
+  retryBlockedStage(workflowId: string, now = Date.now()): CollaborationRun {
+    const current = this.workflowStore.get(workflowId);
+    if (!current?.recovery || current.pendingStageId === null) {
+      throw new Error("workflow is not awaiting a broker-controlled retry");
+    }
+    return this.workflowStore.apply(
+      workflowId,
+      {
+        type: "RECOVERY_TIMER_FIRED",
+        eventId: `${workflowId}:retry:${current.recovery.attempt}:${current.recovery.nextRetryAt}`,
+        now,
+      },
+      now,
+    );
+  }
+
+  blockRunnerReconciliation(
+    workflowId: string,
+    stageId: string,
+    runId: string,
+    now = Date.now(),
+  ): CollaborationRun {
+    return this.workflowStore.apply(
+      workflowId,
+      {
+        type: "BROKER_RECONCILIATION_REQUIRED",
+        eventId: `${runId}:reconciliation-required`,
+        stageId,
+        runId,
+      },
+      now,
+    );
+  }
+
+  recordPrelaunchOutcome(
+    workflowId: string,
+    input: unknown,
+    now = Date.now(),
+  ): CollaborationRun {
+    const parsed = PrelaunchOutcomeReceiptSchema.safeParse(input);
+    if (!parsed.success) invalidRunnerOutcomeEvidence(`invalid prelaunch receipt: ${parsed.error.message}`);
+    const receipt = parsed.data;
+    const current = this.workflowStore.get(workflowId);
+    const active = current?.activeStage;
+    if (!current || !active || current.status !== "running" || receipt.workflowId !== workflowId) {
+      invalidRunnerOutcomeEvidence("prelaunch receipt has no matching active workflow stage");
+    }
+    const dispatchIndex = current.dispatches.findIndex((dispatch) =>
+      dispatch.stageId === active.id && isDeepStrictEqual(dispatch.assignment, active.assignment));
+    const expectedDispatchId = `${workflowId}:dispatch:${dispatchIndex}`;
+    if (dispatchIndex < 0 || receipt.dispatchId !== expectedDispatchId || receipt.stageId !== active.id ||
+        receipt.attemptId !== active.assignment.attemptId ||
+        receipt.attemptOrdinal !== active.assignment.attemptOrdinal ||
+        receipt.agent !== active.assignment.agent || receipt.model !== active.assignment.model ||
+        receipt.policyVersion !== active.assignment.policyVersion ||
+        receipt.sessionId !== active.assignment.sessionId) {
+      invalidRunnerOutcomeEvidence("prelaunch receipt does not match the active dispatch identity");
+    }
+    const runs = new RunStore(this.databasePath);
+    let run: RunRecord | undefined;
+    try { run = runs.get(receipt.runId); } finally { runs.close(); }
+    const expectedStatus = isFailoverOutcome(receipt.resultKind) ? "completed" : "failed";
+    const envelope = asObject(run?.result);
+    const providerResult = asObject(envelope?.providerResult);
+    const effect = asObject(envelope?.effect);
+    if (!run || run.launched || run.attemptCount !== receipt.runAttemptCount ||
+        run.idempotencyKey !== receipt.dispatchId || run.status !== expectedStatus ||
+        run.payload?.workflowId !== workflowId || run.payload.workflowStageId !== active.id ||
+        run.payload.workflowDispatchId !== receipt.dispatchId ||
+        !isDeepStrictEqual(run.payload.workflowDispatchIdentity, active.assignment) ||
+        (envelope?.domainEffect !== "pending" && envelope?.domainEffect !== "applying" &&
+          envelope?.domainEffect !== "applied") ||
+        providerResult?.kind !== receipt.resultKind || providerResult.agent !== receipt.agent ||
+        effect?.type !== "workflow_dispatch_rejected" || effect.workflowId !== workflowId ||
+        effect.stageId !== active.id || effect.runId !== receipt.runId ||
+        effect.reason !== receipt.resultKind || !isDeepStrictEqual(effect.prelaunchReceipt, receipt)) {
+      invalidRunnerOutcomeEvidence("prelaunch receipt does not match exact durable broker evidence");
+    }
+    if (isFailoverOutcome(receipt.resultKind)) {
+      return this.workflowStore.apply(
+        workflowId,
         {
           type: "PROVIDER_OUTCOME",
-          eventId: `${workflowId}:failover:${current.activeStage.id}:${current.activeStage.assignment.attemptId}:${input.from}:${input.outcome.kind}:${input.outcomeEventId}`,
-          agent: input.from,
-          outcome: input.outcome,
+          eventId: `${receipt.runId}:dispatch-provider-unavailable`,
+          agent: active.assignment.agent,
+          outcome: { kind: receipt.resultKind },
           now,
-          handoffEvidence: {
-            checkpoint: input.checkpoint,
-            worktreeLease: {
-              path: input.lease.worktreePath,
-              leaseId: input.lease.leaseId,
-              holder: input.lease.holder,
-              fencingToken: input.lease.fencingToken,
-            },
-          },
-          observedWorktree: input.observed,
         },
-      ],
+        now,
+      );
+    }
+    return this.workflowStore.apply(
+      workflowId,
+      {
+        type: "BROKER_DISPATCH_REJECTED",
+        eventId: `${receipt.runId}:dispatch-rejected`,
+        stageId: active.id,
+        runId: receipt.runId,
+        reason: receipt.resultKind,
+      },
       now,
     );
   }
@@ -281,10 +480,34 @@ export class CollaborationRuntime {
 
   drainDispatchOutbox(runs: RunStore, now = Date.now()): number {
     let published = 0;
-    for (const item of this.workflows.pendingDispatches()) {
-      const stage = item.stage;
-      if (!stage.project || !stage.prompt || !stage.requester) {
-        throw new Error("workflow dispatch lacks execution context");
+    for (const candidate of this.workflowStore.pendingDispatchCandidates()) {
+      if ("error" in candidate) {
+        this.workflowStore.quarantineDispatch(candidate, candidate.error, now);
+        continue;
+      }
+      const item = candidate.value;
+      let stage: ActiveStage;
+      try {
+        stage = item.stage;
+        if (item.dispatchId !== candidate.dispatchId || item.workflowId !== candidate.workflowId) {
+          throw new Error("outbox payload conflicts with its durable row identity");
+        }
+        const durable = this.workflowStore.get(item.workflowId);
+        const index = Number(item.dispatchId.slice(item.dispatchId.lastIndexOf(":") + 1));
+        const dispatch = Number.isSafeInteger(index) ? durable?.dispatches[index] : undefined;
+        const definition = dispatch ? durable?.stages.find(({ id }) => id === dispatch.stageId) : undefined;
+        if (!durable || !dispatch || !definition || !isDeepStrictEqual(item.dispatch, dispatch) ||
+            !isDeepStrictEqual(stage, { ...definition, assignment: dispatch.assignment })) {
+          throw new Error("outbox payload conflicts with durable workflow snapshot");
+        }
+        this.admission.assertDispatch(item.workflowId, durable, stage.id, stage.assignment.agent);
+      } catch (error) {
+        this.workflowStore.quarantineDispatch(
+          candidate,
+          error instanceof Error ? error.message : String(error),
+          now,
+        );
+        continue;
       }
       const dispatchIndex = Number(
         item.dispatchId.slice(item.dispatchId.lastIndexOf(":") + 1),
@@ -295,71 +518,23 @@ export class CollaborationRuntime {
               `${item.workflowId}:dispatch:${dispatchIndex - 1}`,
             )
           : undefined;
-      let handoffLease;
-      if (item.handoff) {
-        const expected = item.handoff.releasedLease;
-        const transferred = this.leases.transferImmediate({
-          worktreePath: expected.path,
-          expectedLeaseId: expected.leaseId,
-          expectedFencingToken: expected.fencingToken,
-          from: item.handoff.from,
-          to: item.handoff.to,
-          now,
-          ttlMs: 31 * 60_000,
-          evidence: item.handoff.evidence,
-          allowAlreadyTransferred: true,
-        });
-        if (transferred.status !== "transferred") {
-          this.workflows.apply(
-            item.workflowId,
-            {
-              type: "HANDOFF_TRANSFER_CONFLICT",
-              eventId: `${item.dispatchId}:lease-transfer-fenced`,
-              stageId: stage.id,
-              expectedFencingToken: expected.fencingToken,
-              currentFencingToken: transferred.currentFencingToken,
-            },
-            now,
-          );
-          this.workflows.markPublished(item.dispatchId, now);
-          continue;
-        }
-        handoffLease = transferred.lease;
-      }
-      const handoffPrompt = item.handoff
-        ? `VERIFIED HANDOFF PACKET (do not widen authority):\n${JSON.stringify(item.handoff.evidence)}\n\n${stage.prompt}`
-        : stage.prompt;
       const payload: Record<string, unknown> = {
         requester: stage.requester,
         preferredAgent: stage.assignment.agent,
         project: stage.project,
-        prompt: handoffPrompt,
+        prompt: stage.prompt,
+        sourceFingerprint: stage.sourceFingerprint,
+        mapLearning: structuredClone(stage.mapLearning),
         approvalScope: stage.approvalScope,
         decision: effortDecision(stage.assignment),
         sessionId: stage.assignment.sessionId,
         workflowDispatchIdentity: structuredClone(stage.assignment),
-        ...(stage.approvalReference
-          ? { approvalReference: stage.approvalReference }
+        workflowDispatchId: item.dispatchId,
+        executionSnapshot: structuredClone(stage.executionSnapshot),
+        ...(stage.authorizationConsumerKey
+          ? { authorizationConsumerKey: stage.authorizationConsumerKey }
           : {}),
-        allowFallback: !item.handoff,
-        ...(handoffLease ? { handoffLease } : {}),
-        ...(item.handoff &&
-        typeof (
-          item.handoff.evidence.checkpoint as CheckpointEvidence & {
-            workspaceFingerprint?: string;
-          }
-        ).workspaceFingerprint === "string"
-          ? {
-              expectedCheckpoint: {
-                workspaceFingerprint: (
-                  item.handoff.evidence.checkpoint as CheckpointEvidence & {
-                    workspaceFingerprint: string;
-                  }
-                ).workspaceFingerprint,
-                artifactHash: item.handoff.evidence.checkpoint.artifactHash,
-              },
-            }
-          : {}),
+        allowFallback: false,
         workflowId: item.workflowId,
         workflowStageId: stage.id,
       };
@@ -371,24 +546,36 @@ export class CollaborationRuntime {
         payload,
         ...(predecessor ? { dependsOnRunId: predecessor.id } : {}),
       };
-      const existing = runs.getByIdempotencyKey(item.dispatchId);
-      if (existing) {
-        this.assertQueueReplay(existing, expected);
-      } else {
-        const enqueued = runs.enqueue({
-          idempotencyKey: item.dispatchId,
-          ...expected,
-        });
-        this.assertQueueReplay(enqueued, expected);
+      try {
+        const existing = runs.getByIdempotencyKey(item.dispatchId);
+        if (existing) {
+          this.assertQueueReplay(existing, expected);
+        } else {
+          const enqueued = runs.enqueue({
+            idempotencyKey: item.dispatchId,
+            ...expected,
+          });
+          this.assertQueueReplay(enqueued, expected);
+        }
+      } catch (error) {
+        if (/database is (?:busy|locked)|SQLITE_BUSY|SQLITE_LOCKED/i.test(String(error))) throw error;
+          this.workflowStore.quarantineDispatch(
+            candidate,
+            error instanceof Error ? error.message : String(error),
+            now,
+          );
+          continue;
       }
-      this.workflows.markPublished(item.dispatchId, now);
+      this.workflowStore.markPublished(item.dispatchId, now);
       published += 1;
     }
     return published;
   }
 
   close(): void {
-    this.workflows.close();
-    this.leases.close();
+    this.workflowStore.close();
+    this.reviews.close();
+    this.approvals.close();
+    this.db.close();
   }
 }

@@ -29,6 +29,12 @@ export interface ApprovalRequest {
   consumerKey?: string;
 }
 
+export interface ApprovalConsumptionRequest {
+  consumerKey: string;
+  project: string;
+  scope: Exclude<ApprovalScope, "workspace-read">;
+}
+
 interface StoredApproval {
   expires_at: number;
   max_uses: number;
@@ -45,30 +51,23 @@ function requireTime(value: number, field: string): void {
 
 export class ApprovalLedger {
   private readonly db: Database.Database;
+  private readonly ownsDatabase: boolean;
 
-  constructor(path: string) {
-    this.db = new Database(path);
-    if (path !== ":memory:") chmodSync(path, 0o600);
+  constructor(pathOrDatabase: string | Database.Database) {
+    this.ownsDatabase = typeof pathOrDatabase === "string";
+    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
+    if (typeof pathOrDatabase === "string" && pathOrDatabase !== ":memory:") chmodSync(pathOrDatabase, 0o600);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS approval_grants (
-        reference TEXT NOT NULL,
-        project TEXT NOT NULL,
-        scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
-        expires_at INTEGER NOT NULL,
-        max_uses INTEGER NOT NULL CHECK (max_uses > 0),
-        used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0 AND used_count <= max_uses),
-        PRIMARY KEY (reference, project, scope)
-      );
-      CREATE TABLE IF NOT EXISTS approval_consumptions (
-        consumer_key TEXT PRIMARY KEY,
-        reference TEXT NOT NULL,
-        project TEXT NOT NULL,
-        scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
-        consumed_at INTEGER NOT NULL
-      );
-    `);
+    const grants = new Set((this.db.prepare("PRAGMA table_info(approval_grants)").all() as Array<{ name: string }>)
+      .map(({ name }) => name));
+    const consumptions = new Set((this.db.prepare("PRAGMA table_info(approval_consumptions)").all() as Array<{ name: string }>)
+      .map(({ name }) => name));
+    if (!["reference", "project", "scope", "expires_at", "max_uses", "used_count"].every((name) => grants.has(name)) ||
+        !["consumer_key", "reference", "project", "scope", "consumed_at"].every((name) => consumptions.has(name))) {
+      if (this.ownsDatabase) this.db.close();
+      throw new Error("approval ledger requires current migration-owned schema");
+    }
   }
 
   issue(input: ApprovalGrant): void {
@@ -155,8 +154,51 @@ export class ApprovalLedger {
     return consume.immediate();
   }
 
+  validate(input: ApprovalRequest): ApprovalValidation {
+    requireNonempty(input.reference, "reference");
+    requireNonempty(input.project, "project");
+    const now = input.now ?? Date.now();
+    requireTime(now, "now");
+    if (input.consumerKey) {
+      requireNonempty(input.consumerKey, "consumerKey");
+      const prior = this.db.prepare(`SELECT reference,project,scope FROM approval_consumptions
+        WHERE consumer_key=?`).get(input.consumerKey) as {
+          reference: string;
+          project: string;
+          scope: ApprovalScope;
+        } | undefined;
+      if (prior) {
+        if (prior.reference !== input.reference || prior.project !== input.project || prior.scope !== input.scope) {
+          throw new Error("approval consumer key conflicts with a different authority request");
+        }
+        return { allowed: true, remainingUses: 0 };
+      }
+    }
+    const approval = this.db.prepare(`SELECT expires_at, max_uses, used_count
+      FROM approval_grants WHERE reference=? AND project=? AND scope=?`).get(
+        input.reference,
+        input.project,
+        input.scope,
+      ) as StoredApproval | undefined;
+    if (!approval) return this.mismatchReason(input);
+    if (now >= approval.expires_at) return { allowed: false, reason: "expired" };
+    if (approval.used_count >= approval.max_uses) return { allowed: false, reason: "exhausted" };
+    return { allowed: true, remainingUses: approval.max_uses - approval.used_count };
+  }
+
+  hasConsumption(input: ApprovalConsumptionRequest): boolean {
+    requireNonempty(input.consumerKey, "consumerKey");
+    requireNonempty(input.project, "project");
+    const stored = this.db.prepare(`SELECT project,scope FROM approval_consumptions
+      WHERE consumer_key=?`).get(input.consumerKey) as {
+        project: string;
+        scope: ApprovalScope;
+      } | undefined;
+    return stored?.project === input.project && stored.scope === input.scope;
+  }
+
   close(): void {
-    this.db.close();
+    if (this.ownsDatabase) this.db.close();
   }
 
   private mismatchReason(input: ApprovalRequest): ApprovalValidation {

@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "pcm-semantic-equivalence", "weight": 45, "hardGate": true, "evaluator": "hidden-pcm-equivalence" },
+    { "id": "provider-engine-regressions", "weight": 20, "hardGate": true, "command": ["bash", "-lc", "PYTHONPATH=sidecar /usr/bin/python3 -m pytest -q sidecar/tests/test_provider_engine.py"] },
+    { "id": "relative-performance", "weight": 25, "hardGate": false, "evaluator": "paired-local-microbenchmark" },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

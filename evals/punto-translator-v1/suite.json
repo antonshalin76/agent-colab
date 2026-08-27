@@ -1,0 +1,417 @@
+{
+  "id": "punto-translator-v1",
+  "mode": "full",
+  "seed": 20260824,
+  "baselinePolicy": {
+    "coordination": "codex",
+    "planning": "grok",
+    "plan_audit": "codex",
+    "plan_critic": "codex",
+    "prd": "grok",
+    "prd_audit": "codex",
+    "prd_critic": "codex",
+    "architecture": "codex",
+    "architecture_audit": "codex",
+    "architecture_critic": "codex",
+    "ui_ux": "grok",
+    "bdd": "grok",
+    "tdd_coding": "codex",
+    "unit_testing": "codex",
+    "e2e_infrastructure": "codex",
+    "e2e_testing": "grok",
+    "test_audit": "codex",
+    "test_critic": "codex",
+    "code_audit": "codex",
+    "code_critic": "codex",
+    "code_review": "codex"
+  },
+  "efforts": [
+    "medium",
+    "high",
+    "xhigh"
+  ],
+  "repetitions": 4,
+  "cases": [
+    {
+      "id": "PUNTO-REF-01",
+      "repository": "punto",
+      "category": "refactor",
+      "runnable": false,
+      "source": {
+        "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7",
+        "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7"
+      },
+      "task": {
+        "stageFamily": "architecture",
+        "promptHash": "746721a798923f128faa413db1dbad87f4c3ecf5750ad0b2f5acd545c2548321",
+        "taskImageHash": "ff5aa75a66fc2149868f48bfb99e9ea702dedfd51f8670daa1ac2a2ecd396b11",
+        "oracleHash": "7f7e32654f8024cd51ea8fea605e803c11dc5add27ed905dc7472d6c97b45b9c"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "characterized-config-behavior",
+            "weight": 35,
+            "hardGate": true,
+            "command": [
+              "bash",
+              "-lc",
+              "cmake -S cpp -B build-eval -DBUILD_TRAY=OFF -DCMAKE_BUILD_TYPE=Debug && cmake --build build-eval -j2 && ctest --test-dir build-eval --output-on-failure"
+            ]
+          },
+          {
+            "id": "single-parser-owner",
+            "weight": 35,
+            "hardGate": false,
+            "evaluator": "single-config-parser-owner"
+          },
+          {
+            "id": "maintained-code-reduction",
+            "weight": 20,
+            "hardGate": false,
+            "evaluator": "owned-surface-delta"
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "PUNTO-REL-02",
+      "repository": "punto",
+      "category": "reliability",
+      "runnable": false,
+      "source": {
+        "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7",
+        "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7"
+      },
+      "task": {
+        "stageFamily": "tdd_coding",
+        "promptHash": "3e172c7bd6a3a82f28af921d9f33770d937a5c418595a3a3fd0de91a5c5fcf9b",
+        "taskImageHash": "829202ecd260e6811f43470e4eced4dcfe911ee8c73d4a2cb530dd7aeea16fcf",
+        "oracleHash": "81cedfb751b1182da8378d01b9fab287d83a49c52744500123db14570afcee0d"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "slow-client-isolation",
+            "weight": 35,
+            "hardGate": true,
+            "evaluator": "hidden-ipc-slow-client"
+          },
+          {
+            "id": "bounded-shutdown",
+            "weight": 25,
+            "hardGate": true,
+            "evaluator": "hidden-ipc-shutdown-bound"
+          },
+          {
+            "id": "ipc-regression-suite",
+            "weight": 30,
+            "hardGate": true,
+            "command": [
+              "bash",
+              "-lc",
+              "cmake -S cpp -B build-eval -DBUILD_TRAY=OFF -DCMAKE_BUILD_TYPE=Debug && cmake --build build-eval -j2 && ctest --test-dir build-eval --output-on-failure"
+            ]
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "PUNTO-BUG-03",
+      "repository": "punto",
+      "category": "bug",
+      "runnable": true,
+      "source": {
+        "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7",
+        "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7"
+      },
+      "task": {
+        "stageFamily": "tdd_coding",
+        "promptHash": "053d612d10f8facebd7a48d666884d7d22b9f158bb983c42670b9eed12d30090",
+        "taskImageHash": "ed031ebbf1e3c6c3ebcd399b16ed0355bf2d2f2edd3534a0a3110f912fa967d5",
+        "oracleHash": "6a7ea2fcbf0b9b5575b122736cf4e31dcb86d7db0363013add6c9c8fb101be04"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "strict-command-grammar",
+            "weight": 45,
+            "hardGate": true,
+            "evaluator": "hidden-ipc-command-grammar"
+          },
+          {
+            "id": "valid-command-compatibility",
+            "weight": 25,
+            "hardGate": true,
+            "evaluator": "hidden-ipc-valid-commands"
+          },
+          {
+            "id": "project-regression-suite",
+            "weight": 20,
+            "hardGate": true,
+            "command": [
+              "bash",
+              "-lc",
+              "cmake -S cpp -B build-eval -DBUILD_TRAY=OFF -DCMAKE_BUILD_TYPE=Debug && cmake --build build-eval -j2 && ctest --test-dir build-eval --output-on-failure"
+            ]
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "PUNTO-OPT-04",
+      "repository": "punto",
+      "category": "optimization",
+      "runnable": false,
+      "source": {
+        "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7",
+        "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7"
+      },
+      "task": {
+        "stageFamily": "tdd_coding",
+        "promptHash": "01460dbd23aef81ebbfc3a428b774ca52bda9b6774d92b6f4336ba2152ea788b",
+        "taskImageHash": "9588af3e10e6c2475fa74451c85163049a16f5a92c1675ac90db556717fa07c3",
+        "oracleHash": "4551ec5a5cdef886d8646fdde6ab7167d3c045fe26894f1d5dd8c08632eeef00"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "semantic-equivalence",
+            "weight": 45,
+            "hardGate": true,
+            "evaluator": "hidden-edit-distance-equivalence"
+          },
+          {
+            "id": "linear-auxiliary-memory",
+            "weight": 25,
+            "hardGate": true,
+            "evaluator": "edit-distance-memory-shape"
+          },
+          {
+            "id": "relative-performance",
+            "weight": 20,
+            "hardGate": false,
+            "evaluator": "paired-local-microbenchmark"
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "TR-REF-01",
+      "repository": "translator",
+      "category": "refactor",
+      "runnable": false,
+      "source": {
+        "revision": "9291e8beafee3e02aaa179178ce460ac9e6c6de2",
+        "treeHash": "0101731159d8d745a230869e8bc2fb55bb57d0b5"
+      },
+      "task": {
+        "stageFamily": "architecture",
+        "promptHash": "61aef649fabdf0aea520af61cbca014f2856a6fe49e633d1e515ae8a591f755d",
+        "taskImageHash": "bf24f793c2a7328a3bcda40909499463854f500af2d0ada2cd376e9af275c76f",
+        "oracleHash": "14270b7fa808bce35b3c0968efff30f7c0049905f3636c9e0ace56bd4e8dbb26"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "source-commit-regressions",
+            "weight": 35,
+            "hardGate": true,
+            "command": [
+              "bash",
+              "-lc",
+              "PYTHONPATH=sidecar /usr/bin/python3 -m pytest -q sidecar/tests/test_source_commit.py"
+            ]
+          },
+          {
+            "id": "sync-async-equivalence",
+            "weight": 25,
+            "hardGate": true,
+            "evaluator": "hidden-source-commit-equivalence"
+          },
+          {
+            "id": "single-transition-owner",
+            "weight": 25,
+            "hardGate": false,
+            "evaluator": "source-commit-structure"
+          },
+          {
+            "id": "scope",
+            "weight": 15,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "TR-REL-01",
+      "repository": "translator",
+      "category": "reliability",
+      "runnable": false,
+      "source": {
+        "revision": "da5ec54a519e9d55855f7518c5c89ed7c9a23fbf",
+        "treeHash": "2dc1c5dcdc08d72a73888a9aafce9a405c6ca97d"
+      },
+      "task": {
+        "stageFamily": "tdd_coding",
+        "promptHash": "d849eb25a8796988c23f01b653c8be0c3633ad76b271fbb20618cb70fb3560b0",
+        "taskImageHash": "81c4c67d4c2593c5133558bafb6a1e09d918a765e6879b997b6654ef50ae2251",
+        "oracleHash": "342c28b1ed2eb335188b980ed6138fff7f3d77433f5a1f4a890f722b470fe14a"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "degraded-graph-self-heals",
+            "weight": 35,
+            "hardGate": true,
+            "evaluator": "hidden-audio-graph-recovery"
+          },
+          {
+            "id": "stopped-bypass-audible",
+            "weight": 25,
+            "hardGate": true,
+            "evaluator": "hidden-stopped-bypass"
+          },
+          {
+            "id": "daemon-regressions",
+            "weight": 30,
+            "hardGate": true,
+            "command": [
+              "cargo",
+              "test",
+              "-p",
+              "translator-daemon"
+            ]
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "TR-BUG-01",
+      "repository": "translator",
+      "category": "bug",
+      "runnable": true,
+      "source": {
+        "revision": "9291e8beafee3e02aaa179178ce460ac9e6c6de2",
+        "treeHash": "0101731159d8d745a230869e8bc2fb55bb57d0b5"
+      },
+      "task": {
+        "stageFamily": "tdd_coding",
+        "promptHash": "47583816742bf72dda67fcb5c6259704546f4b02314e6ffb537430115b6ded08",
+        "taskImageHash": "74fe1dd4049040bdc85acd9472f1040555a9083b2e31d8e25d2bb3fb5d615266",
+        "oracleHash": "8af68a5bb9d566c22ac343ad894fdaad11e13831a69ca0efa098cfbd27b28da5"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "terminal-identity-released",
+            "weight": 45,
+            "hardGate": true,
+            "evaluator": "hidden-terminal-identity-capacity"
+          },
+          {
+            "id": "terminal-semantics-preserved",
+            "weight": 25,
+            "hardGate": true,
+            "evaluator": "hidden-terminal-tombstones"
+          },
+          {
+            "id": "provider-engine-regressions",
+            "weight": 20,
+            "hardGate": true,
+            "command": [
+              "bash",
+              "-lc",
+              "PYTHONPATH=sidecar /usr/bin/python3 -m pytest -q sidecar/tests/test_provider_engine.py"
+            ]
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "TR-OPT-01",
+      "repository": "translator",
+      "category": "optimization",
+      "runnable": false,
+      "source": {
+        "revision": "9291e8beafee3e02aaa179178ce460ac9e6c6de2",
+        "treeHash": "0101731159d8d745a230869e8bc2fb55bb57d0b5"
+      },
+      "task": {
+        "stageFamily": "tdd_coding",
+        "promptHash": "94bf06cdb57ba5d04bb3e3cffd3f85e8098cb35869af5d4280da0ecd2d729dde",
+        "taskImageHash": "0d1891b5a6982f38c75532fc03297ae4583e7c0572ef41ad8bc7493cecb2ffd0",
+        "oracleHash": "4e943bb7e8f90e6c6d8c8c9c6a8c6f297a0ea91a8ed4f167db7024e69076873c"
+      },
+      "rubric": {
+        "checks": [
+          {
+            "id": "pcm-semantic-equivalence",
+            "weight": 45,
+            "hardGate": true,
+            "evaluator": "hidden-pcm-equivalence"
+          },
+          {
+            "id": "provider-engine-regressions",
+            "weight": 20,
+            "hardGate": true,
+            "command": [
+              "bash",
+              "-lc",
+              "PYTHONPATH=sidecar /usr/bin/python3 -m pytest -q sidecar/tests/test_provider_engine.py"
+            ]
+          },
+          {
+            "id": "relative-performance",
+            "weight": 25,
+            "hardGate": false,
+            "evaluator": "paired-local-microbenchmark"
+          },
+          {
+            "id": "scope",
+            "weight": 10,
+            "hardGate": false,
+            "evaluator": "expected-files-only"
+          }
+        ]
+      }
+    }
+  ]
+}

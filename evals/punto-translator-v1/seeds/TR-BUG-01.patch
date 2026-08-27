@@ -1,0 +1,12 @@
+diff --git a/sidecar/translator_sidecar/provider_engine.py b/sidecar/translator_sidecar/provider_engine.py
+index 7f0ea93..6b25103 100644
+--- a/sidecar/translator_sidecar/provider_engine.py
++++ b/sidecar/translator_sidecar/provider_engine.py
+@@ -537,7 +537,6 @@ class ProviderEngine:
+         self._remove_utterance_input(session, utterance_id)
+         self._remove_utterance_output(session, utterance_id)
+         session.utterance_end_received.discard(utterance_id)
+-        session.utterance_streams.pop(utterance_id, None)
+         session.next_audio_sequence.pop(utterance_id, None)
+         session.last_emitted_audio_sequence.pop(utterance_id, None)
+         session.terminal_utterances.add(utterance_id)

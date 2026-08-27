@@ -11,6 +11,8 @@ import {
   type Stage,
   type StageRole,
 } from "../domain/routing.js";
+import type { MapLearningLaunchBinding } from "../flow/map-admin.js";
+import type { ExecutionSnapshotBinding } from "../flow/execution-snapshot.js";
 
 export interface StageDefinition {
   id: string;
@@ -26,7 +28,10 @@ export interface StageDefinition {
   project?: string;
   prompt?: string;
   requester?: ActiveAgentId;
-  approvalReference?: string;
+  sourceFingerprint?: string;
+  authorizationConsumerKey?: string;
+  mapLearning: MapLearningLaunchBinding;
+  executionSnapshot?: ExecutionSnapshotBinding;
 }
 
 export interface AttemptAssignment extends EffortDecision {
@@ -35,61 +40,13 @@ export interface AttemptAssignment extends EffortDecision {
   sessionId: string;
 }
 
+export type PersistedRoutingPolicyVersion =
+  | "routing-v2"
+  | "routing-v3"
+  | typeof ROUTING_POLICY_VERSION;
+
 export interface ActiveStage extends StageDefinition {
   assignment: AttemptAssignment;
-}
-
-export interface WorktreeLeaseEvidence {
-  path: string;
-  leaseId: string;
-  holder: ActiveAgentId;
-  fencingToken: number;
-}
-
-export interface CheckpointEvidence {
-  artifactHash: string;
-  headSha: string;
-  diffHash: string;
-  changedFiles: string[];
-  testEvidence: Array<{ command: string; exitCode: number }>;
-  sourceSessionId: string;
-  approvals: Array<{
-    approvalId: string;
-    grantedBy: string;
-    scope: ApprovalScope;
-    grantedAt: number;
-  }>;
-  nextAction: {
-    kind: "continue_stage";
-    stageId: string;
-    instruction: string;
-  };
-}
-
-export interface HandoffEvidence {
-  checkpoint: CheckpointEvidence;
-  worktreeLease: WorktreeLeaseEvidence;
-}
-
-export interface ObservedWorktree {
-  artifactHash: string;
-  headSha: string;
-  diffHash: string;
-  leaseId: string;
-  fencingToken: number;
-}
-
-interface HandoffRecord {
-  eventId: string;
-  from: ActiveAgentId;
-  to: ActiveAgentId;
-  role: StageRole;
-  approvalScope: ApprovalScope;
-  artifactHash: string;
-  idempotencyKey: string;
-  evidence: HandoffEvidence;
-  releasedLease: WorktreeLeaseEvidence;
-  acquiredLease: WorktreeLeaseEvidence;
 }
 
 export interface DispatchRecord {
@@ -97,7 +54,6 @@ export interface DispatchRecord {
   assignment: AttemptAssignment;
   approvalScope: ApprovalScope;
   idempotencyKey: string;
-  handoffEventId?: string;
 }
 
 export interface FailedAttemptRecord {
@@ -121,7 +77,7 @@ interface RecoveryState {
 export interface CollaborationRun {
   taskId: string;
   origin: ActiveAgentId;
-  policyVersion: typeof ROUTING_POLICY_VERSION;
+  policyVersion: PersistedRoutingPolicyVersion;
   health: ProviderHealthSnapshot;
   stages: StageDefinition[];
   status:
@@ -131,14 +87,14 @@ export interface CollaborationRun {
     | "blocked_stage_order"
     | "blocked_no_provider"
     | "blocked_retry_exhausted"
-    | "blocked_handoff_conflict"
+    | "blocked_policy_upgrade"
+    | "blocked_reconciliation"
     | "terminal_outcome";
   activeStage: ActiveStage | null;
   pendingStageId: string | null;
   blockedReason?: string;
   terminalOutcome?: ProviderOutcome;
   conflict?: Record<string, unknown>;
-  handoffs: HandoffRecord[];
   dispatches: DispatchRecord[];
   failedAttempts: FailedAttemptRecord[];
   completedStageIds: string[];
@@ -170,6 +126,8 @@ const coordinationStage = (
   systemGenerated: true,
   ...(first.project ? { project: first.project } : {}),
   ...(first.requester ? { requester: first.requester } : {}),
+  ...(first.sourceFingerprint ? { sourceFingerprint: first.sourceFingerprint } : {}),
+  mapLearning: structuredClone(first.mapLearning),
   ...(first.prompt
     ? {
         prompt: `Coordinate the delegated ${first.kind} stage before execution. ${first.prompt}`,
@@ -188,6 +146,9 @@ export function createCollaborationRun(input: {
   if (input.stages.length === 0) {
     throw new Error("A collaboration run requires at least one stage");
   }
+  if (input.stages.some((stage) => stage.mapLearning === undefined)) {
+    throw new Error("Every collaboration stage requires an exact durable MAP learning snapshot");
+  }
   const stages = input.stages.map((item) => structuredClone(item));
   if (stages[0]!.kind !== "coordination") {
     stages.unshift(coordinationStage(input.taskId, stages[0]!));
@@ -202,7 +163,6 @@ export function createCollaborationRun(input: {
     status: input.health === undefined ? "probing" : "ready",
     activeStage: null,
     pendingStageId: null,
-    handoffs: [],
     dispatches: [],
     failedAttempts: [],
     completedStageIds: [],
@@ -273,15 +233,11 @@ const assignmentFor = (
   };
 };
 
-const dispatchRecord = (
-  active: ActiveStage,
-  handoffEventId?: string,
-): DispatchRecord => ({
+const dispatchRecord = (active: ActiveStage): DispatchRecord => ({
   stageId: active.id,
   assignment: structuredClone(active.assignment),
   approvalScope: active.approvalScope,
   idempotencyKey: active.idempotencyKey,
-  ...(handoffEventId ? { handoffEventId } : {}),
 });
 
 const isNoProviderError = (error: unknown): boolean =>
@@ -320,7 +276,7 @@ const startStage = (
   } catch (error) {
     if (!isNoProviderError(error)) throw error;
     next.status = "blocked_no_provider";
-    next.blockedReason = "no_healthy_provider";
+    next.blockedReason = "codex_stage_owner_unavailable";
     next.activeStage = null;
     next.pendingStageId = stageId;
     next.recovery ??= {
@@ -362,19 +318,23 @@ export type WorkflowEvent =
     }
   | { type: "RECOVERY_TIMER_FIRED"; eventId: string; now: number }
   | {
-      type: "HANDOFF_TRANSFER_CONFLICT";
+      type: "BROKER_RECONCILIATION_REQUIRED";
       eventId: string;
       stageId: string;
-      expectedFencingToken: number;
-      currentFencingToken: number;
+      runId: string;
+    }
+  | {
+      type: "BROKER_DISPATCH_REJECTED";
+      eventId: string;
+      stageId: string;
+      runId: string;
+      reason: string;
     }
   | {
       type: "PROVIDER_OUTCOME";
       eventId: string;
       agent: ActiveAgentId;
       outcome: ProviderOutcome;
-      handoffEvidence: HandoffEvidence;
-      observedWorktree: ObservedWorktree;
       now?: number;
     };
 
@@ -417,6 +377,9 @@ export function transitionCollaborationRun(
   run: CollaborationRun,
   event: WorkflowEvent,
 ): CollaborationRun {
+  if (run.policyVersion !== ROUTING_POLICY_VERSION) {
+    return blockLegacyPolicyRun(run);
+  }
   if (alreadyProcessed(run, event)) return run;
 
   if (event.type === "BEGIN_STAGE" || event.type === "RETRY_STAGE_BOUNDARY") {
@@ -428,13 +391,6 @@ export function transitionCollaborationRun(
   if (event.type === "PROVIDER_HEALTH_CHANGED") {
     const next = cloneRun(run);
     next.health[event.agent] = event.health;
-    if (
-      event.health === "healthy" &&
-      next.pendingStageId !== null &&
-      next.activeStage === null
-    ) {
-      return startStage(next, next.pendingStageId, next.now);
-    }
     return next;
   }
 
@@ -460,9 +416,7 @@ export function transitionCollaborationRun(
     next.health.codex = event.results.codex.health;
     next.now = event.at;
     markProcessed(next, event);
-    return next.pendingStageId === null
-      ? next
-      : startStage(next, next.pendingStageId, event.at);
+    return next;
   }
 
   if (event.type === "RECOVERY_TIMER_FIRED") {
@@ -478,7 +432,7 @@ export function transitionCollaborationRun(
     markProcessed(next, event);
     if (
       next.pendingStageId !== null &&
-      Object.values(next.health).includes("healthy")
+      next.health.codex === "healthy"
     ) {
       return startStage(next, next.pendingStageId, event.now);
     }
@@ -498,18 +452,40 @@ export function transitionCollaborationRun(
     return next;
   }
 
-  if (event.type === "HANDOFF_TRANSFER_CONFLICT") {
+  if (event.type === "BROKER_RECONCILIATION_REQUIRED") {
     const next = cloneRun(run);
     if (next.activeStage?.id !== event.stageId) return next;
-    next.status = "blocked_handoff_conflict";
-    next.blockedReason = "worktree_lease_transfer_fenced";
+    next.status = "blocked_reconciliation";
+    next.blockedReason = "runner_evidence_reconciliation_required";
     next.conflict = {
-      kind: "worktree_lease_transfer_fenced",
+      kind: "runner_evidence_reconciliation_required",
       stageId: event.stageId,
-      expectedFencingToken: event.expectedFencingToken,
-      currentFencingToken: event.currentFencingToken,
+      runId: event.runId,
+      requiresNewWorkflowIdentity: true,
     };
     next.activeStage = null;
+    next.pendingStageId = null;
+    next.recovery = null;
+    markProcessed(next, event);
+    return next;
+  }
+
+  if (event.type === "BROKER_DISPATCH_REJECTED") {
+    const next = cloneRun(run);
+    if (next.activeStage?.id !== event.stageId) return next;
+    next.status = "terminal_outcome";
+    next.terminalOutcome = { kind: "invalid_request" };
+    next.blockedReason = "broker_dispatch_rejected_before_launch";
+    next.conflict = {
+      kind: "broker_dispatch_rejected_before_launch",
+      stageId: event.stageId,
+      runId: event.runId,
+      reason: event.reason,
+      requiresNewWorkflowIdentity: true,
+    };
+    next.activeStage = null;
+    next.pendingStageId = null;
+    next.recovery = null;
     markProcessed(next, event);
     return next;
   }
@@ -529,94 +505,51 @@ export function transitionCollaborationRun(
     return next;
   }
 
-  const evidence = event.handoffEvidence;
-  const observed = event.observedWorktree;
   const previous = next.activeStage.assignment.agent;
   recordFailedAttempt(next, event);
   next.health[event.agent] = "unavailable";
   next.now = event.now ?? next.now;
-  if (
-    evidence.checkpoint.artifactHash !== next.activeStage.artifactHash ||
-    evidence.checkpoint.artifactHash !== observed.artifactHash ||
-    evidence.checkpoint.nextAction.stageId !== next.activeStage.id
-  ) {
-    next.status = "blocked_handoff_conflict";
-    next.blockedReason = "artifact_changed_since_checkpoint";
-    next.conflict = {
-      kind: "artifact_hash_mismatch",
-      activeArtifactHash: next.activeStage.artifactHash,
-      checkpointHash: evidence.checkpoint.artifactHash,
-      currentArtifactHash: observed.artifactHash,
-      expectedStageId: next.activeStage.id,
-      checkpointStageId: evidence.checkpoint.nextAction.stageId,
-    };
+  if (previous !== "codex") {
+    next.status = "terminal_outcome";
+    next.terminalOutcome = { kind: "invalid_request" };
     return next;
   }
-  if (
-    evidence.worktreeLease.leaseId !== observed.leaseId ||
-    evidence.worktreeLease.fencingToken !== observed.fencingToken ||
-    evidence.worktreeLease.holder !== previous
-  ) {
-    next.status = "blocked_handoff_conflict";
-    next.blockedReason = "worktree_lease_conflict";
-    next.conflict = {
-      kind: "worktree_lease_mismatch",
-      expectedLeaseId: evidence.worktreeLease.leaseId,
-      observedLeaseId: observed.leaseId,
-      expectedFencingToken: evidence.worktreeLease.fencingToken,
-      observedFencingToken: observed.fencingToken,
-      expectedHolder: previous,
-      observedHolder: evidence.worktreeLease.holder,
-    };
-    return next;
-  }
-
-  let assignment: AttemptAssignment;
-  try {
-    assignment = assignmentFor(next, next.activeStage);
-  } catch (error) {
-    if (!isNoProviderError(error)) throw error;
-    next.status = "blocked_no_provider";
-    next.blockedReason = "no_healthy_provider";
-    next.pendingStageId = next.activeStage.id;
-    next.activeStage = null;
-    next.recovery = {
-      attempt: 0,
-      nextRetryAt: next.now + next.retryPolicy.baseDelayMs,
-    };
-    return next;
-  }
-
-  const releasedLease = structuredClone(evidence.worktreeLease);
-  const acquiredLease: WorktreeLeaseEvidence = {
-    ...releasedLease,
-    holder: assignment.agent,
-    fencingToken: releasedLease.fencingToken + 1,
+  next.status = "blocked_no_provider";
+  next.blockedReason = "codex_stage_owner_unavailable";
+  next.pendingStageId = next.activeStage.id;
+  next.activeStage = null;
+  next.recovery = {
+    attempt: 0,
+    nextRetryAt: next.now + next.retryPolicy.baseDelayMs,
   };
-  next.activeStage.assignment = assignment;
-  next.handoffs.push({
-    eventId: event.eventId,
-    from: previous,
-    to: assignment.agent,
-    role: next.activeStage.role,
-    approvalScope: next.activeStage.approvalScope,
-    artifactHash: next.activeStage.artifactHash,
-    idempotencyKey: next.activeStage.idempotencyKey,
-    evidence: structuredClone(evidence),
-    releasedLease,
-    acquiredLease,
-  });
-  next.dispatches.push(dispatchRecord(next.activeStage, event.eventId));
-  next.status = "running";
-  next.pendingStageId = null;
-  next.recovery = null;
-  delete next.blockedReason;
   return next;
 }
 
 export const serializeCollaborationRun = (run: CollaborationRun): string =>
   JSON.stringify(run);
 
+export const blockLegacyPolicyRun = (run: CollaborationRun): CollaborationRun => {
+  if (run.policyVersion === ROUTING_POLICY_VERSION) return run;
+  if (run.policyVersion !== "routing-v2" && run.policyVersion !== "routing-v3") {
+    throw new Error(`Unsupported persisted routing policy: ${String(run.policyVersion)}`);
+  }
+  if (run.completedStageIds.length >= run.stages.length) return run;
+  return {
+    ...cloneRun(run),
+    status: "blocked_policy_upgrade",
+    blockedReason: "routing_policy_upgrade_requires_replan",
+    activeStage: null,
+    pendingStageId: null,
+    recovery: null,
+    conflict: {
+      kind: "routing_policy_upgrade",
+      from: run.policyVersion,
+      to: ROUTING_POLICY_VERSION,
+      requiresNewWorkflowIdentity: true,
+    },
+  };
+};
+
 export const restoreCollaborationRun = (
   serialized: string,
-): CollaborationRun => JSON.parse(serialized) as CollaborationRun;
+): CollaborationRun => blockLegacyPolicyRun(JSON.parse(serialized) as CollaborationRun);

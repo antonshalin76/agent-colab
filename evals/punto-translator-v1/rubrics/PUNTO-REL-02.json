@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "slow-client-isolation", "weight": 35, "hardGate": true, "evaluator": "hidden-ipc-slow-client" },
+    { "id": "bounded-shutdown", "weight": 25, "hardGate": true, "evaluator": "hidden-ipc-shutdown-bound" },
+    { "id": "ipc-regression-suite", "weight": 30, "hardGate": true, "command": ["bash", "-lc", "cmake -S cpp -B build-eval -DBUILD_TRAY=OFF -DCMAKE_BUILD_TYPE=Debug && cmake --build build-eval -j2 && ctest --test-dir build-eval --output-on-failure"] },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

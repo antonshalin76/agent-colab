@@ -20,34 +20,33 @@ export interface EnqueueInput {
 }
 
 export interface DomainEffectEnvelope {
-  domainEffect: "pending" | "applied";
+  domainEffect: "pending" | "applying" | "applied" | "quarantined";
   providerResult: Record<string, unknown>;
   effect: Record<string, unknown>;
+  replayLease?: { owner: string; expiresAt: number };
+  replayError?: unknown;
+  quarantineError?: unknown;
 }
 
 type DbRow = Record<string, unknown>;
 const parse = (value: unknown) => value == null ? undefined : JSON.parse(String(value));
 
 export class RunStore {
-  private readonly db: Database.Database;
-  constructor(path: string) {
-    this.db = new Database(path);
+  protected readonly db: Database.Database;
+  private readonly ownsDatabase: boolean;
+  constructor(pathOrDatabase: string | Database.Database) {
+    this.ownsDatabase = typeof pathOrDatabase === "string";
+    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
-    this.db.exec(`CREATE TABLE IF NOT EXISTS runs (
-      id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, stage TEXT NOT NULL,
-      priority INTEGER NOT NULL, status TEXT NOT NULL, artifact_hash TEXT, approval_scope TEXT,
-      created_at INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL,
-      lease_token TEXT, lease_expires_at INTEGER, worker_id TEXT, launched INTEGER NOT NULL DEFAULT 0,
-      launch_info TEXT, result TEXT, cancel_reason TEXT, payload TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
-      depends_on_run_id TEXT
-    ); CREATE INDEX IF NOT EXISTS runs_due ON runs(status, next_attempt_at, priority, created_at);`);
     const columns = new Set((this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((column) => column.name));
-    for (const required of ["payload", "attempt_count", "depends_on_run_id"]) {
-      if (!columns.has(required)) {
-        this.db.close();
-        throw new Error("runs table requires offline v1-to-v2 migration");
-      }
+    const index = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='index' AND name='runs_due'",
+    ).get();
+    if (["payload", "attempt_count", "depends_on_run_id", "launch_info", "launched"]
+      .some((required) => !columns.has(required)) || index === undefined) {
+      if (this.ownsDatabase) this.db.close();
+      throw new Error("runs table requires current migration-owned schema");
     }
   }
   private record(row?: DbRow): RunRecord | undefined {
@@ -102,11 +101,13 @@ export class RunStore {
     return this.record(this.db.prepare("SELECT * FROM runs WHERE idempotency_key = ?").get(key) as DbRow | undefined);
   }
   list(): RunRecord[] { return (this.db.prepare("SELECT * FROM runs ORDER BY created_at,id").all() as DbRow[]).map((row) => this.record(row)!); }
-  pendingDomainEffects(): RunRecord[] {
+  pendingDomainEffects(now = Date.now()): RunRecord[] {
     return (this.db.prepare(`SELECT * FROM runs
       WHERE status IN ('completed','failed')
-        AND json_extract(result, '$.domainEffect') = 'pending'
-      ORDER BY created_at,id`).all() as DbRow[]).map((row) => this.record(row)!);
+        AND (json_extract(result, '$.domainEffect') = 'pending'
+          OR (json_extract(result, '$.domainEffect') = 'applying'
+            AND json_extract(result, '$.replayLease.expiresAt') <= ?))
+      ORDER BY created_at,id`).all(now) as DbRow[]).map((row) => this.record(row)!);
   }
   needsReconciliation(): RunRecord[] {
     return (this.db.prepare("SELECT * FROM runs WHERE status='needs_reconciliation' ORDER BY created_at,id").all() as DbRow[])
@@ -132,19 +133,55 @@ export class RunStore {
   }
   releaseForRetry(id: string, token: string, input: { nextAttemptAt: number }): void {
     this.requireLease(id, token);
-    this.db.prepare(`UPDATE runs SET status='queued',next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
-      worker_id=NULL,launched=0,launch_info=NULL WHERE id=? AND lease_token=?`).run(input.nextAttemptAt, id, token);
+    const changed = this.db.prepare(`UPDATE runs SET status='queued',next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
+      worker_id=NULL,launched=0,launch_info=NULL WHERE id=? AND status='claimed' AND lease_token=? AND launched=0`)
+      .run(input.nextAttemptAt, id, token).changes;
+    if (changed !== 1) throw new Error("retry release fence rejected");
   }
   cancel(id: string, reason: string): void {
     this.db.prepare("UPDATE runs SET status='cancelled',cancel_reason=? WHERE id=? AND status='queued'").run(reason, id);
   }
+  markLaunchIntent(id: string, token: string, info: Record<string, unknown>): void {
+    const current = this.requireLease(id, token);
+    if (current.launched) throw new Error("launch intent fence rejected");
+    const previous = current.launchInfo && typeof current.launchInfo === "object"
+      ? current.launchInfo as Record<string, unknown>
+      : {};
+    const merged = { ...previous, ...info, phase: "launching" };
+    const changed = this.db.prepare(`UPDATE runs SET launched=1,launch_info=?
+      WHERE id=? AND status='claimed' AND lease_token=? AND launched=0`)
+      .run(JSON.stringify(sanitizeResult(merged)), id, token).changes;
+    if (changed !== 1) throw new Error("launch intent fence rejected");
+  }
+  clearLaunchIntent(id: string, token: string): void {
+    const current = this.requireLease(id, token);
+    const launch = current.launchInfo && typeof current.launchInfo === "object"
+      ? current.launchInfo as Record<string, unknown>
+      : null;
+    if (!current.launched || launch?.phase !== "launching") {
+      throw new Error("launch intent clear fence rejected");
+    }
+    const executionContext = launch.executionContext;
+    const changed = this.db.prepare(`UPDATE runs SET launched=0,launch_info=?
+      WHERE id=? AND status='claimed' AND lease_token=? AND launched=1`)
+      .run(executionContext === undefined ? null : JSON.stringify({ executionContext }), id, token).changes;
+    if (changed !== 1) throw new Error("launch intent clear fence rejected");
+  }
   markLaunched(id: string, token: string, info: unknown): void {
     const current = this.requireLease(id, token);
-    const merged = current.launchInfo && typeof current.launchInfo === "object" && info && typeof info === "object"
-      ? { ...(current.launchInfo as Record<string, unknown>), ...(info as Record<string, unknown>) }
-      : info;
-    this.db.prepare("UPDATE runs SET launched=1,launch_info=? WHERE id=? AND lease_token=?")
-      .run(JSON.stringify(sanitizeResult(merged)), id, token);
+    const launch = current.launchInfo && typeof current.launchInfo === "object"
+      ? current.launchInfo as Record<string, unknown>
+      : {};
+    if (!current.launched || launch.phase !== "launching") {
+      throw new Error("started-process launch fence rejected");
+    }
+    const merged = info && typeof info === "object"
+      ? { ...launch, ...(info as Record<string, unknown>), phase: "started" }
+      : { ...launch, phase: "started", value: info };
+    const changed = this.db.prepare(`UPDATE runs SET launched=1,launch_info=?
+      WHERE id=? AND status='claimed' AND lease_token=? AND launched=1`)
+      .run(JSON.stringify(sanitizeResult(merged)), id, token).changes;
+    if (changed !== 1) throw new Error("started-process launch fence rejected");
   }
   recordExecutionContext(id: string, token: string, context: Record<string, unknown>): void {
     const current = this.requireLease(id, token);
@@ -170,7 +207,17 @@ export class RunStore {
     effect: Record<string, unknown>;
     status: "completed" | "failed";
   }): void {
-    this.requireLease(input.id, input.token);
+    const current = this.requireLease(input.id, input.token);
+    const launch = current.launchInfo && typeof current.launchInfo === "object"
+      ? current.launchInfo as Record<string, unknown>
+      : null;
+    if (current.launched && launch?.phase !== "started") {
+      throw new Error("ambiguous launch cannot commit a domain effect");
+    }
+    if (current.launched && current.approvalScope !== "workspace-read" &&
+        input.providerResult.kind !== "success") {
+      throw new Error("mutable launched run requires reconciliation unless provider success is validated");
+    }
     const envelope: DomainEffectEnvelope = {
       domainEffect: "pending",
       providerResult: sanitizeResult(input.providerResult),
@@ -178,8 +225,10 @@ export class RunStore {
     };
     const persist = () => {
       const changed = this.db.prepare(`UPDATE runs SET status=?,result=?,lease_token=NULL,lease_expires_at=NULL,
-        worker_id=NULL WHERE id=? AND status='claimed' AND lease_token=?`).run(
-          input.status, JSON.stringify(envelope), input.id, input.token,
+        worker_id=NULL WHERE id=? AND status='claimed' AND lease_token=?
+          AND (launched=0 OR (json_extract(launch_info, '$.phase')='started'
+            AND (approval_scope='workspace-read' OR ?='success')))`).run(
+          input.status, JSON.stringify(envelope), input.id, input.token, input.providerResult.kind,
         ).changes;
       if (changed !== 1) throw new Error("invalid or stale lease token");
       if (input.status === "failed") {
@@ -193,11 +242,66 @@ export class RunStore {
     };
     this.db.transaction(persist).immediate();
   }
-  markDomainEffectApplied(id: string): boolean {
+  claimDomainEffect(id: string, input: { owner: string; now: number; leaseMs: number }): boolean {
+    if (!input.owner || !Number.isSafeInteger(input.now) || !Number.isSafeInteger(input.leaseMs) || input.leaseMs <= 0) {
+      throw new Error("domain effect replay claim is invalid");
+    }
+    const lease = JSON.stringify({ owner: input.owner, expiresAt: input.now + input.leaseMs });
     return this.db.prepare(`UPDATE runs
-      SET result=json_set(result, '$.domainEffect', 'applied')
+      SET result=json_remove(json_set(
+        result,
+        '$.domainEffect', 'applying',
+        '$.replayLease', json(?)
+      ), '$.replayError')
       WHERE id=? AND status IN ('completed','failed')
-        AND json_extract(result, '$.domainEffect')='pending'`).run(id).changes === 1;
+        AND (json_extract(result, '$.domainEffect')='pending'
+          OR (json_extract(result, '$.domainEffect')='applying'
+            AND json_extract(result, '$.replayLease.expiresAt') <= ?))`).run(
+              lease,
+              id,
+              input.now,
+            ).changes === 1;
+  }
+  markDomainEffectApplied(id: string, owner: string): boolean {
+    return this.db.prepare(`UPDATE runs
+      SET result=json_remove(json_set(result, '$.domainEffect', 'applied'), '$.replayLease', '$.replayError')
+      WHERE id=? AND status IN ('completed','failed')
+        AND json_extract(result, '$.domainEffect')='applying'
+        AND json_extract(result, '$.replayLease.owner')=?`).run(id, owner).changes === 1;
+  }
+  releaseDomainEffectClaim(id: string, owner: string, error: unknown): boolean {
+    const replayError = sanitizeResult({
+      kind: "domain_effect_replay_deferred",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return this.db.prepare(`UPDATE runs
+      SET result=json_remove(json_set(
+        result,
+        '$.domainEffect', 'pending',
+        '$.replayError', json(?)
+      ), '$.replayLease')
+      WHERE id=? AND status IN ('completed','failed')
+        AND json_extract(result, '$.domainEffect')='applying'
+        AND json_extract(result, '$.replayLease.owner')=?`).run(
+          JSON.stringify(replayError), id, owner,
+        ).changes === 1;
+  }
+  quarantineDomainEffect(id: string, owner: string, error: unknown): boolean {
+    const quarantineError = sanitizeResult({
+      kind: "domain_effect_quarantined",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return this.db.prepare(`UPDATE runs
+      SET result=json_remove(json_set(
+        result,
+        '$.domainEffect', 'quarantined',
+        '$.quarantineError', json(?)
+      ), '$.replayLease', '$.replayError')
+      WHERE id=? AND status IN ('completed','failed')
+        AND json_extract(result, '$.domainEffect')='applying'
+        AND json_extract(result, '$.replayLease.owner')=?`).run(
+          JSON.stringify(quarantineError), id, owner,
+        ).changes === 1;
   }
   resolveReconciliation(input: {
     id: string;
@@ -213,16 +317,48 @@ export class RunStore {
       ).changes;
     if (changed !== 1) throw new Error("run is not awaiting reconciliation");
   }
+  markNeedsReconciliation(id: string, token: string, error?: unknown): void {
+    const current = this.requireLease(id, token);
+    if (!current.launched) throw new Error("only an ambiguous launch can enter reconciliation");
+    const launch = current.launchInfo && typeof current.launchInfo === "object"
+      ? current.launchInfo as Record<string, unknown>
+      : {};
+    const launchInfo = error === undefined
+      ? launch
+      : { ...launch, reconciliationError: sanitizeResult(error) };
+    const changed = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',launch_info=?,
+      lease_token=NULL,lease_expires_at=NULL,worker_id=NULL
+      WHERE id=? AND status='claimed' AND lease_token=? AND launched=1`).run(
+        JSON.stringify(launchInfo), id, token,
+      ).changes;
+    if (changed !== 1) throw new Error("reconciliation fence rejected");
+  }
   persistResult(id: string, token: string, result: unknown): void {
-    this.requireLease(id, token);
-    this.db.prepare(`UPDATE runs SET status='completed',result=?,lease_token=NULL,lease_expires_at=NULL,
-      worker_id=NULL WHERE id=? AND lease_token=?`).run(JSON.stringify(sanitizeResult(result)), id, token);
+    const current = this.requireLease(id, token);
+    const launch = current.launchInfo && typeof current.launchInfo === "object"
+      ? current.launchInfo as Record<string, unknown>
+      : null;
+    if (current.launched && launch?.phase !== "started") {
+      throw new Error("ambiguous launch cannot persist a completed result");
+    }
+    if (current.launched && current.approvalScope !== "workspace-read") {
+      throw new Error("mutable launched run requires a committed domain effect");
+    }
+    const changed = this.db.prepare(`UPDATE runs SET status='completed',result=?,lease_token=NULL,lease_expires_at=NULL,
+      worker_id=NULL WHERE id=? AND status='claimed' AND lease_token=?
+        AND (launched=0 OR (approval_scope='workspace-read'
+          AND json_extract(launch_info, '$.phase')='started'))`)
+      .run(JSON.stringify(sanitizeResult(result)), id, token).changes;
+    if (changed !== 1) throw new Error("result persistence fence rejected");
   }
   fail(id: string, token: string, result: unknown): void {
-    this.requireLease(id, token);
+    const current = this.requireLease(id, token);
+    if (current.launched) throw new Error("launched run requires reconciliation or a domain effect");
     this.db.transaction(() => {
-      this.db.prepare(`UPDATE runs SET status='failed',result=?,lease_token=NULL,lease_expires_at=NULL,
-        worker_id=NULL WHERE id=? AND lease_token=?`).run(JSON.stringify(sanitizeResult(result)), id, token);
+      const changed = this.db.prepare(`UPDATE runs SET status='failed',result=?,lease_token=NULL,lease_expires_at=NULL,
+        worker_id=NULL WHERE id=? AND status='claimed' AND lease_token=? AND launched=0`)
+        .run(JSON.stringify(sanitizeResult(result)), id, token).changes;
+      if (changed !== 1) throw new Error("failure persistence fence rejected");
       this.db.prepare(`WITH RECURSIVE descendants(id) AS (
         SELECT id FROM runs WHERE depends_on_run_id = ? AND status = 'queued'
         UNION ALL
@@ -240,5 +376,5 @@ export class RunStore {
       return before + after;
     })();
   }
-  close(): void { this.db.close(); }
+  close(): void { if (this.ownsDatabase) this.db.close(); }
 }

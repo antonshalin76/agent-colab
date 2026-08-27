@@ -7,6 +7,11 @@ import * as routing from "../src/domain/routing.js";
 import { AgentRunner, type ProcessLauncher } from "../src/runners/agent-runner.js";
 import { buildCodexCommand } from "../src/runners/codex.js";
 import { buildGrokCommand } from "../src/runners/grok.js";
+import {
+  createMapLearningLaunchBinding,
+  formatMapLearningLaunchBindingContext,
+} from "../src/flow/map-admin.js";
+import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 
 const COMPLEX_INPUTS = {
   artifactBytes: 262_144,
@@ -27,6 +32,12 @@ const codexStream = [
   }),
 ].join("\n") + "\n";
 
+const runnerProject = process.cwd();
+const codexLearning = createMapLearningLaunchBinding(runnerProject, "codex");
+const learnedPrompt = (prompt: string): string =>
+  `${formatMapLearningLaunchBindingContext(codexLearning)}\n\n${prompt}`;
+const sourceFingerprint = captureWorkspaceFingerprint(runnerProject).fingerprint;
+
 const runnerWith = (launch = vi.fn(() => ({
   pid: 1234,
   result: Promise.resolve({ exitCode: 0, stdout: codexStream, stderr: "" }),
@@ -41,8 +52,8 @@ const runnerWith = (launch = vi.fn(() => ({
 });
 
 describe("provider-specific effort limits", () => {
-  it("pins the changed durable decision grammar to routing-v3", () => {
-    expect(ROUTING_POLICY_VERSION).toBe("routing-v3");
+  it("pins the changed durable decision grammar to routing-v4", () => {
+    expect(ROUTING_POLICY_VERSION).toBe("routing-v4");
   });
 
   it("caps Codex/Sol at xhigh while Grok has no policy maximum", () => {
@@ -139,24 +150,29 @@ describe("provider-specific effort limits", () => {
       .toThrow(/effort|xhigh|capability/i);
   });
 
-  it("accepts exact capped evidence bound to its immutable workflow dispatch identity", async () => {
+  it("accepts exact capped evidence bound to its immutable review dispatch identity", async () => {
     const valid = runnerWith();
     const identity = {
-      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v3",
+      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v4",
       reasons: [
         "stage_baseline:code_critic:xhigh",
         "retry",
         "provider_policy_limit:gpt-5.6-sol:xhigh",
       ],
-      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v3",
+      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v4",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
     };
     await expect(valid.runner.run({
-      id: "valid-cap", stage: "code_critic", approvalScope: "workspace-read",
+      id: "valid-cap", stage: "review:critic", approvalScope: "workspace-read",
+      idempotencyKey: "review:critic:0",
       payload: {
-        project: "/repo", prompt: "review", approvalScope: "workspace-read",
+        project: runnerProject, prompt: learnedPrompt("review"), approvalScope: "workspace-read",
+        requester: "codex", sourceFingerprint, mapLearning: codexLearning,
         decision: structuredClone(identity),
-        workflowDispatchIdentity: structuredClone(identity),
+        reviewDispatchIdentity: structuredClone(identity),
+        reviewDispatchId: "review:critic:0",
+        reviewAttemptId: identity.attemptId,
+        reviewAttemptOrdinal: identity.attemptOrdinal,
         sessionId: identity.sessionId,
       },
     })).resolves.toMatchObject({ kind: "success", effort: "xhigh" });
@@ -168,17 +184,20 @@ describe("provider-specific effort limits", () => {
     ["cap evidence", { reasons: ["stage_baseline:code_critic:xhigh", "retry"] }],
   ] as const)("rejects decision %s drift from immutable workflow identity", async (_label, patch) => {
     const identity = {
-      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v3",
+      agent: "codex", model: "gpt-5.6-sol", effort: "xhigh", policyVersion: "routing-v4",
       reasons: ["stage_baseline:code_critic:xhigh", "retry",
         "provider_policy_limit:gpt-5.6-sol:xhigh"],
-      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v3",
+      degraded: false, attemptOrdinal: 1, attemptId: "stage:attempt:1:codex:routing-v4",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
     };
     const forged = runnerWith();
     await expect(forged.runner.run({
       id: "forged-identity", stage: "code_critic", approvalScope: "workspace-read",
+      idempotencyKey: "workflow:dispatch:0",
       payload: {
-        project: "/repo", prompt: "review", approvalScope: "workspace-read",
+        project: runnerProject, prompt: learnedPrompt("review"), approvalScope: "workspace-read",
+        requester: "codex", workflowId: "workflow", workflowStageId: "code_critic",
+        workflowDispatchId: "workflow:dispatch:0", sourceFingerprint, mapLearning: codexLearning,
         decision: { ...structuredClone(identity), ...patch },
         workflowDispatchIdentity: structuredClone(identity),
       },
@@ -193,10 +212,13 @@ describe("provider-specific effort limits", () => {
     const missing = runnerWith();
     await expect(missing.runner.run({
       id: "missing-identity", stage: "coordination", approvalScope: "workspace-read",
+      idempotencyKey: "workflow:dispatch:0",
       payload: {
-        project: "/repo", prompt: "coordinate", approvalScope: "workspace-read",
+        project: runnerProject, prompt: learnedPrompt("coordinate"), approvalScope: "workspace-read",
+        requester: "codex", workflowId: "workflow", workflowStageId: "coordination",
+        workflowDispatchId: "workflow:dispatch:0", sourceFingerprint, mapLearning: codexLearning,
         decision: {
-          agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v3",
+          agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v4",
           reasons: ["stage_baseline:coordination:medium"],
         },
       },
@@ -206,16 +228,19 @@ describe("provider-specific effort limits", () => {
 
   it("rejects workflow session drift from immutable identity", async () => {
     const identity = {
-      agent: "grok", model: "grok-4.6", effort: "medium", policyVersion: "routing-v3",
+      agent: "codex", model: "gpt-5.6-sol", effort: "medium", policyVersion: "routing-v4",
       reasons: ["stage_baseline:planning:medium"], degraded: false,
-      attemptOrdinal: 0, attemptId: "stage:attempt:0:grok:routing-v3",
+      attemptOrdinal: 0, attemptId: "stage:attempt:0:codex:routing-v4",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
     };
     const drift = runnerWith();
     await expect(drift.runner.run({
       id: "session-drift", stage: "planning", approvalScope: "workspace-read",
+      idempotencyKey: "workflow:dispatch:0",
       payload: {
-        project: "/repo", prompt: "plan", approvalScope: "workspace-read",
+        project: runnerProject, prompt: learnedPrompt("plan"), approvalScope: "workspace-read",
+        requester: "codex", workflowId: "workflow", workflowStageId: "planning",
+        workflowDispatchId: "workflow:dispatch:0", sourceFingerprint, mapLearning: codexLearning,
         decision: structuredClone(identity), workflowDispatchIdentity: structuredClone(identity),
         sessionId: "123e4567-e89b-42d3-a456-426614174999",
       },
@@ -233,7 +258,7 @@ describe("provider-specific effort limits", () => {
       payload: {
         project: "/repo", prompt: "review", approvalScope: "workspace-read",
         decision: {
-          agent, model, effort: "xhigh", policyVersion: "routing-v3",
+          agent, model, effort: "xhigh", policyVersion: "routing-v4",
           reasons: ["stage_baseline:code_critic:xhigh", "retry", capReason],
         },
       },

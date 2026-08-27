@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "degraded-graph-self-heals", "weight": 35, "hardGate": true, "evaluator": "hidden-audio-graph-recovery" },
+    { "id": "stopped-bypass-audible", "weight": 25, "hardGate": true, "evaluator": "hidden-stopped-bypass" },
+    { "id": "daemon-regressions", "weight": 30, "hardGate": true, "command": ["cargo", "test", "-p", "translator-daemon"] },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

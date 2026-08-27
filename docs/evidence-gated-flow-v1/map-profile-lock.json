@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "map-profile-lock/v1",
+  "version": "3.28.1",
+  "sourceRevision": "1ba52a77b8228a509f3ef08c4fb1f89465699a73",
+  "sourceArchiveSha256": "b5a391a4f892334655a9d5dc0a405020dfb9284dbd9c9ee63b8be78a818bf990",
+  "provider": "codex",
+  "updateTool": {
+    "kind": "uv",
+    "version": "0.8.22",
+    "executablePath": "/home/anton/.local/bin/uv",
+    "executableSha256": "a261804d9493a96e7eebf13bcffc1b7ecc87dbd7da9a2800af94c20182d1a70d"
+  },
+  "sandboxTool": {
+    "kind": "bubblewrap",
+    "version": "0.9.0",
+    "executablePath": "/usr/bin/bwrap",
+    "executableSha256": "52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712"
+  },
+  "runtimeTool": {
+    "kind": "mapify-cli",
+    "version": "3.28.1",
+    "toolRoot": "/home/anton/.local/share/uv/tools/mapify-cli",
+    "executablePath": "/home/anton/.local/share/uv/tools/mapify-cli/bin/mapify",
+    "executableSha256": "2284fff2c1493ae8334dfbe51fca7395e8cd4dbcf8dbe1f20ecf40d11ab4b7d8",
+    "toolTreeSha256": "3da0de77d9e7b02a7dd5705c5d8f57f121f6463f33dc3e725c2d63d32ec34588",
+    "pythonRealPath": "/home/anton/.local/share/uv/python/cpython-3.14.0rc3-linux-x86_64-gnu/bin/python3.14",
+    "pythonSha256": "d5dde1eb49cbf743e4c389a6461fe27cf2da7792b672f6db62618f93430e26ea"
+  },
+  "mapManifestSha256": "392a90596d0aaff3a6cfc2e40bed3dbbcc0b2da41512b1827fa1b5cb4de536e0",
+  "mapConfigSha256": "9135c22e19e484fffb369b8d91829fe61d5e98a3608acee880ec741273e519b0",
+  "managedFileSha256": {
+    ".agents/skills/map-check/SKILL.md": "624fcb01a897e806f652942ee71d4216394b9d655acf0380135779ec1d8aca20",
+    ".agents/skills/map-efficient/SKILL.md": "89f31e5f0e261a935b286eae491ffd94f7015630197a0bc2bd2e8b396154e418",
+    ".agents/skills/map-efficient/efficient-reference.md": "e0df46d14cc5c02a81c0d605e4bbc26b1184f7f208af6ac915354c7942919681",
+    ".agents/skills/map-explain/SKILL.md": "9642ba6cd4e8e5e1d5eabc912fdd7b94770ca195a502dfcfccc8e19485862aa0",
+    ".agents/skills/map-fast/SKILL.md": "f60674c42d7a05135219fdfba7b2fb930c6e1fc206671baf235f83bb1874e274",
+    ".agents/skills/map-plan/SKILL.md": "f64fb0f56414a8ea47ba3674bef4c768848f81bed98311bb874c02c29260a52c",
+    ".agents/skills/map-review/SKILL.md": "758c419aacfeb79233c8a928f0e6c23e4e7486e081c18dae7167406942983a18",
+    ".agents/skills/map-review/adversarial-reference.md": "50b81e63d8e844765f558161455cb0acfe39cb00f905c28311b06045d0793138",
+    ".agents/skills/map-review/review-reference.md": "72511ebc693d5e379bf990e2356ff3187a11da3b3d63423a4e40dbaaa4fa61a4",
+    ".agents/skills/map-understand/SKILL.md": "aa123f749988c0e1f2c314f5b19ade0f3604fb61e01ff4c8dd643e0beb01da65",
+    ".agents/skills/map-upgrade/SKILL.md": "8ccf9f82784c8c1bfe44fb40ba4a3cae13531541d40e1c7d01ed5448713a5309",
+    ".codex/agents/decomposer.toml": "db89a2469b4c6a2a00cd8ed442d11af099d620c72067c7de1c46a4ca0cd9e944",
+    ".codex/agents/evaluator.toml": "b9b290d6d040d1eca43123443323b9ae7f0ea3a84a548eafe8ba4c2e85747534",
+    ".codex/agents/monitor.toml": "a9de3f9a922b975a93659dbc83ed2948b36df9db24857d5e180e0c57ff00a672",
+    ".codex/agents/predictor.toml": "71830f60003974c7cab146580be7bf98e3d03eaf1ac5c8175f33f750ec74cf97",
+    ".codex/agents/researcher.toml": "733933e0f1008e342a5e5b44fd29b8b7fe9267795ffe424300f39bedb17861b7",
+    ".codex/config.toml": "8b57a0ed4f99b39577fc3951a7f33d89f0d78257b3dc587cecc81b41cc4b697d",
+    ".codex/hooks.json": "dba641bf9804833aa937e7f8c358e0a7455e849b15ba16b8cf96b03a97a486d8",
+    ".codex/hooks/workflow-gate.py": "46a30646dc3ce721e67a15258c1010589361f25cca7aafa8c31356092022c2c5",
+    ".map/scripts/classify_scope.py": "5d079f956c03a8ae6a7778a13f70491efe8691e84a1101969062ef4fb901aaee",
+    ".map/scripts/diagnostics.py": "aa509b9b7dc44e22bfbbfe12bf6e1094f44ecb05a659fc0c9606158caddab38e",
+    ".map/scripts/map_orchestrator.py": "d9cabfea7fa7e3b12a5bedd6c664a395c04ba19b804388d3592f138c6f27f16c",
+    ".map/scripts/map_step_runner.py": "3471ada9e1c0e4fea377154b4724f1ae2ce012357b57bab601182446a1d88372",
+    ".map/scripts/map_utils.py": "50ac549b1830c3002dcaae5a45234c1e28fe15c8e10c9a956c53446da11e22b8",
+    ".map/scripts/scrub_internal_ids.py": "3bff29e0f4a91149ade101bc8ff220e51ddf1f70b14c4fb2a2abe0ed0196981c",
+    ".map/scripts/sofa_client.py": "a91a6ab56c7ed785dd1e2e6770fbc2a2ddd62b21c65348512be53f93f380b684",
+    ".map/scripts/validate_spec_citations.py": "85308c349a2078837d044c35ec5a7c626c5ae213915f4a6c7f0f94ed0769e627",
+    ".map/scripts/wayfind_runner.py": "49907e4d8d788f71fd8c8d1489adbddeb0f64e85646c6c302f6675bd52a98c07",
+    "AGENTS.md": "a3837472543d188dc979d50962aba78c2b9269885026e58766a73094d053eee2"
+  },
+  "outsideScopeSha256": {
+    ".agents/skills/map-learn/SKILL.md": "964e9ea23b9f9570c26f2d85fcad93a7dc385f4f47b27044c7e2ad7dd2512e7d",
+    ".codex/hooks/agent-collab-map-gate.py": "efb5f9f9ac514f0e8f47df13e6685f88c70a3f67bb50485dd93dfe2a125e28b3"
+  }
+}

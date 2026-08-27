@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "semantic-equivalence", "weight": 45, "hardGate": true, "evaluator": "hidden-edit-distance-equivalence" },
+    { "id": "linear-auxiliary-memory", "weight": 25, "hardGate": true, "evaluator": "edit-distance-memory-shape" },
+    { "id": "relative-performance", "weight": 20, "hardGate": false, "evaluator": "paired-local-microbenchmark" },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

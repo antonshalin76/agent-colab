@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "terminal-identity-released", "weight": 45, "hardGate": true, "evaluator": "hidden-terminal-identity-capacity" },
+    { "id": "terminal-semantics-preserved", "weight": 25, "hardGate": true, "evaluator": "hidden-terminal-tombstones" },
+    { "id": "provider-engine-regressions", "weight": 20, "hardGate": true, "command": ["bash", "-lc", "PYTHONPATH=sidecar /usr/bin/python3 -m pytest -q sidecar/tests/test_provider_engine.py"] },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

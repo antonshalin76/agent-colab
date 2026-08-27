@@ -1,0 +1,149 @@
+{
+  "id": "punto-translator-v1",
+  "seed": 20260824,
+  "baselinePolicy": {
+    "coordination": "codex",
+    "planning": "grok",
+    "plan_audit": "codex",
+    "plan_critic": "codex",
+    "prd": "grok",
+    "prd_audit": "codex",
+    "prd_critic": "codex",
+    "architecture": "codex",
+    "architecture_audit": "codex",
+    "architecture_critic": "codex",
+    "ui_ux": "grok",
+    "bdd": "grok",
+    "tdd_coding": "codex",
+    "unit_testing": "codex",
+    "e2e_infrastructure": "codex",
+    "e2e_testing": "grok",
+    "test_audit": "codex",
+    "test_critic": "codex",
+    "code_audit": "codex",
+    "code_critic": "codex",
+    "code_review": "codex"
+  },
+  "providers": {
+    "grok": { "model": "grok-4.6" },
+    "codex": { "model": "gpt-5.6-sol" }
+  },
+  "efforts": ["medium", "high", "xhigh"],
+  "repetitions": 4,
+  "limits": {
+    "wallTimeoutMs": 1800000,
+    "outputLimitBytes": 1048576,
+    "diffLimitBytes": 524288,
+    "maxFiles": 20,
+    "maxProcesses": 16,
+    "maxAttempts": 1
+  },
+  "skills": [
+    "agent-collaboration",
+    "agents-best-practices",
+    "karpathy-guidelines",
+    "bug-fix",
+    "performance-testing",
+    "python-performance-optimization",
+    "code-review-master"
+  ],
+  "repositories": {
+    "punto": {
+      "defaultPath": "/home/anton/scripts/punto"
+    },
+    "translator": {
+      "defaultPath": "/home/anton/Source/translator"
+    }
+  },
+  "cases": [
+    {
+      "id": "PUNTO-REF-01",
+      "repository": "punto",
+      "category": "refactor",
+      "stageFamily": "architecture",
+      "runnable": false,
+      "source": { "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7", "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7" },
+      "task": "tasks/PUNTO-REF-01.md",
+      "rubric": "rubrics/PUNTO-REF-01.json",
+      "oracleFiles": []
+    },
+    {
+      "id": "PUNTO-REL-02",
+      "repository": "punto",
+      "category": "reliability",
+      "stageFamily": "tdd_coding",
+      "runnable": false,
+      "source": { "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7", "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7" },
+      "task": "tasks/PUNTO-REL-02.md",
+      "rubric": "rubrics/PUNTO-REL-02.json",
+      "oracleFiles": []
+    },
+    {
+      "id": "PUNTO-BUG-03",
+      "repository": "punto",
+      "category": "bug",
+      "stageFamily": "tdd_coding",
+      "runnable": true,
+      "source": { "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7", "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7" },
+      "task": "tasks/PUNTO-BUG-03.md",
+      "rubric": "rubrics/PUNTO-BUG-03.json",
+      "oracleFiles": ["oracles/PUNTO-BUG-03.cpp"]
+    },
+    {
+      "id": "PUNTO-OPT-04",
+      "repository": "punto",
+      "category": "optimization",
+      "stageFamily": "tdd_coding",
+      "runnable": false,
+      "source": { "revision": "cc4a3cf4c6e44aa5dd2ad67c544580dc29738ff7", "treeHash": "2751ee133cf28a0ee25d81e049bb7aff9ea455e7" },
+      "task": "tasks/PUNTO-OPT-04.md",
+      "rubric": "rubrics/PUNTO-OPT-04.json",
+      "oracleFiles": []
+    },
+    {
+      "id": "TR-REF-01",
+      "repository": "translator",
+      "category": "refactor",
+      "stageFamily": "architecture",
+      "runnable": false,
+      "source": { "revision": "9291e8beafee3e02aaa179178ce460ac9e6c6de2", "treeHash": "0101731159d8d745a230869e8bc2fb55bb57d0b5" },
+      "task": "tasks/TR-REF-01.md",
+      "rubric": "rubrics/TR-REF-01.json",
+      "oracleFiles": []
+    },
+    {
+      "id": "TR-REL-01",
+      "repository": "translator",
+      "category": "reliability",
+      "stageFamily": "tdd_coding",
+      "runnable": false,
+      "source": { "revision": "da5ec54a519e9d55855f7518c5c89ed7c9a23fbf", "treeHash": "2dc1c5dcdc08d72a73888a9aafce9a405c6ca97d" },
+      "task": "tasks/TR-REL-01.md",
+      "rubric": "rubrics/TR-REL-01.json",
+      "oracleFiles": []
+    },
+    {
+      "id": "TR-BUG-01",
+      "repository": "translator",
+      "category": "bug",
+      "stageFamily": "tdd_coding",
+      "runnable": true,
+      "source": { "revision": "9291e8beafee3e02aaa179178ce460ac9e6c6de2", "treeHash": "0101731159d8d745a230869e8bc2fb55bb57d0b5" },
+      "seedPatch": "seeds/TR-BUG-01.patch",
+      "task": "tasks/TR-BUG-01.md",
+      "rubric": "rubrics/TR-BUG-01.json",
+      "oracleFiles": ["oracles/TR-BUG-01.py"]
+    },
+    {
+      "id": "TR-OPT-01",
+      "repository": "translator",
+      "category": "optimization",
+      "stageFamily": "tdd_coding",
+      "runnable": false,
+      "source": { "revision": "9291e8beafee3e02aaa179178ce460ac9e6c6de2", "treeHash": "0101731159d8d745a230869e8bc2fb55bb57d0b5" },
+      "task": "tasks/TR-OPT-01.md",
+      "rubric": "rubrics/TR-OPT-01.json",
+      "oracleFiles": []
+    }
+  ]
+}

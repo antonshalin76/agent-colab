@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ApprovalLedger } from "../src/security/approval-ledger.js";
+import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
 
 const roots: string[] = [];
 
@@ -13,7 +14,9 @@ afterEach(() => {
 function databasePath(): string {
   const root = mkdtempSync(join(tmpdir(), "agent-collab-approval-"));
   roots.push(root);
-  return join(root, "approvals.db");
+  const path = join(root, "approvals.db");
+  initializeCurrentExecutionSchema(path);
+  return path;
 }
 
 describe("approval ledger", () => {

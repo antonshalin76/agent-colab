@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "finding-lifecycle/v1",
+  "findingId": "FIND-901",
+  "classification": "process_escape",
+  "severity": "P1",
+  "status": "closed",
+  "owningStage": "90_learning_close",
+  "affectedScenarioId": "BDD-007",
+  "affectedControlId": "CTRL-014",
+  "rootCause": "learning evidence was not bound to its canonical process execution",
+  "rootCauseClass": "learning_control_fingerprint_bypass",
+  "escapeAnalysis": {
+    "missedStage": "90_learning_close",
+    "escapedOracleId": "ORACLE-010",
+    "reason": "caller-authored PASS evidence escaped the learning guard",
+    "testSystemOwnerId": "OWNER-007"
+  },
+  "closure": {
+    "fixEvidenceId": "EVID-901",
+    "regressionEvidenceId": "EVID-902",
+    "regressionMutationId": "MUTATION-LEARNING-CONTROL-FINGERPRINT",
+    "preventionGuardId": "GUARD-010",
+    "siblingScanEvidenceId": "EVID-903",
+    "invalidatedStageIds": ["90_learning_close"]
+  }
+}

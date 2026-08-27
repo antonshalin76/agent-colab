@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "source-commit-regressions", "weight": 35, "hardGate": true, "command": ["bash", "-lc", "PYTHONPATH=sidecar /usr/bin/python3 -m pytest -q sidecar/tests/test_source_commit.py"] },
+    { "id": "sync-async-equivalence", "weight": 25, "hardGate": true, "evaluator": "hidden-source-commit-equivalence" },
+    { "id": "single-transition-owner", "weight": 25, "hardGate": false, "evaluator": "source-commit-structure" },
+    { "id": "scope", "weight": 15, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}

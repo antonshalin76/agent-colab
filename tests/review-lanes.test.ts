@@ -36,7 +36,7 @@ describe("BDD-5/6 four-lane review policy", () => {
         agent: lane.agent,
         model: lane.agent === "grok" ? "grok-4.6" : "gpt-5.6-sol",
         effort,
-        policyVersion: "routing-v3",
+        policyVersion: "routing-v4",
         reasons: [`stage_baseline:${stage}:${effort}`],
         degraded: false,
       });

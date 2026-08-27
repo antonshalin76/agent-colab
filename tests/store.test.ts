@@ -3,12 +3,31 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RunStore } from "../src/store/run-store.js";
+import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+import { RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
+import { CollaborationRunStore } from "../src/store/collaboration-run-store.js";
+import Database from "better-sqlite3";
 
 const roots: string[] = [];
-const makeDb = () => { const root = mkdtempSync(join(tmpdir(), "agent-collab-store-")); roots.push(root); return join(root, "state.db"); };
+const makeDb = () => { const root = mkdtempSync(join(tmpdir(), "agent-collab-store-")); roots.push(root);
+  const path = join(root, "state.db"); initializeCurrentExecutionSchema(path); return path; };
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("durable run store", () => {
+  it.each([
+    ["run", (path: string) => new RunStore(path)],
+    ["gate", (path: string) => new RunGateUnitOfWork(path)],
+    ["workflow", (path: string) => new CollaborationRunStore(path)],
+  ] as const)("keeps the %s runtime constructor DDL-free on a blank database", (_name, open) => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-ddl-owner-"));
+    roots.push(root);
+    const path = join(root, "state.db");
+    expect(() => open(path)).toThrow(/migration-owned schema|current migration-owned schema/i);
+    const db = new Database(path, { readonly: true });
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()).toEqual([]);
+    db.close();
+  });
+
   it("deduplicates idempotency keys and preserves original immutable fields", () => {
     const store = new RunStore(makeDb());
     const first = store.enqueue({ idempotencyKey: "same", stage: "planning", priority: 10, artifactHash: "a", approvalScope: "workspace-read" });
@@ -53,6 +72,7 @@ describe("durable run store", () => {
     store.recoverExpired(20); expect(store.get(beforeId)?.status).toBe("queued");
     const afterId = store.enqueue({ idempotencyKey: "after", stage: "coding", priority: 1, now: 21 }).id;
     const after = store.claimNext({ workerId: "a", leaseMs: 1, now: 30 })!;
+    store.markLaunchIntent(after.id, after.leaseToken!, { agent: "codex" });
     store.markLaunched(after.id, after.leaseToken!, { pid: 123, sessionId: "session" }); store.close(); store = new RunStore(path);
     store.recoverExpired(40); expect(store.get(afterId)?.status).toBe("needs_reconciliation");
     const done = store.enqueue({ idempotencyKey: "done", stage: "testing", priority: 1, now: 41 });
@@ -60,6 +80,31 @@ describe("durable run store", () => {
     store.persistResult(claimed.id, claimed.leaseToken!, { text: "persisted" }); store.close(); store = new RunStore(path);
     expect(store.get(done.id)?.status).toBe("completed");
     expect(store.claimNext({ workerId: "b", leaseMs: 10, now: 100 })?.id).not.toBe(done.id);
+    store.close();
+  });
+
+  it("persists launch intent before spawn and reconciles an expired ambiguous attempt", () => {
+    const store = new RunStore(makeDb());
+    const queued = store.enqueue({ idempotencyKey: "launch-intent", stage: "planning", priority: 1, now: 1 });
+    const claimed = store.claimNext({ workerId: "worker", leaseMs: 10, now: 2 })!;
+
+    store.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+      phase: "launching",
+      agent: "codex",
+    });
+    expect(store.get(queued.id)).toMatchObject({
+      status: "claimed",
+      launched: true,
+      launchInfo: { phase: "launching", agent: "codex" },
+    });
+    expect(() => store.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!,
+      providerResult: { kind: "cli_missing" }, effect: { type: "review" }, status: "failed" }))
+      .toThrow(/ambiguous launch/i);
+    expect(() => store.fail(claimed.id, claimed.leaseToken!, { kind: "cli_missing" }))
+      .toThrow(/requires reconciliation/i);
+    expect(store.recoverExpired(13)).toBe(1);
+    expect(store.get(queued.id)?.status).toBe("needs_reconciliation");
+    expect(store.claimNext({ workerId: "other", leaseMs: 10, now: 14 })).toBeUndefined();
     store.close();
   });
 
@@ -80,6 +125,7 @@ describe("durable run store", () => {
     const run = store.enqueue({ idempotencyKey: "mutable", stage: "tdd_coding", priority: 1, now: 1,
       approvalScope: "workspace-write", payload: { prompt: "implement" } });
     const claimed = store.claimNext({ workerId: "w", leaseMs: 10, now: 2 })!;
+    store.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "codex" });
     store.markLaunched(claimed.id, claimed.leaseToken!, { pid: 123 });
     expect(store.renewLease(claimed.id, claimed.leaseToken!, 100)).toBe(true);
     expect(store.recoverExpired(99)).toBe(0);

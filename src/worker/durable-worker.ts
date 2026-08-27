@@ -1,5 +1,6 @@
 import type { RunRecord, RunStore } from "../store/run-store.js";
 import { sanitizeResult } from "../security/redaction.js";
+import { isFailoverOutcome } from "../domain/outcomes.js";
 
 export type CommitDomainEffect = (input: {
   providerResult: Record<string, unknown>;
@@ -11,9 +12,9 @@ export type Runner = (
   onLaunch: (info: Record<string, unknown>) => void,
   commitDomainEffect: CommitDomainEffect,
   persistExecutionContext: (context: Record<string, unknown>) => void,
+  onLaunchIntent: (info: Record<string, unknown>) => void,
+  onProvenNoSpawn: () => void,
 ) => Promise<Record<string, unknown>>;
-const retryable = new Set(["quota", "rate_limit", "overload", "network_timeout", "model_unavailable", "cli_missing", "auth"]);
-const deliveryCompleted = new Set(["success", "handoff_dispatched"]);
 export class DurableWorker {
   private readonly store: RunStore; private readonly workerId: string; private readonly runner: Runner; private readonly leaseMs: number;
   constructor(input: { store: RunStore; workerId: string; runner: Runner; leaseMs?: number }) {
@@ -37,31 +38,38 @@ export class DurableWorker {
           domainCommitted = true;
         },
         (context) => this.store.recordExecutionContext(claimed.id, claimed.leaseToken!, context),
+        (info) => this.store.markLaunchIntent(
+          claimed.id,
+          claimed.leaseToken!,
+          { workerId: this.workerId, ...info },
+        ),
+        () => this.store.clearLaunchIntent(claimed.id, claimed.leaseToken!),
       ));
       if (domainCommitted) return this.store.get(claimed.id);
-      if (typeof result.kind === "string" && retryable.has(result.kind)) {
+      const current = this.store.get(claimed.id);
+      if (current?.launched &&
+          result.kind !== "success") {
+        this.store.markNeedsReconciliation(claimed.id, claimed.leaseToken!, result);
+        return this.store.get(claimed.id);
+      }
+      if (isFailoverOutcome(result.kind)) {
         const delayMs = Math.min(30 * 60_000, 30_000 * 2 ** Math.max(0, claimed.attemptCount - 1));
         this.store.releaseForRetry(claimed.id, claimed.leaseToken!, { nextAttemptAt: now + delayMs });
         return this.store.get(claimed.id);
       }
-      if (typeof result.kind === "string" && deliveryCompleted.has(result.kind)) this.store.persistResult(claimed.id, claimed.leaseToken!, result);
+      if (result.kind === "success") this.store.persistResult(claimed.id, claimed.leaseToken!, result);
       else this.store.fail(claimed.id, claimed.leaseToken!, result);
-      if (result.kind === "success" && result.deferredReplay && typeof result.deferredReplay === "object") {
-        this.store.enqueue({
-          idempotencyKey: `${claimed.idempotencyKey}:cross-provider-replay`,
-          stage: `${claimed.stage}:replay`, priority: claimed.priority + 10,
-          ...(claimed.artifactHash ? { artifactHash: claimed.artifactHash } : {}),
-          ...(claimed.approvalScope ? { approvalScope: claimed.approvalScope } : {}),
-          payload: result.deferredReplay as Record<string, unknown>,
-          notBefore: now + 60_000,
-        });
-      }
     } catch (error) {
       if (!domainCommitted) {
         try {
-          this.store.fail(claimed.id, claimed.leaseToken!, sanitizeResult({
+          const failure = sanitizeResult({
             kind: "task_failure", error: error instanceof Error ? error.message : String(error),
-          }));
+          });
+          if (this.store.get(claimed.id)?.launched) {
+            this.store.markNeedsReconciliation(claimed.id, claimed.leaseToken!, failure);
+          } else {
+            this.store.fail(claimed.id, claimed.leaseToken!, failure);
+          }
         } catch { /* a reconciler may already have fenced the queue lease */ }
       }
     }

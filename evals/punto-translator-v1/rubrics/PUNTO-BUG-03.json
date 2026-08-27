@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "id": "strict-command-grammar", "weight": 45, "hardGate": true, "evaluator": "hidden-ipc-command-grammar" },
+    { "id": "valid-command-compatibility", "weight": 25, "hardGate": true, "evaluator": "hidden-ipc-valid-commands" },
+    { "id": "project-regression-suite", "weight": 20, "hardGate": true, "command": ["bash", "-lc", "cmake -S cpp -B build-eval -DBUILD_TRAY=OFF -DCMAKE_BUILD_TYPE=Debug && cmake --build build-eval -j2 && ctest --test-dir build-eval --output-on-failure"] },
+    { "id": "scope", "weight": 10, "hardGate": false, "evaluator": "expected-files-only" }
+  ]
+}
