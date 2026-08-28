@@ -320,12 +320,12 @@ describe("process-only AgentRunner", () => {
       reasons: ["stage_baseline:code_audit:high"],
     } as const;
     for (const terminalText of [
-      JSON.stringify(verdict),
-      JSON.stringify({
+      `I'll inspect the review target.\n${JSON.stringify(verdict)}`,
+      `I'll inspect the review target.\n${JSON.stringify({
         protocolVersion: "agent-collab/v2",
         reasoningEffort: "high",
         visibleText: JSON.stringify(verdict),
-      }),
+      })}`,
     ]) {
       const stdout = JSON.stringify({
         stopReason: "end_turn",

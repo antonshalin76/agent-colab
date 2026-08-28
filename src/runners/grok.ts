@@ -213,20 +213,30 @@ export function normalizeGrokResult(
     throw new Error("model identity mismatch: expected grok-4.6 modelUsage");
   }
   let payload = record(envelope.structuredOutput);
+  const payloadFromStructuredOutput = payload !== null;
+  let visibleText = envelope.text;
   let visibleTextProvenance: NormalizedGrokEvalResult["visibleTextProvenance"] =
     "provider_structured";
   if (payload === null) {
-    try { payload = record(JSON.parse(envelope.text)); } catch { payload = null; }
+    const terminalLine = envelope.text.trim().split(/\r?\n/).at(-1) ?? "";
+    for (const candidate of new Set([envelope.text.trim(), terminalLine])) {
+      try { payload = record(JSON.parse(candidate)); } catch { payload = null; }
+      if (payload !== null) {
+        visibleText = candidate;
+        break;
+      }
+    }
   }
   const hasTransportDiscriminant = payload !== null && (
     "protocolVersion" in payload || "reasoningEffort" in payload || "visibleText" in payload
   );
   if (!hasTransportDiscriminant && expected.allowPlainVisibleText) {
-    if (!envelope.text.trim()) throw new Error("malformed Grok visible result parse");
+    if (!visibleText.trim()) throw new Error("malformed Grok visible result parse");
+    const plainVisibleText = payloadFromStructuredOutput ? JSON.stringify(payload) : visibleText;
     payload = {
       protocolVersion: expected.expectedProtocolVersion,
       reasoningEffort: expectedEffort,
-      visibleText: envelope.text,
+      visibleText: plainVisibleText,
     };
     visibleTextProvenance = "command_pinned_plain_text";
   } else if (payload === null) {
