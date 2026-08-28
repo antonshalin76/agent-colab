@@ -42,7 +42,10 @@ export function classifyProviderFailure(error: unknown, stderr = ""): OutcomeKin
   if (/rate.?limit|429/.test(message)) return "rate_limit";
   if (/quota|usage limit/.test(message)) return "quota";
   if (/auth|login|not logged|credential/.test(message)) return "auth";
-  if (/overload|unavailable|capacity|model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
+  if (/model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* visible result parse/.test(message)) {
+    return "task_failure";
+  }
+  if (/overload|unavailable|capacity|malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
     return "model_unavailable";
   }
   if (/permission|denied/.test(message)) return "permission_denial";

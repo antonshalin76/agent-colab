@@ -169,7 +169,12 @@ export function normalizeGrokResult(
 ): NormalizedGrokEvalResult;
 export function normalizeGrokResult(
   stdout: string,
-  expected: { expectedEffort: Effort; expectedProtocolVersion: string; includeUsage?: false },
+  expected: {
+    expectedEffort: Effort;
+    expectedProtocolVersion: string;
+    includeUsage?: false;
+    allowPlainVisibleText?: boolean;
+  },
 ): NormalizedGrokResult;
 export function normalizeGrokResult(
   stdout: string,
@@ -211,19 +216,21 @@ export function normalizeGrokResult(
   let visibleTextProvenance: NormalizedGrokEvalResult["visibleTextProvenance"] =
     "provider_structured";
   if (payload === null) {
-    try {
-      payload = record(JSON.parse(envelope.text));
-    } catch {
-      if (!expected.allowPlainVisibleText || !envelope.text.trim()) {
-        throw new Error("malformed Grok visible result parse");
-      }
-      payload = {
-        protocolVersion: expected.expectedProtocolVersion,
-        reasoningEffort: expectedEffort,
-        visibleText: envelope.text,
-      };
-      visibleTextProvenance = "command_pinned_plain_text";
-    }
+    try { payload = record(JSON.parse(envelope.text)); } catch { payload = null; }
+  }
+  const hasTransportDiscriminant = payload !== null && (
+    "protocolVersion" in payload || "reasoningEffort" in payload || "visibleText" in payload
+  );
+  if (!hasTransportDiscriminant && expected.allowPlainVisibleText) {
+    if (!envelope.text.trim()) throw new Error("malformed Grok visible result parse");
+    payload = {
+      protocolVersion: expected.expectedProtocolVersion,
+      reasoningEffort: expectedEffort,
+      visibleText: envelope.text,
+    };
+    visibleTextProvenance = "command_pinned_plain_text";
+  } else if (payload === null) {
+    throw new Error("malformed Grok visible result parse");
   }
   if (!payload || payload.protocolVersion !== expected.expectedProtocolVersion) {
     throw new Error("Grok protocol mismatch");

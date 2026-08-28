@@ -592,6 +592,7 @@ export class AgentRunner {
         ? normalizeGrokResult(result.stdout, {
             expectedEffort: payload.decision.effort as GrokEffort,
             expectedProtocolVersion: PROTOCOL,
+            allowPlainVisibleText: true,
           })
         : payload.decision.agent === "claude"
           ? normalizeClaudeResult(result.stdout, {

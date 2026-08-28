@@ -17,6 +17,7 @@ import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.j
 import { CollaborationRuntime } from "../src/runtime/collaboration-runtime.js";
 import { RunStore } from "../src/store/run-store.js";
 import { createCollaborationRun } from "../src/workflow/workflow.js";
+import { normalizeReviewProviderResult } from "../src/domain/review-verdict.js";
 
 const efforts = ["low", "medium", "high", "xhigh"] as const;
 
@@ -149,6 +150,16 @@ describe("process-only AgentRunner", () => {
     consumer: "claude",
     projectionBase64: Buffer.from(claudeProjection.bytes).toString("base64"),
     digest: claudeProjection.digest,
+  } as const;
+  const grokProjection = projectMapLearning(runnerProject, "grok").projection;
+  const grokLearningContext = `Promoted MAP learning projection for grok (${grokProjection.digest}):\n${Buffer.from(
+    grokProjection.bytes,
+  ).toString("utf8").trimEnd()}`;
+  const grokLearningBinding = {
+    schemaVersion: "map-learning-launch-binding/v1",
+    consumer: "grok",
+    projectionBase64: Buffer.from(grokProjection.bytes).toString("base64"),
+    digest: grokProjection.digest,
   } as const;
   const task = (overrides: Record<string, unknown> = {}) => {
     const decision = {
@@ -291,6 +302,59 @@ describe("process-only AgentRunner", () => {
       stdin: `${claudeLearningContext}\n\nreview`,
       killProcessGroup: true,
     });
+  });
+
+  it("accepts Grok plain visible text from the command-pinned terminal envelope", async () => {
+    const sessionId = "123e4567-e89b-42d3-a456-426614174000";
+    const attemptId = "123e4567-e89b-42d3-a456-426614174001";
+    const verdict = {
+      schemaVersion: "review-verdict/v1",
+      verdict: "PASS",
+      findings: [],
+    } as const;
+    const decision = {
+      agent: "grok",
+      model: "grok-4.6",
+      effort: "high",
+      policyVersion: "routing-v5",
+      reasons: ["stage_baseline:code_audit:high"],
+    } as const;
+    for (const terminalText of [
+      JSON.stringify(verdict),
+      JSON.stringify({
+        protocolVersion: "agent-collab/v2",
+        reasoningEffort: "high",
+        visibleText: JSON.stringify(verdict),
+      }),
+    ]) {
+      const stdout = JSON.stringify({
+        stopReason: "end_turn",
+        sessionId,
+        modelUsage: { "grok-4.6": { inputTokens: 1, outputTokens: 1 } },
+        text: terminalText,
+      });
+      const runner = new AgentRunner({
+        binaries: { grok: "/home/anton/.local/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
+        timeoutMs: 90_000,
+        launcher: { launch: () => ({
+          pid: 4323,
+          result: Promise.resolve({ exitCode: 0, stdout, stderr: "" }),
+          terminate: vi.fn(),
+        }) },
+      });
+      const candidate = task({
+        prompt: `${grokLearningContext}\n\nreview`, mapLearning: grokLearningBinding,
+        decision, sessionId, reviewAttemptId: attemptId,
+        reviewDispatchIdentity: {
+          ...decision, sessionId, attemptId, attemptOrdinal: 0, degraded: false,
+        },
+      });
+
+      const result = await runner.run(candidate);
+      expect(normalizeReviewProviderResult(result)).toMatchObject({
+        kind: "success", agent: "grok", reviewVerdict: verdict,
+      });
+    }
   });
 
   it("rejects a review attempt id detached from its immutable dispatch identity", async () => {
@@ -768,9 +832,14 @@ describe("process-only AgentRunner", () => {
     expect(terminate.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
   });
 
-  it("classifies exact-model and protocol drift as provider-unavailable outcomes", () => {
-    expect(classifyRunnerFailure(new Error("model identity mismatch: gpt-5.7"))).toBe("model_unavailable");
-    expect(classifyRunnerFailure(new Error("Grok protocol mismatch"))).toBe("model_unavailable");
+  it("keeps transport failures retryable but makes deterministic contract drift terminal", () => {
+    expect(classifyRunnerFailure(new Error("model identity mismatch: gpt-5.7"))).toBe("task_failure");
+    expect(classifyRunnerFailure(new Error("Grok protocol mismatch"))).toBe("task_failure");
+    expect(classifyRunnerFailure(new Error("Grok reasoning effort mismatch"))).toBe("task_failure");
     expect(classifyRunnerFailure(new Error("malformed Codex JSONL parse"))).toBe("model_unavailable");
+  });
+
+  it("does not retry malformed visible model output as provider unavailability", () => {
+    expect(classifyRunnerFailure(new Error("malformed Grok visible result parse"))).toBe("task_failure");
   });
 });
