@@ -22,6 +22,27 @@ export type OutcomeKind = (typeof FAILOVER_OUTCOMES)[number] | (typeof TERMINAL_
 export type FailoverOutcomeKind = (typeof FAILOVER_OUTCOMES)[number];
 export interface ProviderOutcome {
   kind: OutcomeKind;
+  retryAt?: number;
+}
+
+export const MAX_PROVIDER_RESET_HORIZON_MS = 31 * 24 * 60 * 60 * 1_000;
+const DEFAULT_PROVIDER_RESET_OFFSET = "+08:00";
+
+export function parseProviderRetryAt(text: string, now = Date.now()): number | undefined {
+  const values: number[] = [];
+  const accept = (value: number): void => {
+    if (Number.isSafeInteger(value) && value > now && value < now + MAX_PROVIDER_RESET_HORIZON_MS) values.push(value);
+  };
+  for (const match of text.matchAll(/retry-after\s*:\s*(\d+)/gi)) accept(now + Number(match[1]) * 1_000);
+  for (const match of text.matchAll(/(?:reset(?:s|\s+at)?|retry(?:\s+at)?|until)\D{0,24}(\d{10}|\d{13}|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/gi)) {
+    const raw = match[1];
+    if (!raw) continue;
+    const value = /^\d{10}$/.test(raw) ? Number(raw) * 1_000
+      : /^\d{13}$/.test(raw) ? Number(raw)
+        : new Date(`${raw.includes("T") ? raw : raw.replace(" ", "T")}${/(?:Z|[+-]\d{2}:?\d{2})$/.test(raw) ? "" : DEFAULT_PROVIDER_RESET_OFFSET}`).getTime();
+    accept(value);
+  }
+  return values.length ? Math.max(...values) : undefined;
 }
 
 export class ProviderTransportFailure extends Error {
@@ -34,23 +55,30 @@ export class ProviderTransportFailure extends Error {
   }
 }
 
-export function classifyProviderFailure(error: unknown, stderr = ""): OutcomeKind {
-  if (error instanceof ProviderTransportFailure) return error.outcome;
+export function classifyProviderFailureDetail(error: unknown, stderr = "", now = Date.now()): ProviderOutcome {
+  if (error instanceof ProviderTransportFailure) return { kind: error.outcome };
   const message = `${error instanceof Error ? error.message : String(error)} ${stderr}`.toLowerCase();
-  if (/enoent|not found/.test(message)) return "cli_missing";
-  if (/timed?\s*out|timeout/.test(message)) return "network_timeout";
-  if (/rate.?limit|429/.test(message)) return "rate_limit";
-  if (/quota|usage limit/.test(message)) return "quota";
-  if (/auth|login|not logged|credential/.test(message)) return "auth";
+  const retryAt = parseProviderRetryAt(`${error instanceof Error ? error.message : String(error)} ${stderr}`, now);
+  if (/rate.?limit|429/.test(message)) return { kind: "rate_limit", ...(retryAt ? { retryAt } : {}) };
+  if (/quota|usage limit/.test(message)) return { kind: "quota", ...(retryAt ? { retryAt } : {}) };
+  if (/unrecognized_model|unsupported model|model not found/.test(message)) return { kind: "task_failure" };
+  if (/model (?:is )?unavailable/.test(message)) return { kind: "model_unavailable" };
+  if (/enoent|command not found|no such file or directory/.test(message)) return { kind: "cli_missing" };
+  if (/timed?\s*out|timeout/.test(message)) return { kind: "network_timeout" };
+  if (/auth|login|not logged|credential/.test(message)) return { kind: "auth" };
   if (/model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* visible result parse/.test(message)) {
-    return "task_failure";
+    return { kind: "task_failure" };
   }
   if (/overload|unavailable|capacity|malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
-    return "model_unavailable";
+    return { kind: "model_unavailable" };
   }
-  if (/permission|denied/.test(message)) return "permission_denial";
-  if (/invalid request|bad request/.test(message)) return "invalid_request";
-  return "task_failure";
+  if (/permission|denied/.test(message)) return { kind: "permission_denial" };
+  if (/invalid request|bad request/.test(message)) return { kind: "invalid_request" };
+  return { kind: "task_failure" };
+}
+
+export function classifyProviderFailure(error: unknown, stderr = ""): OutcomeKind {
+  return classifyProviderFailureDetail(error, stderr).kind;
 }
 
 const FAILOVER_SET: ReadonlySet<string> = new Set(FAILOVER_OUTCOMES);

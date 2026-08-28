@@ -549,7 +549,7 @@ describe("runtime durable review barrier", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
     expect(health.canAttempt("claude", 0)).toBe(true);
-    health.recordFailoverFailure("claude", { kind: "quota" }, 100);
+    health.recordFailoverFailure("claude", { kind: "quota" }, 100, 0);
     health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
 
@@ -742,7 +742,7 @@ describe("runtime durable review barrier", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
     expect(health.canAttempt("claude", 0)).toBe(true);
-    health.recordFailoverFailure("claude", { kind: "model_unavailable" }, 100);
+    health.recordFailoverFailure("claude", { kind: "model_unavailable" }, 100, 0);
     health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
     const store = new RunGateUnitOfWork(path);
@@ -792,7 +792,7 @@ describe("runtime durable review barrier", () => {
   it("marks deferred lanes stale when the source workspace fingerprint changed", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    health.canAttempt("claude", 0); health.recordFailoverFailure("claude", { kind: "quota" }, 100);
+    health.canAttempt("claude", 0); health.recordFailoverFailure("claude", { kind: "quota" }, 100, 0);
     health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
     const store = new RunGateUnitOfWork(path);

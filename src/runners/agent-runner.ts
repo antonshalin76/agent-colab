@@ -14,7 +14,7 @@ import {
   type ReviewProviderId,
   type Stage,
 } from "../domain/routing.js";
-import { classifyProviderFailure } from "../domain/outcomes.js";
+import { classifyProviderFailure, classifyProviderFailureDetail } from "../domain/outcomes.js";
 import { redactSensitive } from "../security/redaction.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
@@ -617,7 +617,7 @@ export class AgentRunner {
         ? redactSensitive(String(error.stderr))
         : "";
       return {
-        kind: classifyRunnerFailure(error, stderr),
+        ...classifyProviderFailureDetail(error, stderr),
         agent: payload.decision.agent,
         error: error instanceof Error ? error.message : String(error),
         ...(stderr ? { logs: [stderr] } : {}),

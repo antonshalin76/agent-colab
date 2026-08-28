@@ -326,25 +326,6 @@ if (command === "mcp") {
   const startupOutbox = new RunStore(layout.database);
   collaborationRuntime.drainDispatchOutbox(startupOutbox); startupOutbox.close();
 
-  const refreshHealth = (now: number): void => {
-    for (const [agent, binary, args] of [
-      ["grok", grokBinary, ["models"]],
-      ["claude", claudeBinary, ["auth", "status"]],
-      ["codex", codexBinary, ["login", "status"]],
-    ] as const) {
-      const state = health.get(agent);
-      if (state.health === "healthy" || state.health === "disabled" ||
-          (state.health === "probing" && state.updatedAt > 0) ||
-          (state.retryAt !== null && state.retryAt > now) || !health.canAttempt(agent, now)) continue;
-      const result = spawnSync(binary, args, { encoding: "utf8", timeout: 10_000, shell: false });
-      if (result.status === 0) health.recordAuthReady(agent, now);
-      else health.recordFailoverFailure(agent, {
-        kind: result.error && "code" in result.error && result.error.code === "ENOENT" ? "cli_missing" : "auth",
-      }, now);
-    }
-  };
-
-  refreshHealth(Date.now());
   const runner = new AgentRunner({ binaries: {
     grok: grokBinary,
     claude: claudeBinary,
@@ -442,7 +423,8 @@ if (command === "mcp") {
       if (resultKind === "success") {
         health.recordSuccess(agent, terminalAt, admissionClaimedAt);
       } else if (isFailoverOutcome(resultKind)) {
-        health.recordFailoverFailure(agent, { kind: resultKind }, terminalAt, admissionClaimedAt);
+        const retryAt = typeof providerResult.retryAt === "number" ? providerResult.retryAt : undefined;
+        health.recordFailoverFailure(agent, { kind: resultKind, ...(retryAt ? { retryAt } : {}) }, terminalAt, admissionClaimedAt);
       } else if (admissionClaimedAt !== undefined) {
         health.releaseAttempt(agent, terminalAt, admissionClaimedAt);
       }
@@ -690,7 +672,6 @@ if (command === "mcp") {
       await replayPendingDomainEffects();
       const outboxQueue = new RunStore(layout.database);
       collaborationRuntime.drainDispatchOutbox(outboxQueue, now); outboxQueue.close();
-      refreshHealth(now);
       const available = routingHealth(health, now);
       for (const recoverable of collaborationRuntime.workflows.recoverable()) {
         const recovery = recoverable.state.recovery;
@@ -730,13 +711,17 @@ if (command === "mcp") {
       claude: discoverProviderVersion(claudeBinary),
       codex: discoverProviderVersion(codexBinary),
     };
+    const probeAt = Date.now();
+    const probeAdmissions = Object.fromEntries(REVIEW_PROVIDERS.map((agent) =>
+      [agent, service.providers.acquireExplicitProbeAdmission(agent, probeAt)])) as
+      Record<ReviewProviderId, ReturnType<ProviderHealthStore["acquireExplicitProbeAdmission"]>>;
     const result = await runCapabilityProbes({
       providers: {
-        grok: { enabled: true, binaryPath: grokBinary, expectedVersion: versions.grok,
+        grok: { enabled: probeAdmissions.grok.runnable, binaryPath: grokBinary, expectedVersion: versions.grok,
           model: "grok-4.6", effort: "high", cwd: process.cwd() },
-        claude: { enabled: true, binaryPath: claudeBinary, expectedVersion: versions.claude,
+        claude: { enabled: probeAdmissions.claude.runnable, binaryPath: claudeBinary, expectedVersion: versions.claude,
           model: "glm-5.3", effort: "max", cwd: process.cwd() },
-        codex: { enabled: true, binaryPath: codexBinary, expectedVersion: versions.codex,
+        codex: { enabled: probeAdmissions.codex.runnable, binaryPath: codexBinary, expectedVersion: versions.codex,
           model: "gpt-5.6-sol", effort: "high", cwd: process.cwd() },
       },
       timeoutMs: 120_000,
@@ -764,8 +749,11 @@ if (command === "mcp") {
       },
     });
     for (const agent of REVIEW_PROVIDERS) {
-      if (result.results[agent].ready) service.providers.recordSuccess(agent, Date.now());
-      else service.providers.recordFailoverFailure(agent, { kind: "model_unavailable" }, Date.now());
+      if (!probeAdmissions[agent].runnable) continue;
+      const now = Date.now();
+      const claimedAt = probeAdmissions[agent].claimedAt;
+      if (result.results[agent].ready) service.providers.recordSuccess(agent, now, claimedAt);
+      else service.providers.recordFailoverFailure(agent, { kind: "model_unavailable" }, now, claimedAt);
     }
     console.log(JSON.stringify(result, null, 2));
   } else if (command === "doctor") {

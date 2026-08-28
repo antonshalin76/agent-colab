@@ -53,6 +53,19 @@ describe("durable run store", () => {
     store.close();
   });
 
+  it("claims demanded review before ordinary review at the same persisted priority", () => {
+    const store = new RunStore(makeDb());
+    const ordinary = store.enqueue({ idempotencyKey: "ordinary", stage: "review:critic", priority: 5, now: 1,
+      payload: { providerAdmissionClaimedAt: "invalid" } });
+    const demanded = store.enqueue({ idempotencyKey: "demanded", stage: "review:auditor", priority: 5, now: 2,
+      payload: { providerAdmissionClaimedAt: 42 } });
+    const coordination = store.enqueue({ idempotencyKey: "coordination-first", stage: "coordination", priority: 1, now: 3 });
+    expect(store.claimNext({ workerId: "w", leaseMs: 100, now: 10 })?.id).toBe(coordination.id);
+    expect(store.claimNext({ workerId: "w", leaseMs: 100, now: 11 })?.id).toBe(demanded.id);
+    expect(store.get(ordinary.id)?.status).toBe("queued");
+    store.close();
+  });
+
   it("fences two store connections and rejects stale lease completion", () => {
     const path = makeDb(); const first = new RunStore(path); const second = new RunStore(path);
     first.enqueue({ idempotencyKey: "one-launch", stage: "review", priority: 5, now: 1 });

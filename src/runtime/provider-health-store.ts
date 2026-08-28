@@ -188,6 +188,18 @@ export class ProviderHealthStore {
     return changed === 1 ? { runnable: true, claimedAt: now } : { runnable: false };
   }
 
+  acquireExplicitProbeAdmission(agent: ReviewProviderId, now: number): ProviderAdmission {
+    const changed = this.db.prepare(`
+      UPDATE runtime_provider_health
+         SET health = 'probing', attempt_claimed = 1, updated_at = ?
+       WHERE agent = ? AND health != 'disabled' AND attempt_claimed = 0
+         AND (health = 'healthy'
+           OR (health = 'probing' AND (updated_at = 0 OR updated_at <= ?))
+           OR (health = 'unavailable' AND retry_at IS NOT NULL AND retry_at <= ?))
+    `).run(now, agent, now - this.attemptLeaseMs, now).changes;
+    return changed === 1 ? { runnable: true, claimedAt: now } : { runnable: false };
+  }
+
   canAttempt(agent: ReviewProviderId, now: number): boolean {
     return this.acquireAdmission(agent, now).runnable;
   }
@@ -200,8 +212,11 @@ export class ProviderHealthStore {
          SET health = 'healthy', retry_at = NULL, failure_count = 0,
              attempt_claimed = 0, capability_verified = 1, updated_at = ?
        WHERE agent = ?
-         AND (? IS NULL OR (attempt_claimed = 1 AND updated_at = ?))
-    `).run(now, agent, expectedClaimedAt ?? null, expectedClaimedAt ?? null);
+         AND updated_at <= ?
+         AND ((? IS NULL AND attempt_claimed = 0 AND (health = 'healthy'
+               OR (health = 'probing' AND capability_verified = 0 AND updated_at = 0)))
+           OR (? IS NOT NULL AND attempt_claimed = 1 AND updated_at = ?))
+    `).run(now, agent, now, expectedClaimedAt ?? null, expectedClaimedAt ?? null, expectedClaimedAt ?? null);
     return this.get(agent);
   }
 
@@ -239,14 +254,18 @@ export class ProviderHealthStore {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
     const preserveCapability = current.capabilityVerified && TRANSIENT_CAPABILITY_FAILURES.has(outcome.kind);
+    const retryAt = Math.max(now + this.cooldownMs,
+      Number.isSafeInteger(outcome.retryAt) && outcome.retryAt! > now ? outcome.retryAt! : 0);
     this.db.prepare(`
       UPDATE runtime_provider_health
          SET health = 'unavailable', retry_at = ?, failure_count = failure_count + 1,
              attempt_claimed = 0, capability_verified = ?, updated_at = ?
        WHERE agent = ?
-         AND (? IS NULL OR (attempt_claimed = 1 AND updated_at = ?))
-    `).run(now + this.cooldownMs, preserveCapability ? 1 : 0, now, agent,
-      expectedClaimedAt ?? null, expectedClaimedAt ?? null);
+         AND updated_at <= ?
+         AND ((? IS NULL AND health = 'healthy' AND attempt_claimed = 0)
+           OR (? IS NOT NULL AND attempt_claimed = 1 AND updated_at = ?))
+    `).run(retryAt, preserveCapability ? 1 : 0, now, agent, now,
+      expectedClaimedAt ?? null, expectedClaimedAt ?? null, expectedClaimedAt ?? null);
     return this.get(agent);
   }
 

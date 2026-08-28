@@ -17,6 +17,18 @@ afterEach(() => {
 });
 
 describe("runtime provider health persistence", () => {
+  it("fences explicit provider probes before launch", () => {
+    const path = database();
+    const first = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    const second = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    expect(first.acquireExplicitProbeAdmission("claude", 10)).toEqual({ runnable: true, claimedAt: 10 });
+    expect(second.acquireExplicitProbeAdmission("claude", 10)).toEqual({ runnable: false });
+    expect(first.recordFailoverFailure("claude", { kind: "quota" }, 20, 10).health).toBe("unavailable");
+    expect(first.acquireExplicitProbeAdmission("claude", 1_019)).toEqual({ runnable: false });
+    expect(first.acquireExplicitProbeAdmission("claude", 1_020)).toEqual({ runnable: true, claimedAt: 1_020 });
+    expect(first.recordSuccess("claude", 1_021, 1_020).health).toBe("healthy");
+    first.close(); second.close();
+  });
   it("rejects a pre-v3 provider schema instead of migrating it in the constructor", () => {
     const path = database();
     const db = new Database(path);
@@ -133,7 +145,7 @@ describe("runtime provider health persistence", () => {
     const second = new ProviderHealthStore(path, { cooldownMs: 1_000 });
 
     expect(first.canAttempt("grok", 0)).toBe(true);
-    expect(first.recordFailoverFailure("grok", { kind: "rate_limit" }, 100)).toMatchObject({
+    expect(first.recordFailoverFailure("grok", { kind: "rate_limit" }, 100, 0)).toMatchObject({
       health: "unavailable",
       retryAt: 1_100,
       failureCount: 1,
@@ -156,7 +168,7 @@ describe("runtime provider health persistence", () => {
   it("records recovery and never penalizes a provider for a non-failover outcome", () => {
     const store = new ProviderHealthStore(database(), { cooldownMs: 1_000 });
     expect(store.canAttempt("codex", 0)).toBe(true);
-    store.recordFailoverFailure("codex", { kind: "auth" }, 50);
+    store.recordFailoverFailure("codex", { kind: "auth" }, 50, 0);
 
     expect(() =>
       store.recordFailoverFailure("codex", { kind: "permission_denial" }, 60),
@@ -167,13 +179,14 @@ describe("runtime provider health persistence", () => {
       failureCount: 1,
     });
 
-    expect(store.recordSuccess("codex", 1_051)).toMatchObject({
+    expect(store.acquireAdmission("codex", 1_051)).toEqual({ runnable: true, claimedAt: 1_051 });
+    expect(store.recordSuccess("codex", 1_052, 1_051)).toMatchObject({
       health: "healthy",
       retryAt: null,
       failureCount: 0,
       attemptClaimed: false,
       capabilityVerified: true,
-      updatedAt: 1_051,
+      updatedAt: 1_052,
     });
     expect(store.canAttempt("codex", 1_052)).toBe(true);
     store.close();
@@ -186,7 +199,7 @@ describe("runtime provider health persistence", () => {
       health: "probing", attemptClaimed: false, capabilityVerified: false,
     });
     expect(store.canAttempt("codex", 3)).toBe(true);
-    expect(store.recordSuccess("codex", 4)).toMatchObject({
+    expect(store.recordSuccess("codex", 4, 3)).toMatchObject({
       health: "healthy", capabilityVerified: true, attemptClaimed: false,
     });
     store.close();

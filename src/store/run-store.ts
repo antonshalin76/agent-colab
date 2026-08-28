@@ -118,7 +118,11 @@ export class RunStore {
     return this.db.transaction(() => {
       const candidate = this.db.prepare(`SELECT id FROM runs r WHERE status='queued' AND next_attempt_at <= ?
         AND (depends_on_run_id IS NULL OR EXISTS (SELECT 1 FROM runs d WHERE d.id=r.depends_on_run_id AND d.status='completed'))
-        ORDER BY priority ASC, created_at ASC, id ASC LIMIT 1`).get(now) as { id: string } | undefined;
+        ORDER BY priority ASC,
+          CASE WHEN stage LIKE 'review:%'
+            AND typeof(json_extract(payload, '$.providerAdmissionClaimedAt')) IN ('integer','real')
+            THEN 0 ELSE 1 END ASC,
+          created_at ASC, id ASC LIMIT 1`).get(now) as { id: string } | undefined;
       if (!candidate) return undefined;
       const token = randomUUID();
       const changed = this.db.prepare(`UPDATE runs SET status='claimed', lease_token=?, lease_expires_at=?,

@@ -18,8 +18,27 @@ import { CollaborationRuntime } from "../src/runtime/collaboration-runtime.js";
 import { RunStore } from "../src/store/run-store.js";
 import { createCollaborationRun } from "../src/workflow/workflow.js";
 import { normalizeReviewProviderResult } from "../src/domain/review-verdict.js";
+import { classifyProviderFailureDetail } from "../src/domain/outcomes.js";
 
 const efforts = ["low", "medium", "high", "xhigh"] as const;
+
+describe("provider retry evidence", () => {
+  it("preserves the Claude five-hour usage-limit reset", () => {
+    const now = new Date("2026-08-28T18:09:11+08:00").getTime();
+    expect(classifyProviderFailureDetail(new Error(
+      "API Error: Request rejected (429) [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-08-28 20:24:53]",
+    ), "", now)).toEqual({
+      kind: "rate_limit",
+      retryAt: new Date("2026-08-28T20:24:53+08:00").getTime(),
+    });
+  });
+
+  it.each(["unrecognized_model", "unsupported model", "model not found"])(
+    "keeps deterministic model contract failure terminal: %s", (message) => {
+      expect(classifyProviderFailureDetail(new Error(message))).toEqual({ kind: "task_failure" });
+    },
+  );
+});
 
 const codexStream = (text = "visible Codex answer", model = "gpt-5.6-sol") => [
   JSON.stringify({ type: "session_meta", payload: { id: "codex-session", model } }),
