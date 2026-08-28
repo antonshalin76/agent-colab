@@ -10,6 +10,7 @@ import { AgentRunner } from "../src/runners/agent-runner.js";
 import Database from "better-sqlite3";
 import { formatMapLearningLaunchBindingContext } from "../src/flow/map-admin.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 
 const delegatedArtifact = (artifactContent: string) => ({
   artifactContent,
@@ -101,7 +102,7 @@ describe("local collaboration service wiring", () => {
         requester: "grok", stage: "code_review", project, prompt: "review",
         artifactContent, artifactHash, approvalScope: "workspace-read",
         idempotencyKey: "large-artifact",
-      } as never);
+      });
       expect(service.runtime.workflows.get(delegated.runId)?.activeStage?.assignment).toMatchObject({
         agent: "codex",
         effort: "high",
@@ -186,7 +187,7 @@ describe("local collaboration service wiring", () => {
       const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
       const result = await service.requestReview({
         requester: "codex",
-        project,
+        workspaceRoot: project,
         artifactHash,
         artifactContent,
         prompt: "review immutable artifact",
@@ -251,6 +252,66 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("binds all review providers to the exact linked worktree root and fingerprint", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-review-worktree-"));
+    const main = join(root, "main"); const worktree = join(root, "review");
+    execFileSync("git", ["init", "-q", main]);
+    execFileSync("git", ["-C", main, "config", "user.email", "test@example.invalid"]);
+    execFileSync("git", ["-C", main, "config", "user.name", "Test"]);
+    (await import("node:fs")).writeFileSync(join(main, "tracked.txt"), "main\n");
+    execFileSync("git", ["-C", main, "add", "tracked.txt"]);
+    execFileSync("git", ["-C", main, "commit", "-qm", "base"]);
+    execFileSync("git", ["-C", main, "worktree", "add", "-qb", "review", worktree]);
+    (await import("node:fs")).writeFileSync(join(worktree, "review-only.txt"), "exact review state\n");
+    const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
+    markCapabilityReady(service);
+    try {
+      const artifactContent = "linked worktree review";
+      const result = await service.requestReview({
+        requester: "codex", workspaceRoot: worktree,
+        artifactHash: createHash("sha256").update(artifactContent).digest("hex"), artifactContent,
+        prompt: "review exact worktree", approvalScope: "workspace-read",
+        idempotencyKey: "linked-worktree-review",
+      } as never);
+      const fingerprint = captureWorkspaceFingerprint(worktree).fingerprint;
+      expect(service.runs.list()).toHaveLength(6);
+      expect(service.runs.list().every((run) => run.payload?.project === worktree)).toBe(true);
+      expect(service.runs.list().every((run) => run.payload?.sourceFingerprint === fingerprint)).toBe(true);
+      expect(service.reviews.get(result.reviewId)).toMatchObject({ project: worktree, sourceFingerprint: fingerprint });
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects invalid review roots without durable side effects", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-review-subdir-"));
+    const outside = mkdtempSync(join(tmpdir(), "agent-collab-review-outside-"));
+    const project = join(root, "project"); const subdir = join(project, "nested");
+    execFileSync("git", ["init", "-q", project]); execFileSync("mkdir", [subdir]);
+    const database = join(root, "state.db");
+    const service = new LocalCollabService(database, serviceOptions(root));
+    markCapabilityReady(service);
+    const db = new Database(database, { readonly: true });
+    const barrierCount = () => (db.prepare("SELECT count(*) AS count FROM runtime_review_barriers").get() as { count: number }).count;
+    try {
+      const beforeRuns = service.runs.list(); const beforeBarriers = barrierCount(); const artifactContent = "review";
+      const invalidRoots: Array<[string, RegExp]> = [
+        [subdir, /worktree top-level/i],
+        [join(root, "missing"), /real project directory/i],
+        [outside, /outside allowed project roots/i],
+      ];
+      for (const [index, [workspaceRoot, error]] of invalidRoots.entries()) {
+        await expect(service.requestReview({ requester: "codex", workspaceRoot,
+          artifactHash: createHash("sha256").update(artifactContent).digest("hex"), artifactContent,
+          prompt: "review", approvalScope: "workspace-read", idempotencyKey: `invalid-review-${index}`,
+        })).rejects.toThrow(error);
+        expect(service.runs.list()).toEqual(beforeRuns);
+        expect(barrierCount()).toBe(beforeBarriers);
+      }
+    } finally {
+      db.close(); service.close();
+      rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it("rejects credential-bearing review bytes instead of breaking the declared artifact hash", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-review-secret-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
@@ -258,7 +319,7 @@ describe("local collaboration service wiring", () => {
     markCapabilityReady(service);
     try {
       const artifactContent = "review me sk-ant-FAKEFAKEFAKEFAKEFAKEFAKE";
-      await expect(service.requestReview({ requester: "codex", project, artifactContent,
+      await expect(service.requestReview({ requester: "codex", workspaceRoot: project, artifactContent,
         artifactHash: createHash("sha256").update(artifactContent).digest("hex"), prompt: "review",
         approvalScope: "workspace-read", idempotencyKey: "secret-review" }))
         .rejects.toThrow("cannot preserve its exact hash safely");
@@ -290,7 +351,7 @@ describe("local collaboration service wiring", () => {
     const secret = "sk-ant-FAKE_REVIEW_PROMPT_SECRET_123456";
     try {
       const artifactContent = "safe immutable review artifact";
-      const result = await service.requestReview({ requester: "codex", project, artifactContent,
+      const result = await service.requestReview({ requester: "codex", workspaceRoot: project, artifactContent,
         artifactHash: createHash("sha256").update(artifactContent).digest("hex"), prompt: `review with ${secret}`,
         approvalScope: "workspace-read", idempotencyKey: "prompt-secret-review" });
       const serialized = JSON.stringify({ review: service.reviews.get(result.reviewId), runs: service.runs.list() });
@@ -312,8 +373,8 @@ describe("local collaboration service wiring", () => {
       const artifactContent = "same review"; const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
       const common = { requester: "codex" as const, artifactHash, artifactContent, prompt: "review",
         approvalScope: "workspace-read" as const, idempotencyKey: "same-review" };
-      const first = await service.requestReview({ ...common, project: a });
-      const second = await service.requestReview({ ...common, project: b });
+      const first = await service.requestReview({ ...common, workspaceRoot: a });
+      const second = await service.requestReview({ ...common, workspaceRoot: b });
       expect(first.reviewId).not.toBe(second.reviewId);
       expect(service.runs.list()).toHaveLength(12);
       expect(new Set(service.runs.list().map((run) => run.idempotencyKey)).size).toBe(12);
@@ -660,7 +721,7 @@ describe("local collaboration service wiring", () => {
       service.providers.recordSuccess("codex", 1);
       const artifactContent = "degraded immutable artifact";
       const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
-      const result = await service.requestReview({ requester: "codex", project, artifactHash, artifactContent,
+      const result = await service.requestReview({ requester: "codex", workspaceRoot: project, artifactHash, artifactContent,
         prompt: "review", approvalScope: "workspace-read", idempotencyKey: "degraded-review" });
       expect(result).toMatchObject({ laneCount: 6, activeLaneCount: 5, runState: "DEGRADED_REVIEW_SET" });
       expect(service.runs.list().map((run) => run.payload?.preferredAgent)).toEqual([

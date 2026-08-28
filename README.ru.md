@@ -100,6 +100,12 @@ node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs mcp
 Укажите абсолютный путь к checkout. После изменения регистрации MCP или общих
 скиллов перезапустите все три harness.
 
+`collab_request_review` требует поле `workspaceRoot`: точный корень checkout или
+linked worktree, который должны проверять все review-провайдеры. Git-подкаталог,
+отсутствующий путь, путь вне настроенных разрешённых корней и устаревшее поле
+`project` отклоняются до сохранения review-состояния. Каталоги проектов без Git
+по-прежнему поддерживаются.
+
 ## Worker
 
 Для надежной фоновой обработки запустите worker:

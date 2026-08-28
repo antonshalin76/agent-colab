@@ -12,7 +12,7 @@ export interface DelegateInput {
   artifactHash: string; artifactContent: string; approvalScope: ApprovalScope; approvalReference?: string | undefined; idempotencyKey: string;
 }
 export interface ReviewInput {
-  requester: ActiveAgentId; project: string; stageId?: string | undefined; artifactHash: string; artifactContent: string; prompt: string;
+  requester: ActiveAgentId; workspaceRoot: string; stageId?: string | undefined; artifactHash: string; artifactContent: string; prompt: string;
   approvalScope: ApprovalScope; approvalReference?: string | undefined; idempotencyKey: string;
 }
 export interface CollabService {
@@ -62,11 +62,14 @@ export function createCollabMcpServer(service: CollabService): McpServer {
       return service.delegate(input);
     }));
   const reviewSchema = z.object({
-    requester: agent, project: boundedPath, stageId: boundedId.optional(),
+    requester: agent, workspaceRoot: boundedPath, stageId: boundedId.optional(),
     artifactHash: sha256, artifactContent: z.string().max(2_000_000), prompt: z.string().max(200_000),
     approvalScope, approvalReference: boundedId.optional(), idempotencyKey: boundedId,
   }).strict();
-  server.registerTool("collab_request_review", { description: "Dispatch six independent auditor and critic lanes", inputSchema: reviewSchema },
+  server.registerTool("collab_request_review", {
+    description: "Dispatch six independent auditor and critic lanes in the exact checkout or linked-worktree root supplied as workspaceRoot",
+    inputSchema: reviewSchema,
+  },
     guarded(async (input) => {
       if (input.approvalScope === "external" && !input.approvalReference) throw new Error("external review requires explicit approval reference");
       return service.requestReview(input);

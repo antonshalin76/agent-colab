@@ -6,8 +6,32 @@ import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprin
 import { executionAuthorityConsumerKey } from "../src/flow/execution-snapshot.js";
 import { ensureStateLayout, resolveStatePath } from "../src/store/state-layout.js";
 import { execFileSync } from "node:child_process";
+import { ProjectPolicy } from "../src/security/project-policy.js";
 
 describe("local state security", () => {
+  it("admits only an exact Git worktree top-level as a review workspace", () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-review-worktree-policy-"));
+    const main = join(root, "main"); const worktree = join(root, "review");
+    try {
+      execFileSync("git", ["init", "-q", main]);
+      execFileSync("git", ["-C", main, "config", "user.email", "test@example.invalid"]);
+      execFileSync("git", ["-C", main, "config", "user.name", "Test"]);
+      writeFileSync(join(main, "tracked.txt"), "main\n");
+      execFileSync("git", ["-C", main, "add", "tracked.txt"]);
+      execFileSync("git", ["-C", main, "commit", "-qm", "base"]);
+      execFileSync("git", ["-C", main, "worktree", "add", "-qb", "review", worktree]);
+      const policy = new ProjectPolicy([root]) as ProjectPolicy & {
+        resolveReviewWorkspace(path: string): string;
+      };
+
+      expect(policy.resolveReviewWorkspace(worktree)).toBe(worktree);
+      const nested = join(worktree, "nested"); execFileSync("mkdir", [nested]);
+      expect(() => policy.resolveReviewWorkspace(nested))
+        .toThrow(/worktree top-level/i);
+      const nonGit = join(root, "non-git"); execFileSync("mkdir", [nonGit]);
+      expect(policy.resolveReviewWorkspace(nonGit)).toBe(nonGit);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it("creates private files and no listener", () => {
     const parent = mkdtempSync(join(tmpdir(), "agent-collab-security-"));
     try { const root = join(parent, "state"); const layout = ensureStateLayout(root); expect(lstatSync(root).mode & 0o777).toBe(0o700); expect(lstatSync(layout.database).mode & 0o777).toBe(0o600); expect(layout.socket).toBeUndefined(); }

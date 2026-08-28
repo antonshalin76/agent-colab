@@ -109,7 +109,7 @@ describe("stdio MCP collaboration boundary", () => {
     const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
     const result = await client.callTool({ name: "collab_request_review", arguments: {
       requester: "codex",
-      project: "/repo",
+      workspaceRoot: "/repo",
       artifactHash,
       artifactContent,
       prompt: "audit and critique",
@@ -120,7 +120,21 @@ describe("stdio MCP collaboration boundary", () => {
     const text = content[0]?.type === "text" ? content[0].text ?? "" : "";
     expect(result.isError).not.toBe(true);
     expect(text).toContain('"laneCount":6');
-    expect(service.requestReview).toHaveBeenCalledOnce();
+    expect(service.requestReview).toHaveBeenCalledWith(expect.objectContaining({ workspaceRoot: "/repo" }));
+    expect(vi.mocked(service.requestReview).mock.calls[0]![0]).not.toHaveProperty("project");
+    await client.close(); await server.close();
+  });
+
+  it("rejects legacy project-only review input before calling the service", async () => {
+    const service = fakeService(); const { client, server } = await connect(service);
+    const artifactContent = "review artifact";
+    const result = await client.callTool({ name: "collab_request_review", arguments: {
+      requester: "codex", project: "/repo",
+      artifactHash: createHash("sha256").update(artifactContent).digest("hex"), artifactContent,
+      prompt: "review", approvalScope: "workspace-read", idempotencyKey: "legacy-review",
+    } });
+    expect(result.isError).toBe(true);
+    expect(service.requestReview).not.toHaveBeenCalled();
     await client.close(); await server.close();
   });
 

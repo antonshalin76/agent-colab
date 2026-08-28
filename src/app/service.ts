@@ -362,7 +362,7 @@ export class LocalCollabService implements CollabService {
   }
   async requestReview(input: ReviewInput) {
     this.assertSharedSkills();
-    const project = this.projects.resolve(input.project);
+    const project = this.projects.resolveReviewWorkspace(input.workspaceRoot);
     if (input.approvalScope !== "workspace-read") throw new Error("review lanes are immutable read-only operations");
     if (redactSensitive(input.artifactContent) !== input.artifactContent) {
       throw new Error("review artifact contains credential material and cannot preserve its exact hash safely");

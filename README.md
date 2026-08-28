@@ -95,6 +95,12 @@ node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs mcp
 Use the absolute path for your checkout. Restart the three harnesses after
 changing the MCP registration or shared skills.
 
+`collab_request_review` requires `workspaceRoot`: the exact checkout or linked
+worktree top-level that every review provider must inspect. A Git subdirectory,
+missing path, path outside the configured allowed roots, or the legacy
+`project` field is rejected before review state is persisted. Non-Git project
+directories remain supported.
+
 ## Worker
 
 For durable background processing, run the worker:

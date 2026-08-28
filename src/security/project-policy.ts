@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, relative } from "node:path";
@@ -32,6 +33,25 @@ export class ProjectPolicy {
     const canonical = realDirectory(project, "project");
     if (!this.allowedRoots.some((root) => isInside(root, canonical))) {
       throw new Error(`project is outside allowed project roots: ${project}`);
+    }
+    return canonical;
+  }
+
+  resolveReviewWorkspace(workspaceRoot: string): string {
+    const canonical = this.resolve(workspaceRoot);
+    const git = spawnSync("git", ["-C", canonical, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      shell: false,
+      timeout: 5_000,
+    });
+    if (git.error) throw new Error(`cannot validate review workspaceRoot: ${git.error.message}`);
+    if (git.status !== 0) {
+      if (/not a git repository/i.test(git.stderr)) return canonical;
+      throw new Error(`cannot validate review workspaceRoot Git top-level: ${workspaceRoot}`);
+    }
+    const topLevel = realDirectory(git.stdout.trim(), "Git worktree top-level");
+    if (topLevel !== canonical) {
+      throw new Error(`review workspaceRoot must be the exact Git worktree top-level: ${workspaceRoot}`);
     }
     return canonical;
   }
