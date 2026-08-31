@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "implementation-plan-lock/v1",
+  "planId": "agent-collab-hybrid-flow-v1-r2",
+  "revision": "1.1.0",
+  "status": "stabilized_ready_for_lock",
+  "planPath": "docs/hybrid-flow-v1-r2/IMPLEMENTATION_PLAN.md",
+  "planSha256": "af9191ea30d500de7f53cfdb57a890bfc7c1e55df3d3e738ed667bce7a787224",
+  "normativeArtifacts": {
+    "docs/hybrid-flow-v1-r2/IMPLEMENTATION_PLAN.md": "af9191ea30d500de7f53cfdb57a890bfc7c1e55df3d3e738ed667bce7a787224",
+    "docs/hybrid-flow-v1-r2/EVIDENCE_PROTOCOL.md": "77a604ff5f6d1efa166993459f933c9ec71366f71cc8f24e15e586f71a6fa766",
+    "docs/hybrid-flow-v1/PLAN_LOCK.json": "c4a20714762f22e7ffe30b411483f822b4b447d634426b7603d5450ea8abf36b",
+    "evals/hybrid-flow-v1/eval-contract.json": "561183ec6181e4d45e468a9b749ffc4f6791eebb9cce6d89d923bdf9bb5a6edd",
+    "evals/hybrid-flow-v1/run-evals.mjs": "6ebdec0a21e4ee7d7e638cb936a95cf92f77662d35392cc69a12611ca3452dc3"
+  },
+  "initialPackageInventory": [
+    {"path":"docs/hybrid-flow-v1-r2/IMPLEMENTATION_PLAN.md","role":"immutable_normative","sha256":"af9191ea30d500de7f53cfdb57a890bfc7c1e55df3d3e738ed667bce7a787224"},
+    {"path":"docs/hybrid-flow-v1-r2/EVIDENCE_PROTOCOL.md","role":"immutable_normative","sha256":"77a604ff5f6d1efa166993459f933c9ec71366f71cc8f24e15e586f71a6fa766"},
+    {"path":"docs/hybrid-flow-v1/PLAN_LOCK.json","role":"immutable_inherited","sha256":"c4a20714762f22e7ffe30b411483f822b4b447d634426b7603d5450ea8abf36b"},
+    {"path":"evals/hybrid-flow-v1/eval-contract.json","role":"immutable_eval","sha256":"561183ec6181e4d45e468a9b749ffc4f6791eebb9cce6d89d923bdf9bb5a6edd"},
+    {"path":"evals/hybrid-flow-v1/run-evals.mjs","role":"immutable_eval","sha256":"6ebdec0a21e4ee7d7e638cb936a95cf92f77662d35392cc69a12611ca3452dc3"}
+  ],
+  "sourceBaseline": {
+    "branch": "master",
+    "sourceBaselineHead": "d0f6cda738cf08ff851f14192ff48e636c1f0f17",
+    "mapProfileLockSha256": "e5e0e0183cff1d3f37074775709fb32cee52ae68773756702354e1835a74fe7a",
+    "routingPolicy": "routing-v5"
+  },
+  "supersedesPlanId": "agent-collab-hybrid-flow-v1",
+  "createdAt": "2026-08-31T10:02:00+08:00",
+  "implementationStartArtifact": "docs/hybrid-flow-v1-r2/IMPLEMENTATION_START.json"
+}

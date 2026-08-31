@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-collab://schemas/mcp-flow-v1",
+  "title": "agent-collab flow/v1 MCP contracts",
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"},
+    "baseRequest": {
+      "type": "object",
+      "required": ["schemaVersion", "project", "requester", "idempotencyKey"],
+      "properties": {
+        "schemaVersion": {"const": "flow/v1"},
+        "project": {"type": "string", "minLength": 1, "maxLength": 512},
+        "requester": {"$ref": "#/$defs/id"},
+        "idempotencyKey": {"$ref": "#/$defs/id"}
+      }
+    },
+    "graphNode": {
+      "type": "object", "additionalProperties": false,
+      "required": ["nodeId", "stageKind", "role", "approvalScope", "promptTemplateRef", "artifactRef", "inputPorts", "outputSchema", "joinPolicy", "allowedRoutes", "timeoutMs", "maxAttempts", "requestedTokenLimit"],
+      "properties": {
+        "nodeId": {"$ref": "#/$defs/id"},
+        "stageKind": {"enum": ["coordination", "architecture", "implementation", "testing", "review", "research", "transform"]},
+        "role": {"type": "string", "minLength": 1, "maxLength": 128},
+        "approvalScope": {"type": "string", "minLength": 1, "maxLength": 128},
+        "resourceHint": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "promptTemplateRef": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "artifactRef": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "inputPorts": {"type": "array", "maxItems": 64, "items": {"type": "object", "additionalProperties": false, "required": ["name", "schemaSha256"], "properties": {"name": {"$ref": "#/$defs/id"}, "schemaSha256": {"$ref": "#/$defs/sha256"}, "required": {"type": "boolean"}}}},
+        "outputSchema": {"type": "object"},
+        "joinPolicy": {"enum": ["all_success", "all_terminal"]},
+        "allowedRoutes": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "timeoutMs": {"type": "integer", "minimum": 1},
+        "maxAttempts": {"type": "integer", "minimum": 1},
+        "requestedTokenLimit": {"type": "integer", "minimum": 0}
+      },
+      "allOf": [{"if": {"properties": {"stageKind": {"not": {"const": "transform"}}}}, "then": {"properties": {"requestedTokenLimit": {"type": "integer", "minimum": 1}}}}]
+    },
+    "graphEdge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["edgeId", "sourceId", "targetId", "condition"],
+      "properties": {
+        "edgeId": {"$ref": "#/$defs/id"},
+        "sourceId": {"$ref": "#/$defs/id"},
+        "targetId": {"$ref": "#/$defs/id"},
+        "condition": {
+          "oneOf": [
+            {"type": "object", "additionalProperties": false, "required": ["kind", "outcomes"], "properties": {"kind": {"const": "outcome"}, "outcomes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["succeeded", "failed", "cancelled", "skipped", "blocked"]}}}},
+            {"type": "object", "additionalProperties": false, "required": ["kind", "routes"], "properties": {"kind": {"const": "route"}, "routes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}}}
+          ]
+        }
+      }
+    },
+    "graphFlow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "flowId", "taskId", "project", "origin", "definitionSha256", "budget", "nodes", "edges"],
+      "properties": {
+        "schemaVersion": {"const": "GraphFlow/v1"},
+        "flowId": {"$ref": "#/$defs/id"},
+        "taskId": {"$ref": "#/$defs/id"},
+        "project": {"type": "string", "minLength": 1, "maxLength": 512},
+        "origin": {"$ref": "#/$defs/id"},
+        "definitionSha256": {"$ref": "#/$defs/sha256"},
+        "budget": {
+          "type": "object", "additionalProperties": false,
+          "required": ["maxNodes", "maxActiveReadOnly", "maxChildDepth", "maxTokens", "maxWallTimeMs"],
+          "properties": {
+            "maxNodes": {"type": "integer", "minimum": 1, "maximum": 100},
+            "maxActiveReadOnly": {"type": "integer", "minimum": 1, "maximum": 3},
+            "maxChildDepth": {"type": "integer", "minimum": 0, "maximum": 8},
+            "maxTokens": {"type": "integer", "minimum": 0},
+            "maxWallTimeMs": {"type": "integer", "minimum": 1},
+            "maxCostMicrousd": {"type": "integer", "minimum": 0}
+          }
+        },
+        "nodes": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/graphNode"}},
+        "edges": {"type": "array", "maxItems": 400, "items": {"$ref": "#/$defs/graphEdge"}}
+      }
+    },
+    "error": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "code", "message", "retryable"],
+      "properties": {
+        "kind": {"const": "error"},
+        "code": {"enum": ["invalid_request", "not_found", "conflict", "forbidden", "stale", "budget_blocked", "blocked_plan_integrity", "needs_reconciliation", "internal_error"]},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "retryable": {"type": "boolean"},
+        "details": {"type": "object", "additionalProperties": false, "properties": {"field": {"type": "string"}, "expectedSha256": {"$ref": "#/$defs/sha256"}, "actualSha256": {"$ref": "#/$defs/sha256"}}}
+      }
+    },
+    "nodeStatusProjection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["nodeId", "status", "readyRevision", "version", "attemptId"],
+      "properties": {
+        "nodeId": {"$ref": "#/$defs/id"},
+        "status": {"enum": ["pending", "ready", "awaiting_authority", "admitting", "queued", "running", "succeeded", "failed", "cancelled", "skipped", "blocked", "needs_reconciliation"]},
+        "readyRevision": {"type": "integer", "minimum": 0},
+        "version": {"type": "integer", "minimum": 1},
+        "attemptId": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]}
+      }
+    },
+    "flowEventProjection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["eventId", "sequence", "eventType", "eventVersion", "eventSha256", "previousEventSha256", "createdAt"],
+      "properties": {
+        "eventId": {"$ref": "#/$defs/id"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "eventType": {"$ref": "#/$defs/id"},
+        "eventVersion": {"$ref": "#/$defs/id"},
+        "eventSha256": {"$ref": "#/$defs/sha256"},
+        "previousEventSha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "nodeId": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "attemptId": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "sessionId": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "payloadSha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "redactedPayloadJson": {"type": ["string", "null"], "maxLength": 4096},
+        "createdAt": {"type": "integer", "minimum": 0}
+      }
+    },
+    "nodeResultProjection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaSha256", "payloadSha256", "payload"],
+      "properties": {
+        "schemaSha256": {"$ref": "#/$defs/sha256"},
+        "payloadSha256": {"$ref": "#/$defs/sha256"},
+        "payload": {"type": "object"}
+      }
+    },
+    "responseEnvelope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "requestId", "result"],
+      "properties": {
+        "schemaVersion": {"const": "flow/v1"},
+        "requestId": {"$ref": "#/$defs/id"},
+        "result": {}
+      }
+    },
+    "admissionResult": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "flowId", "nodeId", "attemptId", "workflowId"], "properties": {"kind": {"const": "admitted"}, "flowId": {"$ref": "#/$defs/id"}, "nodeId": {"$ref": "#/$defs/id"}, "attemptId": {"$ref": "#/$defs/id"}, "workflowId": {"$ref": "#/$defs/id"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "flowId", "nodeId", "admissionSha256"], "properties": {"kind": {"enum": ["awaiting_authority", "stale", "budget_blocked"]}, "flowId": {"$ref": "#/$defs/id"}, "nodeId": {"$ref": "#/$defs/id"}, "admissionSha256": {"$ref": "#/$defs/sha256"}}},
+        {"$ref": "#/$defs/error"}
+      ]
+    }
+  },
+  "tools": {
+    "collab_flow_validate": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["definition"], "properties": {"definition": {"$ref": "#/$defs/graphFlow"}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "definitionSha256", "valid", "issues"], "properties": {"kind": {"const": "validation"}, "definitionSha256": {"$ref": "#/$defs/sha256"}, "valid": {"type": "boolean"}, "issues": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 1024}}}}, {"$ref": "#/$defs/error"}]}}}]}
+    },
+    "collab_flow_submit": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["definition", "expectedDefinitionSha256"], "properties": {"definition": {"$ref": "#/$defs/graphFlow"}, "expectedDefinitionSha256": {"$ref": "#/$defs/sha256"}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "flowId", "definitionSha256", "status"], "properties": {"kind": {"const": "submitted"}, "flowId": {"$ref": "#/$defs/id"}, "definitionSha256": {"$ref": "#/$defs/sha256"}, "status": {"const": "submitted"}}}, {"$ref": "#/$defs/error"}]}}}]}
+    },
+    "collab_flow_start": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["flowId", "expectedDefinitionSha256", "rootAdmissionSha256"], "properties": {"flowId": {"$ref": "#/$defs/id"}, "expectedDefinitionSha256": {"$ref": "#/$defs/sha256"}, "rootAdmissionSha256": {"$ref": "#/$defs/sha256"}, "approvalReference": {"type": "string", "minLength": 1, "maxLength": 512}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"$ref": "#/$defs/admissionResult"}}}]}
+    },
+    "collab_flow_admit_node": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["flowId", "nodeId", "readyRevision", "expectedDefinitionSha256", "admissionSha256", "approvalReference"], "properties": {"flowId": {"$ref": "#/$defs/id"}, "nodeId": {"$ref": "#/$defs/id"}, "readyRevision": {"type": "integer", "minimum": 1}, "expectedDefinitionSha256": {"$ref": "#/$defs/sha256"}, "admissionSha256": {"$ref": "#/$defs/sha256"}, "approvalReference": {"type": "string", "minLength": 1, "maxLength": 512}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"$ref": "#/$defs/admissionResult"}}}]}
+    },
+    "collab_flow_status": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["flowId"], "properties": {"flowId": {"$ref": "#/$defs/id"}, "depth": {"type": "integer", "minimum": 0, "maximum": 8}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "flowId", "version", "status", "nodes", "usageCompleteness"], "properties": {"kind": {"const": "status"}, "flowId": {"$ref": "#/$defs/id"}, "version": {"type": "integer", "minimum": 1}, "status": {"enum": ["submitted", "running", "succeeded", "failed", "cancelled", "needs_reconciliation"]}, "nodes": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/nodeStatusProjection"}}, "usageCompleteness": {"enum": ["exact", "partial", "unavailable"]}}}, {"$ref": "#/$defs/error"}]}}}]}
+    },
+    "collab_flow_events": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["flowId"], "properties": {"flowId": {"$ref": "#/$defs/id"}, "cursor": {"type": "string", "maxLength": 2048}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "events", "nextCursor"], "properties": {"kind": {"const": "events"}, "events": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/flowEventProjection"}}, "nextCursor": {"type": ["string", "null"], "maxLength": 2048}}}, {"$ref": "#/$defs/error"}]}}}]}
+    },
+    "collab_flow_result": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["flowId", "nodeId"], "properties": {"flowId": {"$ref": "#/$defs/id"}, "nodeId": {"$ref": "#/$defs/id"}, "attemptNo": {"type": "integer", "minimum": 1}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "flowId", "nodeId", "attemptNo", "outcome", "terminalEnvelopeSha256", "result"], "properties": {"kind": {"const": "terminal_result"}, "flowId": {"$ref": "#/$defs/id"}, "nodeId": {"$ref": "#/$defs/id"}, "attemptNo": {"type": "integer", "minimum": 0}, "outcome": {"enum": ["succeeded", "failed", "cancelled", "skipped", "blocked"]}, "terminalEnvelopeSha256": {"$ref": "#/$defs/sha256"}, "result": {"oneOf": [{"$ref": "#/$defs/nodeResultProjection"}, {"type": "null"}]}}}, {"$ref": "#/$defs/error"}]}}}]}
+    },
+    "collab_flow_cancel": {
+      "request": {"allOf": [{"$ref": "#/$defs/baseRequest"}, {"type": "object", "required": ["flowId", "expectedDefinitionSha256", "expectedFlowVersion", "reason", "cancellationAuthority"], "properties": {"flowId": {"$ref": "#/$defs/id"}, "expectedDefinitionSha256": {"$ref": "#/$defs/sha256"}, "expectedFlowVersion": {"type": "integer", "minimum": 1}, "reason": {"type": "string", "minLength": 1, "maxLength": 1024}, "cancellationAuthority": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "origin_requester"}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "operatorId", "approvalReference"], "properties": {"kind": {"const": "operator_approval"}, "operatorId": {"$ref": "#/$defs/id"}, "approvalReference": {"type": "string", "minLength": 1, "maxLength": 512}}}]}}, "unevaluatedProperties": false}]},
+      "response": {"allOf": [{"$ref": "#/$defs/responseEnvelope"}, {"type": "object", "properties": {"result": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "flowId", "version"], "properties": {"kind": {"enum": ["cancelled", "cancellation_requested", "needs_reconciliation", "already_terminal"]}, "flowId": {"$ref": "#/$defs/id"}, "version": {"type": "integer", "minimum": 1}}}, {"$ref": "#/$defs/error"}]}}}]}
+    }
+  }
+}

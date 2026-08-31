@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "implementation-start/v1",
+  "planId": "agent-collab-hybrid-flow-v1",
+  "normativePackageSha256": "c4a20714762f22e7ffe30b411483f822b4b447d634426b7603d5450ea8abf36b",
+  "planAnchorCommit": "684853e067daeba0039c01ae74ac803ee25fffa7",
+  "sourceBaselineHead": "d0f6cda738cf08ff851f14192ff48e636c1f0f17",
+  "implementationHead": "d0f6cda738cf08ff851f14192ff48e636c1f0f17",
+  "branch": "master",
+  "worktree": "/home/anton/Source/agent-collab",
+  "mapSha256": "e5e0e0183cff1d3f37074775709fb32cee52ae68773756702354e1835a74fe7a",
+  "routingPolicy": "routing-v5",
+  "authorityConsumer": "codex:/root:hybrid-flow-v1",
+  "authorityReceiptSha256": "70cc4798d3a1dff922f5a70c776d6db80f9b0b45d00e40154595f60a1d364a95",
+  "commitPushScope": "none",
+  "liveProviderScope": "none",
+  "startedAt": "2026-08-31T03:58:08+08:00",
+  "startSha256": "056e98f1e260f24b949e3191f7e2900a198094144505cde24bd2dae2f8b44e4c"
+}

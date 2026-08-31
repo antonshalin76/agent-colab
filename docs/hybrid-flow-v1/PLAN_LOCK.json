@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "implementation-plan-lock/v1",
+  "planId": "agent-collab-hybrid-flow-v1",
+  "revision": "1.0.1",
+  "status": "stabilized_ready_for_lock",
+  "planPath": "docs/hybrid-flow-v1/IMPLEMENTATION_PLAN.md",
+  "planSha256": "1ab2330b7e1a8a9c377ec3c6aae6bc1d403f3a2a2d111e05aebb21d853ba5f04",
+  "normativeArtifacts": {
+    "docs/hybrid-flow-v1/IMPLEMENTATION_PLAN.md": "1ab2330b7e1a8a9c377ec3c6aae6bc1d403f3a2a2d111e05aebb21d853ba5f04",
+    "docs/hybrid-flow-v1/CONTRACTS.md": "2f223433e67874906c1aee503c18513c41e02f21cfcd34551245c4b0ee341d32",
+    "docs/hybrid-flow-v1/EVIDENCE_PROTOCOL.md": "0b4174c1ae388df47fc09157d6d524021d00438b32e5ad3bbf05a63315ea780c",
+    "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql": "43ae43d139ac44f25d2132439600a5405c1082a8278aca60cffeab5e479ead8b",
+    "docs/hybrid-flow-v1/MCP_FLOW_V1_SCHEMAS.json": "22700454d3a6a34ea76b2bd8d0b748bd08d043227526aedb66a629585e6dae23"
+  },
+  "initialPackageInventory": [
+    {"path": "docs/hybrid-flow-v1/IMPLEMENTATION_PLAN.md", "role": "immutable_normative", "sha256": "1ab2330b7e1a8a9c377ec3c6aae6bc1d403f3a2a2d111e05aebb21d853ba5f04"},
+    {"path": "docs/hybrid-flow-v1/CONTRACTS.md", "role": "immutable_normative", "sha256": "2f223433e67874906c1aee503c18513c41e02f21cfcd34551245c4b0ee341d32"},
+    {"path": "docs/hybrid-flow-v1/EVIDENCE_PROTOCOL.md", "role": "immutable_normative", "sha256": "0b4174c1ae388df47fc09157d6d524021d00438b32e5ad3bbf05a63315ea780c"},
+    {"path": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql", "role": "immutable_normative", "sha256": "43ae43d139ac44f25d2132439600a5405c1082a8278aca60cffeab5e479ead8b"},
+    {"path": "docs/hybrid-flow-v1/MCP_FLOW_V1_SCHEMAS.json", "role": "immutable_normative", "sha256": "22700454d3a6a34ea76b2bd8d0b748bd08d043227526aedb66a629585e6dae23"},
+    {"path": "docs/hybrid-flow-v1/IMPLEMENTATION_PLAN.sha256", "role": "immutable_support", "sha256": "0ab6a1f889260212d4ec76c354f6c54f45982fe45577ee1addfcceca3c5e0b42"},
+    {"path": "docs/hybrid-flow-v1/IMPLEMENTATION_BRIEF.md", "role": "immutable_support", "sha256": "cca126cf07eaefc784c7da56ccac4bfbb177f13b0f8fc8c97e85979e2d0a8b9e"},
+    {"path": "docs/hybrid-flow-v1/RISK_REGISTER.md", "role": "immutable_support", "sha256": "99aed8af5915921a59fc5389752f54f28e8293891fb5d668ca01bdaac8e4be6f"},
+    {"path": "docs/hybrid-flow-v1/DECISIONS.md", "role": "append_only_support", "sha256": "29b1ca9256e92f7e5e10f3032f4008a8adefdf27b6b974efca16f5ca3552aa57"},
+    {"path": "docs/hybrid-flow-v1/IMPLEMENTATION_PROGRESS.md", "role": "generated_non_authoritative_projection", "sha256": "8823b777a79faaa319afe20183a8b738232d3899a6f86c90a4954e8f29f491ef"},
+    {"path": "repo-c4.json", "role": "immutable_baseline_projection", "sha256": "d4008cab2471456f5c3bf2049473ddf3565a6927b798f6b6bd5793cfa0e5a681"}
+  ],
+  "futureGeneratedPaths": [
+    "docs/hybrid-flow-v1/IMPLEMENTATION_START.json",
+    "docs/hybrid-flow-v1/IMPLEMENTATION_PROGRESS.jsonl",
+    "docs/hybrid-flow-v1/stage-close/pre-v4/NNNNNN-EVENT_ID.json",
+    "docs/hybrid-flow-v1/amendments/AMD-NNNN.json",
+    "docs/hybrid-flow-v1/amendments/AMD-NNNN.md",
+    "docs/hybrid-flow-v1/stage-close/STG-NN.json"
+  ],
+  "sourceBaseline": {
+    "branch": "master",
+    "sourceBaselineHead": "d0f6cda738cf08ff851f14192ff48e636c1f0f17",
+    "workflowContractSha256": "c313e8506b2e0c80e5789a68a776da6ab07032893e5944d06ee04cdbf76c981a",
+    "mapProfileLockSha256": "e5e0e0183cff1d3f37074775709fb32cee52ae68773756702354e1835a74fe7a",
+    "repoC4Sha256": "d4008cab2471456f5c3bf2049473ddf3565a6927b798f6b6bd5793cfa0e5a681",
+    "routingPolicy": "routing-v5"
+  },
+  "createdAt": "2026-08-31T00:51:33+08:00",
+  "implementationStartArtifact": "docs/hybrid-flow-v1/IMPLEMENTATION_START.json"
+}
