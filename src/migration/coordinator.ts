@@ -181,11 +181,17 @@ const GRAPH_V4_REQUIRED_INDEXES = [
 const GRAPH_V4_TABLE_SCHEMA_SHA256 = "2b3a0f52fdbfe2e6a9ac4d2ace77423888c3d6c50787950bdaf834f978357751";
 const GRAPH_V4_REQUIRED_INDEX_SHA256 = "1c38876a1730a8fc9b00d756bc81158d5bdd894099ef3b67d9470030b1539ba5";
 const LEGACY_STATE_PROFILE_SHA256 = {
-  v3_routing_v5: "7a29baaff38b71f25e6670429398944b34b708f9f661ea4512eddacfa2b5d585",
-  v4_routing_v5: "d9843b1c811c1fddfe916b51fb6c0e90f18d4c53185f78fc2b068c2862b69bb0",
-  v4_review_v3: "761f81590bfb897a81be8fc42ae2b133d11cfe45d96d031460fc392645938ed3",
+  v3_routing_v5: [
+    "7a29baaff38b71f25e6670429398944b34b708f9f661ea4512eddacfa2b5d585",
+    "3ca282d1e539a2b6c1928b91eb00bb0f3623b023d31eb0853386aa486f20d009",
+  ],
+  v4_routing_v5: ["d9843b1c811c1fddfe916b51fb6c0e90f18d4c53185f78fc2b068c2862b69bb0"],
+  v4_review_v3: ["761f81590bfb897a81be8fc42ae2b133d11cfe45d96d031460fc392645938ed3"],
 } as const;
-const HISTORY_V2_SCHEMA_SHA256 = "58b2d0fd246bbe2ee62969dded0f2a6dcd242340ae90f6a9293abed4c2dbe2fd";
+const HISTORY_V2_SCHEMA_SHA256 = [
+  "58b2d0fd246bbe2ee62969dded0f2a6dcd242340ae90f6a9293abed4c2dbe2fd",
+  "f4ef7b73fa2cf1dc8b9678ef0062122b74598feb2db2c46bc463c19dacbb611d",
+] as const;
 
 const EXECUTION_TABLES = [
   "runs",
@@ -786,7 +792,7 @@ function verifyHistoryV2Schema(history: Database.Database, exactProfile = false)
     assertNoAdditiveUniqueIndexes(history);
     const exactSchema = schemaRowsSha256(normalizedSchemaRows(history).filter((row) =>
       row.type === "table" || row.type === "trigger" || row.type === "view"));
-    if (exactSchema !== HISTORY_V2_SCHEMA_SHA256) {
+    if (!HISTORY_V2_SCHEMA_SHA256.some((expected) => exactSchema === expected)) {
       throw new Error("history v2 schema profile mismatch");
     }
   }
@@ -939,7 +945,8 @@ export function verifyCompatibilityRuntime(input: {
     if (stateVersion === V3 && graphSchema !== "absent") {
       throw new Error("graph v4 schema cannot be present on state v3");
     }
-    if (legacyStateSchemaSha256(state) !== LEGACY_STATE_PROFILE_SHA256[stateProfile]) {
+    const legacySchemaSha256 = legacyStateSchemaSha256(state);
+    if (!LEGACY_STATE_PROFILE_SHA256[stateProfile].some((expected) => legacySchemaSha256 === expected)) {
       throw new Error(`legacy state schema profile mismatch: ${stateProfile}`);
     }
     assertExactIndex(state, "idx_worktree_handoffs_task", ["task_id", "id"]);
