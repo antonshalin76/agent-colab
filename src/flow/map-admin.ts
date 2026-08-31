@@ -587,11 +587,11 @@ export function assertCurrentMapLearningLaunchBinding(
     throw new Error("MAP learning projection is stale before provider launch");
   }
   const context = formatMapLearningLaunchBindingContext(binding);
-  if (
-    prompt.split(context).length !== 2 ||
-    prompt.split("Promoted MAP learning projection for ").length !== 2
-  ) {
-    throw new Error("run prompt does not contain its exact MAP learning projection once");
+  const completeProjectionBlocks = prompt.match(
+    /Promoted MAP learning projection for (?:codex|grok|claude) \([a-f0-9]{64}\):\r?\n/g,
+  ) ?? [];
+  if (prompt.split(context).length !== 2 || completeProjectionBlocks.length !== 1) {
+    throw new Error("run prompt must contain exactly one exact MAP learning projection");
   }
   return binding;
 }

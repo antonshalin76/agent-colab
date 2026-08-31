@@ -152,16 +152,29 @@ export function normalizeCodexResult(
   const texts: string[] = [];
   let usageSource: Record<string, unknown> | null = null;
   if (current) {
-    if (records.filter((item) => item.type === "thread.started").length !== 1) {
+    if (records[0]?.type !== "thread.started" ||
+        records.filter((item) => item.type === "thread.started").length !== 1) {
       throw new Error("incomplete Codex stream: invalid thread identity");
     }
-    for (const event of records) {
+    let completed = false;
+    for (const event of records.slice(1)) {
+      if (completed) {
+        throw new Error("invalid Codex stream ordering: event after terminal");
+      }
+      if (event.type === "turn.failed" || event.type === "error") {
+        throw new Error("Codex stream terminal failure");
+      }
       if (event.type === "item.completed") {
         const item = record(event.item);
         if (item?.type === "agent_message" && typeof item.text === "string") texts.push(item.text);
       }
-      if (event.type === "turn.completed") usageSource = record(event.usage);
+      if (event.type === "turn.completed") {
+        if (!texts.length) throw new Error("invalid Codex stream ordering: terminal before result");
+        completed = true;
+        usageSource = record(event.usage);
+      }
     }
+    if (!completed) throw new Error("incomplete Codex stream: missing terminal");
   } else {
     const sessions = records
       .filter((item) => item.type === "session_meta")
@@ -187,13 +200,15 @@ export function normalizeCodexResult(
     }
   }
   if (!texts.length) throw new Error("incomplete Codex stream: missing result");
-  let text = texts.join("\n");
+  // Codex can emit progress or policy-required announcements as completed
+  // assistant messages. The final completed message is the terminal response;
+  // composing messages would corrupt strict JSON result contracts.
+  let text = texts.at(-1)!;
   if (options && "expectedProtocolVersion" in options) {
     if (options.pinnedModel !== MODEL) throw new Error("Codex command-pinned model mismatch");
     // Structured Codex runs may emit schema-valid progress messages before the
     // terminal schema-valid message. Only the last completed agent message is
     // the final response contract; joining them creates invalid JSON.
-    text = texts.at(-1)!;
     let payload: Record<string, unknown> | null;
     try { payload = record(JSON.parse(text)); }
     catch { throw new Error("malformed Codex visible result parse"); }

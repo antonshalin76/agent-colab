@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "test-evidence/v1",
+  "stageId": "R2-STG-00",
+  "sourceFingerprint": "9366c25efe0b924cf90c3ffa42fbee7bb07bd9913e79105ce016529be91bb2f3",
+  "commands": [
+    { "command": "npm run typecheck", "result": "PASS" },
+    { "command": "npm run build", "result": "PASS" },
+    { "command": "git diff --check", "result": "PASS" },
+    { "command": "focused R2 suite", "result": "178/178 PASS" },
+    { "command": "npm test -- --maxWorkers=1 --no-file-parallelism", "result": "65 files, 1469/1469 PASS, 729.71 s" }
+  ],
+  "priorFullRun": {
+    "result": "1461/1465",
+    "corrections": "three contract regressions fixed; isolated restore timeout reran 1/1 PASS"
+  },
+  "recordedAt": "2026-09-01T04:58:24+08:00"
+}

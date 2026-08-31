@@ -116,13 +116,72 @@ export class RunStore {
   claimNext(input: { workerId: string; leaseMs: number; now?: number }): RunRecord | undefined {
     const now = input.now ?? Date.now();
     return this.db.transaction(() => {
+      this.db.prepare(`UPDATE runs SET status='needs_reconciliation',lease_token=NULL,
+          lease_expires_at=NULL,worker_id=NULL
+        WHERE status='queued' AND stage LIKE 'review:%' AND EXISTS (
+          SELECT 1 FROM runtime_review_lane_attempts a
+          JOIN runtime_review_barriers b ON b.review_id=a.review_id
+          WHERE a.run_id=runs.id AND b.launch_authority_version=3
+            AND (NOT EXISTS (
+              SELECT 1 FROM runtime_review_attempt_authorities va
+              JOIN runtime_review_attempt_base_policies bp ON bp.base_policy_id=a.base_policy_id
+              WHERE va.authority_id=a.authority_id AND va.attempt_id=a.attempt_id
+                AND va.review_id=a.review_id AND va.agent=a.agent AND va.role=a.role
+                AND va.attempt_ordinal=a.attempt_ordinal
+                AND va.authority_kind=a.authority_kind
+                AND va.recovery_generation IS a.recovery_generation
+                AND va.previous_ordinal IS a.previous_ordinal
+                AND va.previous_evidence_hash IS a.previous_evidence_hash
+                AND va.authority_hash=a.authority_receipt_id
+                AND va.admission_source_receipt_id<>va.admission_readiness_receipt_id
+                AND bp.review_id=a.review_id AND bp.agent=a.agent AND bp.role=a.role
+                AND bp.model=a.model AND bp.effort=a.effort
+                AND bp.policy_version=a.policy_version AND bp.reasons_json=a.reasons_json
+                AND a.expected_attempt_ordinal=a.attempt_ordinal
+                AND ((a.authority_kind='initial' AND a.expected_lane_revision=0
+                      AND a.recovery_generation IS NULL)
+                  OR (a.authority_kind IN ('first_admission','recovery')
+                      AND a.recovery_generation IS NOT NULL))
+            ) OR json_extract(runs.payload,'$.reviewId') IS NOT a.review_id
+              OR json_extract(runs.payload,'$.reviewRole') IS NOT a.role
+              OR json_extract(runs.payload,'$.decision.agent') IS NOT a.agent
+              OR json_extract(runs.payload,'$.reviewAttemptId') IS NOT a.attempt_id
+              OR json_extract(runs.payload,'$.reviewAttemptOrdinal') IS NOT a.attempt_ordinal
+              OR json_extract(runs.payload,'$.reviewDispatchIdentity.attemptId') IS NOT a.attempt_id
+              OR json_extract(runs.payload,'$.reviewDispatchIdentity.attemptOrdinal') IS NOT a.attempt_ordinal
+              OR json_extract(runs.payload,'$.reviewDispatchIdentity.agent') IS NOT a.agent)
+        )`).run();
       const candidate = this.db.prepare(`SELECT id FROM runs r WHERE status='queued' AND next_attempt_at <= ?
         AND (depends_on_run_id IS NULL OR EXISTS (SELECT 1 FROM runs d WHERE d.id=r.depends_on_run_id AND d.status='completed'))
-        ORDER BY priority ASC,
-          CASE WHEN stage LIKE 'review:%'
-            AND typeof(json_extract(payload, '$.providerAdmissionClaimedAt')) IN ('integer','real')
-            THEN 0 ELSE 1 END ASC,
-          created_at ASC, id ASC LIMIT 1`).get(now) as { id: string } | undefined;
+        AND (stage NOT LIKE 'review:%' OR EXISTS (
+          SELECT 1
+            FROM runtime_review_lane_attempts a
+            JOIN runtime_review_barriers b ON b.review_id=a.review_id
+           WHERE a.run_id=r.id
+             AND ((b.launch_authority_version=2
+               AND a.review_id=json_extract(r.payload, '$.reviewId')
+               AND a.agent=json_extract(r.payload, '$.decision.agent')
+               AND a.role=json_extract(r.payload, '$.reviewRole'))
+              OR (b.launch_authority_version=3
+               AND a.attempt_id IS NOT NULL AND a.authority_id IS NOT NULL AND EXISTS (
+                 SELECT 1 FROM runtime_review_attempt_authorities va
+                 WHERE va.authority_id=a.authority_id AND va.attempt_id=a.attempt_id
+                   AND va.review_id=a.review_id AND va.agent=a.agent AND va.role=a.role
+                   AND va.attempt_ordinal=a.attempt_ordinal)
+               AND a.review_id=json_extract(r.payload, '$.reviewId')
+               AND a.agent=json_extract(r.payload, '$.decision.agent')
+               AND a.role=json_extract(r.payload, '$.reviewRole')
+               AND a.attempt_id=json_extract(r.payload, '$.reviewAttemptId')
+               AND a.attempt_ordinal=json_extract(r.payload, '$.reviewAttemptOrdinal')
+               AND a.attempt_id=json_extract(r.payload, '$.reviewDispatchIdentity.attemptId')
+               AND a.attempt_ordinal=json_extract(r.payload, '$.reviewDispatchIdentity.attemptOrdinal')
+               AND a.agent=json_extract(r.payload, '$.reviewDispatchIdentity.agent'))
+        )))
+        ORDER BY priority ASC, created_at ASC,
+          CASE json_extract(payload,'$.decision.agent')
+            WHEN 'grok' THEN 0 WHEN 'claude' THEN 1 WHEN 'codex' THEN 2 ELSE 3 END,
+          CASE json_extract(payload,'$.reviewRole') WHEN 'auditor' THEN 0 ELSE 1 END,
+          id ASC LIMIT 1`).get(now) as { id: string } | undefined;
       if (!candidate) return undefined;
       const token = randomUUID();
       const changed = this.db.prepare(`UPDATE runs SET status='claimed', lease_token=?, lease_expires_at=?,
@@ -135,14 +194,32 @@ export class RunStore {
     if (!row || row.status !== "claimed" || row.leaseToken !== token) throw new Error("invalid or stale lease token");
     return row;
   }
+  reconcileClaimedReviewIdentity(id: string, token: string, reason: string): void {
+    const current = this.requireLease(id, token);
+    if (!this.db.prepare("SELECT 1 FROM runtime_review_lane_attempts WHERE run_id=?").get(id)) {
+      throw new Error("only a linked review run may reconcile its identity");
+    }
+    const changed = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',cancel_reason=?,
+      lease_token=NULL,lease_expires_at=NULL,worker_id=NULL
+      WHERE id=? AND status='claimed' AND lease_token=? AND launched=0`)
+      .run(reason, id, token).changes;
+    if (changed !== 1) throw new Error("review identity reconciliation fence rejected");
+    if (current.launched) throw new Error("launched review identity requires launch reconciliation");
+  }
   releaseForRetry(id: string, token: string, input: { nextAttemptAt: number }): void {
     this.requireLease(id, token);
+    if (this.db.prepare("SELECT 1 FROM runtime_review_lane_attempts WHERE run_id=?").get(id)) {
+      throw new Error("linked review attempt cannot be released for generic retry");
+    }
     const changed = this.db.prepare(`UPDATE runs SET status='queued',next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
       worker_id=NULL,launched=0,launch_info=NULL WHERE id=? AND status='claimed' AND lease_token=? AND launched=0`)
       .run(input.nextAttemptAt, id, token).changes;
     if (changed !== 1) throw new Error("retry release fence rejected");
   }
   cancel(id: string, reason: string): void {
+    if (this.db.prepare("SELECT 1 FROM runtime_review_lane_attempts WHERE run_id=?").get(id)) {
+      throw new Error("linked review attempt requires an authoritative review transition");
+    }
     this.db.prepare("UPDATE runs SET status='cancelled',cancel_reason=? WHERE id=? AND status='queued'").run(reason, id);
   }
   markLaunchIntent(id: string, token: string, info: Record<string, unknown>): void {
@@ -165,10 +242,12 @@ export class RunStore {
     if (!current.launched || launch?.phase !== "launching") {
       throw new Error("launch intent clear fence rejected");
     }
-    const executionContext = launch.executionContext;
+    const launchIntent = { ...launch };
+    delete launchIntent.pid;
+    delete launchIntent.value;
     const changed = this.db.prepare(`UPDATE runs SET launched=0,launch_info=?
       WHERE id=? AND status='claimed' AND lease_token=? AND launched=1`)
-      .run(executionContext === undefined ? null : JSON.stringify({ executionContext }), id, token).changes;
+      .run(JSON.stringify({ ...launchIntent, phase: "proven_no_spawn" }), id, token).changes;
     if (changed !== 1) throw new Error("launch intent clear fence rejected");
   }
   markLaunched(id: string, token: string, info: unknown): void {
@@ -373,11 +452,18 @@ export class RunStore {
   }
   recoverExpired(now = Date.now()): number {
     return this.db.transaction(() => {
+      const linked = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',lease_token=NULL,
+        lease_expires_at=NULL,worker_id=NULL
+        WHERE status='claimed' AND lease_expires_at < ? AND launched=0
+          AND EXISTS (SELECT 1 FROM runtime_review_lane_attempts a WHERE a.run_id=runs.id)`)
+        .run(now).changes;
       const before = this.db.prepare(`UPDATE runs SET status='queued',next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
-        worker_id=NULL WHERE status='claimed' AND lease_expires_at < ? AND launched=0`).run(now + 1_000, now).changes;
+        worker_id=NULL WHERE status='claimed' AND lease_expires_at < ? AND launched=0
+          AND NOT EXISTS (SELECT 1 FROM runtime_review_lane_attempts a WHERE a.run_id=runs.id)`)
+        .run(now + 1_000, now).changes;
       const after = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',lease_token=NULL,
         lease_expires_at=NULL,worker_id=NULL WHERE status='claimed' AND lease_expires_at < ? AND launched=1 AND result IS NULL`).run(now).changes;
-      return before + after;
+      return linked + before + after;
     })();
   }
   close(): void { if (this.ownsDatabase) this.db.close(); }

@@ -1,0 +1,191 @@
+{
+  "schemaVersion": "hybrid-flow-eval-report/v2",
+  "label": "candidate",
+  "generatedAt": "2026-08-31T13:46:41.753Z",
+  "suiteId": "agent-collab-hybrid-flow-v2-normative",
+  "contractSha256": "2f7243d3ce16478fa5314a3ab5724201b9e2cc8b8dea4e0c2518ea65e290cf9b",
+  "runnerSha256": "56c53a0e373903907307c2feb9dc4c9f9b5790ddddeca865c392d4cac3d6380e",
+  "runtimeRoot": "/home/anton/Source/agent-collab",
+  "runtime": {
+    "node": "v24.14.1",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "functional": {
+    "passed": 12,
+    "failed": 0,
+    "unsupported": 0,
+    "total": 12,
+    "verifiedCompletionRate": 1,
+    "cases": [
+      {
+        "id": "dag_validation",
+        "status": "pass",
+        "evidence": "100 nodes/400 edges/depth<=8"
+      },
+      {
+        "id": "cycle_rejection",
+        "status": "pass",
+        "evidence": "cycle rejected"
+      },
+      {
+        "id": "fan_out_readiness",
+        "status": "pass",
+        "evidence": [
+          "n1",
+          "n2"
+        ]
+      },
+      {
+        "id": "all_success_join",
+        "status": "pass",
+        "evidence": "opened only after both parents"
+      },
+      {
+        "id": "all_terminal_join",
+        "status": "pass",
+        "evidence": "terminal parent opened consumer"
+      },
+      {
+        "id": "conditional_route",
+        "status": "pass",
+        "evidence": "matching route activated exactly once"
+      },
+      {
+        "id": "unreachable_skip",
+        "status": "pass",
+        "evidence": "inactive descendant skipped"
+      },
+      {
+        "id": "typed_result_validation",
+        "status": "pass",
+        "evidence": "valid result accepted"
+      },
+      {
+        "id": "invalid_result_fail_closed",
+        "status": "pass",
+        "evidence": "invalid result rejected"
+      },
+      {
+        "id": "session_checkpoint_isolation",
+        "status": "pass",
+        "evidence": "cross-flow rejected"
+      },
+      {
+        "id": "usage_completeness",
+        "status": "pass",
+        "evidence": {
+          "inputTokens": 10,
+          "outputTokens": 2,
+          "costMicroUsd": null,
+          "completeness": "partial"
+        }
+      },
+      {
+        "id": "mcp_flow_capability",
+        "status": "pass",
+        "evidence": "collab_flow_validate registered"
+      }
+    ]
+  },
+  "performance": {
+    "pureGraph100Nodes400Edges": {
+      "medianMs": 2.7880890000000136,
+      "p95Ms": 4.922482000000002,
+      "samples": [
+        25.11030799999999,
+        4.922482000000002,
+        5.619566000000006,
+        2.9956480000000028,
+        4.126413999999997,
+        4.075212999999991,
+        2.9001349999999775,
+        3.87128899999999,
+        4.135133999999994,
+        2.7880890000000136,
+        2.767610999999988,
+        2.6941419999999994,
+        2.774831000000006,
+        2.6194069999999954,
+        2.7496260000000063,
+        3.160853000000003,
+        2.7295970000000125,
+        2.7836499999999944,
+        2.740745000000004,
+        3.063030999999995,
+        2.6458880000000136,
+        2.679338999999999,
+        2.8826290000000085,
+        2.6632899999999893,
+        2.615093999999999,
+        2.813883000000004,
+        2.6276770000000056,
+        2.800200999999987,
+        2.822568000000018,
+        2.912015999999994,
+        2.703924999999998,
+        2.6096729999999866,
+        2.841943999999984,
+        2.882002,
+        2.7344920000000172,
+        2.7282179999999983,
+        3.0050760000000025,
+        2.639692999999994,
+        2.66596899999999,
+        2.8119509999999934
+      ]
+    },
+    "fanOut3x40ms": {
+      "medianMs": 40.26389800000004,
+      "p95Ms": 40.38430600000004,
+      "samples": [
+        40.38006300000001,
+        40.18226200000004,
+        40.354854999999986,
+        40.25308799999999,
+        40.24508199999997,
+        40.21012400000001,
+        40.252207999999996,
+        40.28567900000007,
+        40.331826999999976,
+        40.26389800000004,
+        40.38430600000004,
+        40.33790099999999
+      ]
+    },
+    "legacyQueue100NodeChain": {
+      "medianMs": 32.772181000000046,
+      "p95Ms": 40.539276999999856,
+      "samples": [
+        36.45709099999999,
+        30.373567000000094,
+        24.845925999999963,
+        38.97098200000005,
+        35.10900099999981,
+        26.00665600000002,
+        41.51115699999991,
+        31.049312999999984,
+        26.285186000000067,
+        32.772181000000046,
+        32.484781999999996,
+        36.823459000000184,
+        32.787180000000035,
+        32.57047499999999,
+        40.539276999999856,
+        33.94637199999988,
+        36.9443540000002,
+        34.62124700000004,
+        24.021364000000176,
+        23.474146999999903
+      ]
+    }
+  },
+  "thresholds": {
+    "pureGraphP95": true,
+    "fanOutSpeedup": 2.980337373197197
+  },
+  "process": {
+    "rssBytes": 144519168,
+    "heapUsedBytes": 44081112
+  }
+}

@@ -349,7 +349,7 @@ describe("paired benchmark provider output normalization", () => {
   });
 
   it("keeps unavailable telemetry null with explicit provenance instead of inventing zero", () => {
-    const codex = normalizeCodexResult(codex0147SanitizedExecStream().replace(
+    expect(() => normalizeCodexResult(codex0147SanitizedExecStream().replace(
       /\{"type":"turn.completed".*\}\n$/,
       "",
     ), {
@@ -357,7 +357,7 @@ describe("paired benchmark provider output normalization", () => {
       expectedEffort: "high",
       expectedProtocolVersion: protocolVersion,
       pinnedModel: "gpt-5.6-sol",
-    });
+    })).toThrow(/missing terminal/i);
     const grok = normalizeGrokResult(grok105SanitizedTerminalEnvelope({
       modelUsage: { "grok-4.6": { inputTokens: 8, outputTokens: 2 } },
     }), {
@@ -366,12 +366,10 @@ describe("paired benchmark provider output normalization", () => {
       includeUsage: true,
     });
 
-    expect(codex.usage).toEqual(usage(null, null, null, null, null, null, {}));
     expect(grok.usage).toEqual(usage(8, null, 2, null, null, null, {
       inputTokens: "provider_reported",
       outputTokens: "provider_reported",
     }));
-    expect(Object.values(codex.usage).filter((value) => typeof value === "number")).toEqual([]);
   });
 
   it.each([

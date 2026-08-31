@@ -18,6 +18,31 @@ const stateDatabase = (root: string): string => {
 };
 
 describe("worker contention", () => {
+  it("never retries an uncommitted failover without a domain owner", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-worker-no-generic-retry-"));
+    try {
+      const store = new RunStore(stateDatabase(root));
+      const queued = store.enqueue({ idempotencyKey: "no-generic-retry", stage: "coordination",
+        priority: 1, now: 1 });
+      const worker = new DurableWorker({
+        store,
+        workerId: "no-generic-retry-worker",
+        runner: async () => ({ kind: "model_unavailable", error: "provider down" }),
+      });
+
+      await worker.runOnce(10);
+
+      expect(store.get(queued.id)).toMatchObject({
+        status: "failed",
+        launched: false,
+        attemptCount: 1,
+      });
+      expect(store.claimNext({ workerId: "other", leaseMs: 100, now: 1_000_000 })).toBeUndefined();
+      worker.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("starts one external process for one durable command", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-worker-"));
     try {
@@ -32,7 +57,7 @@ describe("worker contention", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("keeps provider outages queued with bounded retry instead of losing the task", async () => {
+  it("fails an uncommitted generic provider outage so retry stays domain-owned", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-worker-retry-"));
     try {
       const path = stateDatabase(root); const store = new RunStore(path);
@@ -43,7 +68,7 @@ describe("worker contention", () => {
         runner: async () => ({ kind: "auth", error: "provider unavailable" }),
       });
       await worker.runOnce(10);
-      expect(store.get(queued.id)).toMatchObject({ status: "queued", attemptCount: 1, nextAttemptAt: 30_010 });
+      expect(store.get(queued.id)).toMatchObject({ status: "failed", attemptCount: 1, nextAttemptAt: 1 });
       expect(await worker.runOnce(11)).toBeUndefined();
       worker.close();
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -69,7 +94,7 @@ describe("worker contention", () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-worker-replay-"));
     try {
       const path = stateDatabase(root); const store = new RunStore(path);
-      const queued = store.enqueue({ idempotencyKey: "review", stage: "review:auditor", priority: 5, now: 1 });
+      const queued = store.enqueue({ idempotencyKey: "review-output", stage: "planning", priority: 5, now: 1 });
       const replay = { preferredAgent: "grok", project: "/repo", prompt: "audit", approvalScope: "workspace-read", allowFallback: false, replayOnly: true };
       const worker = new DurableWorker({
         store,

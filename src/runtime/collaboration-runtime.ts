@@ -20,6 +20,7 @@ import { RunGateUnitOfWork } from "./run-gate-unit-of-work.js";
 import type { MapAdmissionProof } from "../flow/map-admission.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
 import { ExecutionAdmission } from "./execution-admission.js";
+import { matchesExactPrelaunchCliMissing } from "./prelaunch-evidence.js";
 
 export type DispatchDisposition =
   | "execute"
@@ -430,6 +431,13 @@ export class CollaborationRuntime {
       invalidRunnerOutcomeEvidence("prelaunch receipt does not match exact durable broker evidence");
     }
     if (isFailoverOutcome(receipt.resultKind)) {
+      if (!matchesExactPrelaunchCliMissing(
+        run,
+        active.assignment as unknown as Readonly<Record<string, unknown>>,
+        receipt.resultKind,
+      )) {
+        invalidRunnerOutcomeEvidence("prelaunch recovery requires exact proven-no-spawn cli_missing evidence");
+      }
       return this.workflowStore.apply(
         workflowId,
         {

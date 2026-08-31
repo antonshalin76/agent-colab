@@ -6,6 +6,7 @@ import {
   RunnerOutcomeReceiptSchema,
 } from "../runtime/collaboration-runtime.js";
 import type { RunRecord } from "../store/run-store.js";
+import { matchesExactPrelaunchCliMissing } from "../runtime/prelaunch-evidence.js";
 
 const OutcomeKindSchema = z.enum([...FAILOVER_OUTCOMES, ...TERMINAL_OUTCOMES]);
 const ResultKindSchema = z.enum(["success", ...FAILOVER_OUTCOMES, ...TERMINAL_OUTCOMES]);
@@ -155,6 +156,13 @@ export function assertPersistedDomainEffectMatchesRun(
     }, "prelaunch receipt");
     requireEqual(providerResult.agent, object(payload.workflowDispatchIdentity)?.agent,
       "provider result agent");
+    if (isFailoverOutcome(effect.reason) && !matchesExactPrelaunchCliMissing(
+      run,
+      object(payload.workflowDispatchIdentity) ?? {},
+      effect.reason,
+    )) {
+      throw new Error("persisted prelaunch recovery lacks exact proven-no-spawn cli_missing evidence");
+    }
     return;
   }
 

@@ -110,7 +110,13 @@ function createProfileFixture(): string {
   return root;
 }
 
-function learningBytes(root: string, options?: { controlFingerprint?: () => string }) {
+function learningBytes(root: string, options?: {
+  controlFingerprint?: () => string;
+  optionalReviewState?: "missing" | "grok_missing" | "claude_missing" |
+    "pass" | "provider_unavailable" |
+    "changes_requested" | "failed" | "needs_reconciliation";
+  adverseAgent?: "grok" | "claude";
+}) {
   const profileLock = readCheckedInLock(root);
   return prepareLearningFixture({
     projectRoot: root,
@@ -124,6 +130,8 @@ function learningBytes(root: string, options?: { controlFingerprint?: () => stri
     revision: 1,
     },
     ...(options?.controlFingerprint ? { controlFingerprint: options.controlFingerprint } : {}),
+    ...(options?.optionalReviewState ? { optionalReviewState: options.optionalReviewState } : {}),
+    ...(options?.adverseAgent ? { adverseAgent: options.adverseAgent } : {}),
   });
 }
 
@@ -295,7 +303,7 @@ describe("local MAP administration adapter", { timeout: 15_000 }, () => {
       .toThrow(/runtime tool tree.*identity/i);
   });
 
-  it("closes exact-byte learning and projects the same records to Codex, Grok and Claude", () => {
+  it("closes exact-byte learning with the required Codex quorum when optional providers are missing", () => {
     const root = createProfileFixture();
     const input = learningBytes(root);
     const mapConfigBefore = readFileSync(join(root, ".map/config.yaml"));
@@ -303,12 +311,8 @@ describe("local MAP administration adapter", { timeout: 15_000 }, () => {
       reviewReceipts: Array<{ agent: string; role: string }>;
     };
     expect(handoff.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort()).toEqual([
-      "claude:auditor",
-      "claude:critic",
       "codex:auditor",
       "codex:critic",
-      "grok:auditor",
-      "grok:critic",
     ]);
     const beforePromotion = createMapLearningLaunchBinding(root, "codex");
     const beforePrompt = `${formatMapLearningLaunchBindingContext(beforePromotion)}\n\nreview`;
@@ -362,6 +366,77 @@ describe("local MAP administration adapter", { timeout: 15_000 }, () => {
       claudeBinding,
       `${formatMapLearningLaunchBindingContext(claudeBinding)}\n\nread-only review`,
     )).not.toThrow();
+  });
+
+  it("retains exact optional PASS receipts when diversity providers complete", () => {
+    const root = createProfileFixture();
+    const input = learningBytes(root, { optionalReviewState: "pass" });
+    const handoff = JSON.parse(Buffer.from(input.handoffBytes).toString("utf8")) as {
+      reviewReceipts: Array<{ agent: string; role: string }>;
+    };
+    expect(handoff.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort()).toEqual([
+      "claude:auditor",
+      "claude:critic",
+      "codex:auditor",
+      "codex:critic",
+      "grok:auditor",
+      "grok:critic",
+    ]);
+    expect(() => closeLearning(root, input, input.authority)).not.toThrow();
+  });
+
+  it.each([
+    ["grok_missing", ["claude:auditor", "claude:critic", "codex:auditor", "codex:critic"]],
+    ["claude_missing", ["codex:auditor", "codex:critic", "grok:auditor", "grok:critic"]],
+  ] as const)("closes when exactly one optional provider is missing: %s", (optionalReviewState, expected) => {
+    const root = createProfileFixture();
+    const input = learningBytes(root, { optionalReviewState });
+    const handoff = JSON.parse(Buffer.from(input.handoffBytes).toString("utf8")) as {
+      reviewReceipts: Array<{ agent: string; role: string }>;
+    };
+    expect(handoff.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort()).toEqual(expected);
+    expect(() => closeLearning(root, input, input.authority)).not.toThrow();
+  });
+
+  it("closes with explicit durable optional-provider unavailable outcomes", () => {
+    const root = createProfileFixture();
+    const input = learningBytes(root, { optionalReviewState: "provider_unavailable" });
+    const handoff = JSON.parse(Buffer.from(input.handoffBytes).toString("utf8")) as {
+      reviewReceipts: Array<{ agent: string; role: string }>;
+    };
+    expect(handoff.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort()).toEqual([
+      "codex:auditor",
+      "codex:critic",
+    ]);
+    expect(() => closeLearning(root, input, input.authority)).not.toThrow();
+  });
+
+  it.each((["grok", "claude"] as const).flatMap((adverseAgent) =>
+    (["changes_requested", "failed", "needs_reconciliation"] as const)
+      .map((optionalReviewState) => [adverseAgent, optionalReviewState] as const)))(
+    "blocks learning closure for optional %s adverse state %s", (adverseAgent, optionalReviewState) => {
+      const root = createProfileFixture();
+      const input = learningBytes(root, { optionalReviewState, adverseAgent });
+      expect(() => closeLearning(root, input, input.authority))
+        .toThrow(/review barrier|durable PASS evidence/i);
+    },
+  );
+
+  it("requires both Codex receipts and every completed optional PASS receipt", () => {
+    for (const omittedPair of ["codex:critic", "grok:auditor"] as const) {
+      const root = createProfileFixture();
+      const input = learningBytes(root, { optionalReviewState: "pass" });
+      const handoff = JSON.parse(Buffer.from(input.handoffBytes).toString("utf8")) as {
+        reviewReceipts: Array<{ agent: string; role: string }>;
+      };
+      handoff.reviewReceipts = handoff.reviewReceipts.filter(
+        ({ agent, role }) => `${agent}:${role}` !== omittedPair,
+      );
+      expect(() => closeLearning(root, {
+        ...input,
+        handoffBytes: encoder.encode(`${JSON.stringify(handoff)}\n`),
+      }, input.authority), omittedPair).toThrow(/review receipt|Codex.*quorum|durable harness evidence/i);
+    }
   });
 
   it("recovers promotion after an obsolete process lock is left by a crash", () => {

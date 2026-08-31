@@ -1,0 +1,129 @@
+{
+  "schemaVersion": "hybrid-flow-eval-report/v2",
+  "label": "baseline",
+  "generatedAt": "2026-08-31T13:24:53.148Z",
+  "suiteId": "agent-collab-hybrid-flow-v2-normative",
+  "contractSha256": "2f7243d3ce16478fa5314a3ab5724201b9e2cc8b8dea4e0c2518ea65e290cf9b",
+  "runnerSha256": "56c53a0e373903907307c2feb9dc4c9f9b5790ddddeca865c392d4cac3d6380e",
+  "runtimeRoot": "/tmp/agent-collab-baseline-H3VklM",
+  "runtime": {
+    "node": "v24.14.1",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "functional": {
+    "passed": 0,
+    "failed": 1,
+    "unsupported": 11,
+    "total": 12,
+    "verifiedCompletionRate": 0,
+    "cases": [
+      {
+        "id": "dag_validation",
+        "status": "unsupported"
+      },
+      {
+        "id": "cycle_rejection",
+        "status": "unsupported"
+      },
+      {
+        "id": "fan_out_readiness",
+        "status": "unsupported"
+      },
+      {
+        "id": "all_success_join",
+        "status": "unsupported"
+      },
+      {
+        "id": "all_terminal_join",
+        "status": "unsupported"
+      },
+      {
+        "id": "conditional_route",
+        "status": "unsupported"
+      },
+      {
+        "id": "unreachable_skip",
+        "status": "unsupported"
+      },
+      {
+        "id": "typed_result_validation",
+        "status": "unsupported"
+      },
+      {
+        "id": "invalid_result_fail_closed",
+        "status": "unsupported"
+      },
+      {
+        "id": "session_checkpoint_isolation",
+        "status": "unsupported"
+      },
+      {
+        "id": "usage_completeness",
+        "status": "unsupported"
+      },
+      {
+        "id": "mcp_flow_capability",
+        "status": "fail",
+        "error": "validation tool missing"
+      }
+    ]
+  },
+  "performance": {
+    "pureGraph100Nodes400Edges": {
+      "status": "unsupported"
+    },
+    "fanOut3x40ms": {
+      "medianMs": 120.60688400000004,
+      "p95Ms": 120.75548200000003,
+      "samples": [
+        120.09455300000002,
+        120.75548200000003,
+        120.70372300000002,
+        120.53615500000006,
+        120.52029000000005,
+        120.54318,
+        120.50820899999997,
+        120.63539700000001,
+        120.63807799999995,
+        120.60688400000004,
+        120.70007400000009,
+        120.73458000000005
+      ]
+    },
+    "legacyQueue100NodeChain": {
+      "medianMs": 32.61345899999969,
+      "p95Ms": 41.52070000000003,
+      "samples": [
+        34.0393160000001,
+        38.115827999999965,
+        35.04492399999981,
+        35.09126500000002,
+        28.44155099999989,
+        29.611762,
+        30.023541000000023,
+        26.761601000000155,
+        24.042468999999983,
+        41.52070000000003,
+        36.97023900000022,
+        46.0725809999999,
+        26.92299899999989,
+        29.567916999999852,
+        36.41425100000015,
+        30.558779000000413,
+        32.61345899999969,
+        32.83478500000001,
+        28.08326500000021,
+        34.38887100000011
+      ]
+    }
+  },
+  "thresholds": {
+    "pureGraphP95": false,
+    "fanOutSpeedup": 0.9949680815897703
+  },
+  "process": {
+    "rssBytes": 151678976,
+    "heapUsedBytes": 55178344
+  }
+}

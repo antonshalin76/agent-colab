@@ -3,22 +3,34 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import Database from "better-sqlite3";
 import { HistoryIndex } from "../history/index.js";
 import { buildHistoryContext } from "../history/context.js";
 import { HistoryVisibilityPolicy } from "../history/visibility-policy.js";
 import type { CollabService, DelegateInput, ReviewInput, SearchInput } from "../mcp/server.js";
 import { createCollaborationRun, type StageDefinition } from "../workflow/workflow.js";
-import { preferredAgentForStage, routeStage, stageRequiresReadOnly } from "../domain/routing.js";
+import {
+  preferredAgentForStage,
+  routeStage,
+  stageRequiresReadOnly,
+  type ReviewProviderHealthSnapshot,
+  type ReviewProviderId,
+} from "../domain/routing.js";
 import { RunStore } from "../store/run-store.js";
+import { validateGraphFlow } from "../workflow/flow-contract.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
 import { executionAuthorityConsumerKey, snapshotFromBinding } from "../flow/execution-snapshot.js";
 import { defaultAllowedProjectRoots, ProjectPolicy } from "../security/project-policy.js";
 import { ProviderHealthStore } from "../runtime/provider-health-store.js";
 import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
+import { ReviewEvidenceCapture, type ReviewEvidenceCaptureEntryPoint } from "../runtime/review-evidence-capture.js";
+import { assertReviewV3SchemaSignature } from "../migration/review-v3-schema.js";
 import { CollaborationRuntime } from "../runtime/collaboration-runtime.js";
+import { REVIEW_BARRIER_POLICY } from "../domain/review.js";
 import { redactSensitive } from "../security/redaction.js";
-import { auditSharedSkills } from "../skills/audit.js";
+import { auditSharedSkills, sharedSkillReadiness } from "../skills/audit.js";
 import {
   createCurrentMapLearningLaunchBinding,
   formatMapLearningLaunchBindingContext,
@@ -141,8 +153,35 @@ export class LocalCollabService implements CollabService {
   private readonly projects: ProjectPolicy;
   private readonly sharedSkillsRoot = join(homedir(), ".agents", "skills");
   private readonly agentSkillRoots: Readonly<Record<"grok" | "claude" | "codex", string>>;
+  private readonly evidenceCapture: ReviewEvidenceCapture;
   constructor(readonly stateDatabase: string, options?: { allowedRoots?: string[]; historyDatabase?: string;
-    agentSkillRoots?: Readonly<Record<"grok" | "claude" | "codex", string>> }) {
+    agentSkillRoots?: Readonly<Record<"grok" | "claude" | "codex", string>>;
+    evidenceCapture?: ReviewEvidenceCapture }) {
+    const rawOptions = options as Record<string, unknown> | undefined;
+    if (rawOptions && ("harnessReady" in rawOptions || "sourceFingerprint" in rawOptions)) {
+      throw new Error("legacy raw review evidence options are unsupported; use typed evidence capture");
+    }
+    const schema = new Database(stateDatabase, { readonly: true });
+    try { assertReviewV3SchemaSignature(schema); } finally { schema.close(); }
+    this.agentSkillRoots = options?.agentSkillRoots ?? {
+      grok: join(homedir(), ".grok", "skills"),
+      claude: join(homedir(), ".claude", "skills"),
+      codex: join(homedir(), ".codex", "skills"),
+    };
+    this.evidenceCapture = options?.evidenceCapture ?? new ReviewEvidenceCapture({
+      captureSource: ({ project }) => {
+        const source = captureWorkspaceFingerprint(project);
+        return { sourceFingerprint: source.fingerprint, valid: true };
+      },
+      captureReadiness: ({ agent }) => {
+        const readiness = sharedSkillReadiness(auditSharedSkills({
+          canonicalRoot: this.sharedSkillsRoot, agentRoots: this.agentSkillRoots,
+        }))[agent];
+        return readiness
+          ? { harnessReady: true, state: "ready", valid: true }
+          : { harnessReady: false, state: "provider_unavailable", valid: false };
+      },
+    });
     this.runs = new RunStore(stateDatabase);
     const historyDatabase = options?.historyDatabase ?? join(dirname(stateDatabase), "history.db");
     this.history = new HistoryIndex(historyDatabase, { visibilityPolicy: new HistoryVisibilityPolicy() });
@@ -153,20 +192,37 @@ export class LocalCollabService implements CollabService {
     this.mapControl = new MapControlPlane(stateDatabase);
     this.runtime = new CollaborationRuntime(stateDatabase);
     this.projects = new ProjectPolicy(options?.allowedRoots ?? defaultAllowedProjectRoots());
-    this.agentSkillRoots = options?.agentSkillRoots ?? {
-      grok: join(homedir(), ".grok", "skills"),
-      claude: join(homedir(), ".claude", "skills"),
-      codex: join(homedir(), ".codex", "skills"),
-    };
   }
   async status() {
     const runs = this.runs.list();
     return {
       providers: Object.fromEntries(Object.entries(this.providers.snapshot()).map(([agent, state]) => [agent, state.health])),
+      reviewPolicy: {
+        required: REVIEW_BARRIER_POLICY.requiredRoles.map(
+          (role) => `${REVIEW_BARRIER_POLICY.requiredAgent}:${role}`,
+        ),
+        optional: REVIEW_BARRIER_POLICY.optionalAgents.flatMap(
+          (agent) => REVIEW_BARRIER_POLICY.requiredRoles.map((role) => `${agent}:${role}`),
+        ),
+        optionalUnavailableBlocks: REVIEW_BARRIER_POLICY.optionalUnavailableBlocks,
+        optionalChangesRequestedBlocks: REVIEW_BARRIER_POLICY.optionalChangesRequestedBlocks,
+        optionalNeedsReconciliationBlocks: REVIEW_BARRIER_POLICY.optionalNeedsReconciliationBlocks,
+      },
       queue: Object.fromEntries(["queued", "claimed", "completed", "failed", "cancelled", "needs_reconciliation"]
         .map((status) => [status, runs.filter((run) => run.status === status).length])),
       protocol: "agent-collab/v2",
+      capabilities: { graphFlowValidation: "flow/v1" },
       memorySources: this.history.memorySourceHealth(),
+    };
+  }
+  async validateFlow(input: unknown) {
+    const validated = validateGraphFlow(input);
+    return {
+      schemaVersion: "GraphFlowValidation/v1",
+      flowId: validated.graph.flowId,
+      nodeCount: validated.graph.nodes.length,
+      edgeCount: validated.graph.edges.length,
+      valid: true,
     };
   }
   async search(input: SearchInput) {
@@ -195,12 +251,105 @@ export class LocalCollabService implements CollabService {
       ...(consumerKey ? { consumerKey } : {}) });
     if (!result.allowed) throw new Error(`approval denied: ${result.reason}`);
   }
-  private assertSharedSkills(): void {
+  private assertSharedSkills(health: ReviewProviderHealthSnapshot): {
+    health: ReviewProviderHealthSnapshot;
+    skillReady: Readonly<Record<ReviewProviderId, boolean>>;
+  } {
     const audit = auditSharedSkills({
       canonicalRoot: this.sharedSkillsRoot,
       agentRoots: this.agentSkillRoots,
     });
-    if (!audit.consistent) throw new Error("shared skill manifest is unavailable or divergent");
+    const skillReady = sharedSkillReadiness(audit);
+    if (!skillReady.codex) {
+      throw new Error("shared skill manifest is unavailable or divergent");
+    }
+    return {
+      health: {
+        ...health,
+        grok: skillReady.grok ? health.grok : "unavailable",
+        claude: skillReady.claude ? health.claude : "unavailable",
+      },
+      skillReady,
+    };
+  }
+  private captureAdmission(
+    entryPoint: Extract<ReviewEvidenceCaptureEntryPoint, "request_review" | "map_admission">,
+    project: string,
+    reviewId: string,
+  ): { health: ReviewProviderHealthSnapshot; sourceFingerprint: string;
+    admissionReceipts: Array<{ agent: ReviewProviderId; role: "auditor" | "critic";
+      activationNonce: string; sourceReceiptId: string; readinessReceiptId: string }> } {
+    const outcomes = new Map<string, ReturnType<ReviewEvidenceCapture["capture"]>>();
+    const unavailableForThisAdmission = new Set<ReviewProviderId>();
+    for (const agent of ["grok", "claude", "codex"] as const) {
+      for (const role of ["auditor", "critic"] as const) {
+        const outcome = this.evidenceCapture.capture({ entryPoint, phase: "admission",
+          project, agent, role });
+        outcomes.set(`${agent}:${role}`, outcome);
+      }
+      const auditor = outcomes.get(`${agent}:auditor`)!;
+      const critic = outcomes.get(`${agent}:critic`)!;
+      const pairIsEquivalent = auditor.kind === critic.kind &&
+          auditor.kind !== "infrastructure_failure" &&
+          critic.kind !== "infrastructure_failure" &&
+          JSON.stringify(auditor.source) === JSON.stringify(critic.source) &&
+          JSON.stringify(auditor.readiness) === JSON.stringify(critic.readiness);
+      const pairIsReady = pairIsEquivalent && auditor.kind === "ready" && critic.kind === "ready";
+      if (!pairIsReady) {
+        if (agent === "codex") {
+          throw new Error("mandatory Codex auditor/critic pair is unavailable or divergent");
+        }
+        unavailableForThisAdmission.add(agent);
+        const unavailable = [auditor, critic].find(
+          (outcome) => outcome.kind === "provider_unavailable",
+        );
+        if (unavailable?.kind === "provider_unavailable") {
+          this.providers.applyCaptureOutcome(unavailable);
+        }
+        continue;
+      }
+    }
+    const persistedHealth = reviewHealth(this.providers.snapshot());
+    const health: ReviewProviderHealthSnapshot = {
+      ...persistedHealth,
+      ...Object.fromEntries([...unavailableForThisAdmission].map((agent) => [agent, "unavailable"])),
+    } as ReviewProviderHealthSnapshot;
+    const codexSource = outcomes.get("codex:auditor")!;
+    if (codexSource.kind !== "ready") throw new Error("mandatory Codex evidence capture failed");
+    const admissionReceipts: Array<{ agent: ReviewProviderId; role: "auditor" | "critic";
+      activationNonce: string; sourceReceiptId: string; readinessReceiptId: string }> = [];
+    for (const agent of ["grok", "claude", "codex"] as const) {
+      if (health[agent] !== "healthy" || unavailableForThisAdmission.has(agent)) continue;
+      for (const role of ["auditor", "critic"] as const) {
+        const outcome = outcomes.get(`${agent}:${role}`)!;
+        if (outcome.kind !== "ready") {
+          throw new Error(`healthy review provider lacks ready evidence: ${agent}/${role}`);
+        }
+        const sourceScope = `review/${reviewId}/${agent}/${role}/source`;
+        const readinessScope = `review/${reviewId}/${agent}/${role}/readiness`;
+        const cursor = this.reviews.receiptPairCursor({ sourceScope, readinessScope });
+        const activationNonce = randomUUID();
+        const sourceReceiptId = randomUUID();
+        const readinessReceiptId = randomUUID();
+        const captured = this.reviews.captureReviewReceiptPair({
+          pairId: randomUUID(), phase: "admission", activationNonce,
+          scopeRevision: cursor.scopeRevision, recoveryGeneration: null,
+          expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
+          predecessorReceiptIds: cursor.predecessorReceiptIds,
+          receipts: {
+            source: { receiptId: sourceReceiptId, scope: sourceScope, observation: outcome.source },
+            readiness: { receiptId: readinessReceiptId, scope: readinessScope,
+              observation: outcome.readiness },
+          },
+          createdAt: outcome.observedAt,
+        });
+        if (captured.lifecycle !== "pending") {
+          throw new Error(`admission receipt pair lost current head: ${agent}/${role}`);
+        }
+        admissionReceipts.push({ agent, role, activationNonce, sourceReceiptId, readinessReceiptId });
+      }
+    }
+    return { health, sourceFingerprint: codexSource.source.sourceFingerprint, admissionReceipts };
   }
   private reviewRuns(reviewId: string, requester: "grok" | "codex") {
     return this.reviews.enqueueDescriptors(reviewId)
@@ -212,17 +361,6 @@ export class LocalCollabService implements CollabService {
         if (!run) throw new Error("atomic review run is missing");
         return run;
       });
-  }
-  private admitDemandedReview(reviewId: string, sourceFingerprint: string, now: number): void {
-    for (const agent of ["grok", "claude", "codex"] as const) {
-      this.reviews.activateDeferred({
-        reviewId,
-        agent,
-        currentSourceFingerprint: sourceFingerprint,
-        now,
-        providerHealth: this.providers,
-      });
-    }
   }
   closeMapLearning(input: MapLearningBytesInput) {
     return this.mapControl.closeLearning(input);
@@ -240,6 +378,7 @@ export class LocalCollabService implements CollabService {
     input: DelegateInput,
     project: string,
     workflow: ReturnType<typeof createCollaborationRun>,
+    _health: ReviewProviderHealthSnapshot,
   ) {
     const target = this.runtime.reviewTarget(workflow, input.idempotencyKey);
     const snapshot = snapshotFromBinding(target.binding);
@@ -247,7 +386,9 @@ export class LocalCollabService implements CollabService {
     const source = snapshot.workspace;
     const gates = mapAdmissionGates(input.stage);
     if (gates.length === 0) return { satisfied: true, profile, gates: [] };
-    const health = reviewHealth(this.providers.snapshot());
+    if (input.requester !== "codex") {
+      throw new Error("only the local Codex workflow owner may mint MAP review grants");
+    }
     const snapshots = gates.map((gate) => {
       const expectation = mapAdmissionReviewExpectation({
         project,
@@ -257,13 +398,15 @@ export class LocalCollabService implements CollabService {
         sourceFingerprint: source.fingerprint,
         changedFiles: source.changedFiles.length,
       });
+      const admission = this.captureAdmission("map_admission", project, expectation.reviewId);
       this.reviews.create({
         ...expectation,
-        health,
+        health: admission.health,
+        sourceFingerprint: admission.sourceFingerprint,
+        admissionReceipts: admission.admissionReceipts,
         createdAt: Date.now(),
       });
       const { reviewId } = expectation;
-      this.admitDemandedReview(reviewId, source.fingerprint, Date.now());
       const runs = this.reviewRuns(reviewId, "codex");
       return { name: gate.name, reviewId, barrier: this.reviews.barrier(reviewId), runIds: runs.map((run) => run.id) };
     });
@@ -286,7 +429,8 @@ export class LocalCollabService implements CollabService {
     };
   }
   async delegate(input: DelegateInput) {
-    this.assertSharedSkills();
+    const providerSnapshot = this.providers.snapshot();
+    const sharedSkills = this.assertSharedSkills(reviewHealth(providerSnapshot));
     if (stageRequiresReadOnly(input.stage) && input.approvalScope !== "workspace-read") {
       throw new Error(`${input.stage} is a read-only stage and cannot receive mutation authority`);
     }
@@ -312,7 +456,6 @@ export class LocalCollabService implements CollabService {
     const workflowPrompt = `${input.stage === "planning" ? "MAP control plane: use the installed map-plan contract before proposing implementation.\n\n" : ""}${formatMapLearningLaunchBindingContext(mapLearning)}\n\n${input.prompt}\n\nImmutable artifact (${input.artifactHash}):\n${input.artifactContent}`;
     const taskId = input.taskId ?? input.idempotencyKey.split(":")[0] ?? input.idempotencyKey;
     const workflowTaskId = scopedIdempotencyKey(project, taskId);
-    const providerSnapshot = this.providers.snapshot();
     const health = routingHealth(providerSnapshot);
     const targetStage: StageDefinition = { id: input.idempotencyKey, kind: input.stage,
       role: input.stage === "coordination" ? "coordinator" as const : "stage-owner" as const,
@@ -333,7 +476,12 @@ export class LocalCollabService implements CollabService {
       this.assertAuthorized(project, input.approvalScope, input.approvalReference,
         targetStage.authorizationConsumerKey);
     }
-    const mapAdmission = this.ensureMapAdmission(input, project, candidate);
+    const mapAdmission = this.ensureMapAdmission(
+      input,
+      project,
+      candidate,
+      sharedSkills.health,
+    );
     if (!mapAdmission.satisfied) {
       return {
         runId: persistedInputKey,
@@ -361,7 +509,9 @@ export class LocalCollabService implements CollabService {
     return { runId: persistedInputKey, assignedAgent, status: state.status };
   }
   async requestReview(input: ReviewInput) {
-    this.assertSharedSkills();
+    if (input.requester !== "codex") {
+      throw new Error("only Codex may mint a review grant at the local stdio boundary");
+    }
     const project = this.projects.resolveReviewWorkspace(input.workspaceRoot);
     if (input.approvalScope !== "workspace-read") throw new Error("review lanes are immutable read-only operations");
     if (redactSensitive(input.artifactContent) !== input.artifactContent) {
@@ -370,17 +520,17 @@ export class LocalCollabService implements CollabService {
     const artifact = Buffer.from(input.artifactContent, "utf8");
     const actualHash = createHash("sha256").update(artifact).digest("hex");
     if (actualHash !== input.artifactHash) throw new Error("review artifact hash mismatch");
-    const snapshot = this.providers.snapshot();
-    const health = reviewHealth(snapshot);
     const reviewId = scopedIdempotencyKey(project, input.idempotencyKey);
     const safePrompt = redactSensitive(input.prompt);
     const source = captureWorkspaceFingerprint(project);
-    const review = this.reviews.create({ reviewId, stageId: input.stageId ?? "independent-review", artifact, health,
+    const admission = this.captureAdmission("request_review", project, reviewId);
+    const review = this.reviews.create({ reviewId, stageId: input.stageId ?? "independent-review", artifact,
+      health: admission.health,
       approvalScope: "workspace-read", idempotencyKey: reviewId,
       prompts: { auditor: `AUDITOR independent lane. ${safePrompt}`, critic: `CRITIC independent lane. ${safePrompt}` },
       createdAt: Date.now(), project, requester: input.requester,
-      sourceFingerprint: source.fingerprint, changedFiles: source.changedFiles.length });
-    this.admitDemandedReview(reviewId, source.fingerprint, Date.now());
+      sourceFingerprint: admission.sourceFingerprint, changedFiles: source.changedFiles.length,
+      admissionReceipts: admission.admissionReceipts });
     const runs = this.reviewRuns(reviewId, input.requester);
     return { reviewId, laneCount: 6, activeLaneCount: runs.length, runState: review.runState, runIds: runs.map((lane) => lane.id) };
   }

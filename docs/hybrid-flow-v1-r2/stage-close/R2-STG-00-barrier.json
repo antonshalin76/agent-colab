@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "review-barrier-evidence/v1",
+  "stageId": "R2-STG-00",
+  "gateId": "R2-STG-00",
+  "sourceFingerprint": "9366c25efe0b924cf90c3ffa42fbee7bb07bd9913e79105ce016529be91bb2f3",
+  "satisfied": true,
+  "requiredCount": 2,
+  "terminalCount": 2,
+  "requiredReceipts": [
+    {
+      "agent": "codex",
+      "role": "auditor",
+      "attemptId": "codex-r2-final-auditor-20260901",
+      "receiptSha256": "9ce07f91881abd76a4bc3dcb7827d86c560b7c00f825eba722f00c7c4274b57b"
+    },
+    {
+      "agent": "codex",
+      "role": "critic",
+      "attemptId": "codex-r2-final-critic-20260901",
+      "receiptSha256": "50bd760ba43ecda77b5f6285006d8e12d06e3c59f9b25df86eb309aef7194706"
+    }
+  ]
+}

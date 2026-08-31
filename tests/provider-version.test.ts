@@ -1,16 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
-import { discoverProviderVersion } from "../src/probes/provider-version.js";
+import { discoverProviderVersion, normalizeProviderVersion } from "../src/probes/provider-version.js";
 
 describe("live provider version discovery", () => {
-  it("uses the exact installed CLI version without a release fallback", () => {
+  it("normalizes Grok's HOME-dependent stable channel suffix", () => {
     const probe = vi.fn(() => ({
       status: 0,
       stdout: "grok 9.8.7 (future) [stable]\n",
       stderr: "",
     }));
     expect(discoverProviderVersion("/opt/bin/grok", probe))
-      .toBe("grok 9.8.7 (future) [stable]");
+      .toBe("grok 9.8.7 (future)");
     expect(probe).toHaveBeenCalledWith("/opt/bin/grok", ["--version"]);
+  });
+
+  it("uses the same normalization for an observed capability-probe version", () => {
+    expect(normalizeProviderVersion("grok 9.8.7 (future) [stable]\n"))
+      .toBe("grok 9.8.7 (future)");
   });
 
   it("fails closed when the installed binary cannot identify itself", () => {

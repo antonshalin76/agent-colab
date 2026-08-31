@@ -5,6 +5,9 @@ export type VersionProbe = (
   args: readonly string[],
 ) => { status: number | null; stdout: string; stderr: string; error?: Error };
 
+export const normalizeProviderVersion = (value: string): string =>
+  value.trim().replace(/ \[stable\]$/, "");
+
 export function discoverProviderVersion(
   binaryPath: string,
   probe: VersionProbe = (file, args) => spawnSync(file, args, {
@@ -17,7 +20,7 @@ export function discoverProviderVersion(
   if (result.status !== 0) {
     throw result.error ?? new Error(result.stderr.trim() || `version probe failed: ${binaryPath}`);
   }
-  const version = result.stdout.trim();
+  const version = normalizeProviderVersion(result.stdout);
   if (!version) throw new Error(`version probe returned empty output: ${binaryPath}`);
   return version;
 }

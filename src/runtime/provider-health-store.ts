@@ -5,6 +5,10 @@ import {
   type ProviderHealth,
   type ReviewProviderId,
 } from "../domain/routing.js";
+import {
+  isReviewEvidenceCaptureOutcome,
+  type ReviewEvidenceCaptureOutcome,
+} from "./review-evidence-capture.js";
 
 const AGENTS = REVIEW_PROVIDER_IDS;
 const TRANSIENT_CAPABILITY_FAILURES: ReadonlySet<ProviderOutcome["kind"]> = new Set([
@@ -37,6 +41,13 @@ export interface ProviderAdmission {
   claimedAt?: number | undefined;
 }
 
+export interface CaptureOutcomeApplication {
+  applied: boolean;
+  agent: ReviewProviderId;
+  health: ProviderHealth;
+  recoveryGeneration: number;
+}
+
 interface ProviderHealthRow {
   agent: ReviewProviderId;
   health: ProviderHealth;
@@ -51,6 +62,10 @@ interface ProviderHealthOptions {
   cooldownMs: number;
   attemptLeaseMs?: number;
   enabled?: Record<ReviewProviderId, boolean>;
+}
+
+interface RecordSuccessOptions {
+  faultInjector?: (point: string) => void;
 }
 
 const toState = (row: ProviderHealthRow): ProviderHealthState => ({
@@ -172,31 +187,66 @@ export class ProviderHealthStore {
     };
   }
 
-  acquireAdmission(agent: ReviewProviderId, now: number): ProviderAdmission {
-    const current = this.get(agent);
-    if (current.health === "healthy") return { runnable: true };
-    if (current.health === "disabled") return { runnable: false };
+  applyCaptureOutcome(outcome: ReviewEvidenceCaptureOutcome): CaptureOutcomeApplication {
+    if (!isReviewEvidenceCaptureOutcome(outcome)) {
+      throw new Error("ProviderHealthStore requires a typed review capture outcome");
+    }
+    if (outcome.kind !== "provider_unavailable") {
+      const current = this.get(outcome.agent);
+      return { applied: false, agent: outcome.agent, health: current.health,
+        recoveryGeneration: this.latestRecoveryGeneration(outcome.agent) };
+    }
+    const current = this.get(outcome.agent);
+    if (current.health === "disabled") {
+      return { applied: false, agent: outcome.agent, health: current.health,
+        recoveryGeneration: this.latestRecoveryGeneration(outcome.agent) };
+    }
+    const retryAt = outcome.observedAt + this.cooldownMs;
     const changed = this.db.prepare(`
       UPDATE runtime_provider_health
-         SET health = 'probing', retry_at = NULL, attempt_claimed = 1, updated_at = ?
-       WHERE agent = ?
-         AND (
-           (health = 'probing' AND (attempt_claimed = 0 OR updated_at <= ?))
-           OR (health = 'unavailable' AND retry_at IS NOT NULL AND retry_at <= ?)
-         )
-    `).run(now, agent, now - this.attemptLeaseMs, now).changes;
-    return changed === 1 ? { runnable: true, claimedAt: now } : { runnable: false };
+         SET health = 'unavailable', retry_at = ?, failure_count = failure_count + 1,
+             attempt_claimed = 0, capability_verified = 0, updated_at = ?
+       WHERE agent = ? AND health != 'disabled' AND updated_at <= ?
+    `).run(retryAt, outcome.observedAt, outcome.agent, outcome.observedAt).changes;
+    const updated = this.get(outcome.agent);
+    return { applied: changed === 1, agent: outcome.agent, health: updated.health,
+      recoveryGeneration: this.latestRecoveryGeneration(outcome.agent) };
+  }
+
+  acquireAdmission(agent: ReviewProviderId, now: number): ProviderAdmission {
+    const current = this.get(agent);
+    void now;
+    return {
+      runnable: current.health === "healthy" && current.capabilityVerified && !current.attemptClaimed,
+    };
   }
 
   acquireExplicitProbeAdmission(agent: ReviewProviderId, now: number): ProviderAdmission {
     const changed = this.db.prepare(`
       UPDATE runtime_provider_health
-         SET health = 'probing', attempt_claimed = 1, updated_at = ?
-       WHERE agent = ? AND health != 'disabled' AND attempt_claimed = 0
-         AND (health = 'healthy'
-           OR (health = 'probing' AND (updated_at = 0 OR updated_at <= ?))
-           OR (health = 'unavailable' AND retry_at IS NOT NULL AND retry_at <= ?))
-    `).run(now, agent, now - this.attemptLeaseMs, now).changes;
+         SET health = 'probing', retry_at = NULL, attempt_claimed = 1, updated_at = ?
+       WHERE agent = ? AND health != 'disabled'
+         AND updated_at <= ?
+         AND ((attempt_claimed = 0 AND (
+                health = 'healthy'
+             OR health = 'probing'
+             OR (health = 'unavailable' AND retry_at IS NOT NULL AND retry_at <= ?)))
+           OR (attempt_claimed = 1 AND updated_at <= ?))
+    `).run(now, agent, now, now, now - this.attemptLeaseMs).changes;
+    return changed === 1 ? { runnable: true, claimedAt: now } : { runnable: false };
+  }
+
+  acquireRecoveryProbeAdmission(agent: ReviewProviderId, now: number): ProviderAdmission {
+    const changed = this.db.prepare(`
+      UPDATE runtime_provider_health
+         SET health = 'probing', retry_at = NULL, attempt_claimed = 1, updated_at = ?
+       WHERE agent = ? AND health != 'disabled'
+         AND updated_at <= ?
+         AND ((attempt_claimed = 0 AND (
+                (health = 'unavailable' AND retry_at IS NOT NULL AND retry_at <= ?)
+             OR (health = 'probing' AND capability_verified = 0)))
+           OR (attempt_claimed = 1 AND updated_at <= ?))
+    `).run(now, agent, now, now, now - this.attemptLeaseMs).changes;
     return changed === 1 ? { runnable: true, claimedAt: now } : { runnable: false };
   }
 
@@ -204,20 +254,56 @@ export class ProviderHealthStore {
     return this.acquireAdmission(agent, now).runnable;
   }
 
-  recordSuccess(agent: ReviewProviderId, now: number, expectedClaimedAt?: number): ProviderHealthState {
+  recordSuccess(
+    agent: ReviewProviderId,
+    now: number,
+    expectedClaimedAt?: number,
+    options: RecordSuccessOptions = {},
+  ): ProviderHealthState {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
-    this.db.prepare(`
-      UPDATE runtime_provider_health
-         SET health = 'healthy', retry_at = NULL, failure_count = 0,
-             attempt_claimed = 0, capability_verified = 1, updated_at = ?
-       WHERE agent = ?
-         AND updated_at <= ?
-         AND ((? IS NULL AND attempt_claimed = 0 AND (health = 'healthy'
-               OR (health = 'probing' AND capability_verified = 0 AND updated_at = 0)))
-           OR (? IS NOT NULL AND attempt_claimed = 1 AND updated_at = ?))
-    `).run(now, agent, now, expectedClaimedAt ?? null, expectedClaimedAt ?? null, expectedClaimedAt ?? null);
-    return this.get(agent);
+    const hasGenerationLedger = this.db.prepare(`SELECT 1 FROM sqlite_master
+      WHERE type = 'table' AND name = 'runtime_provider_recovery_generations'`).get() !== undefined;
+    const commit = this.db.transaction((): ProviderHealthState => {
+      if (expectedClaimedAt !== undefined && hasGenerationLedger) {
+        const replay = this.db.prepare(`SELECT generation
+          FROM runtime_provider_recovery_generations
+          WHERE agent = ? AND probe_claimed_at = ?`).get(agent, expectedClaimedAt);
+        if (replay !== undefined) return this.get(agent);
+      }
+
+      const changed = this.db.prepare(`
+        UPDATE runtime_provider_health
+           SET health = 'healthy', retry_at = NULL, failure_count = 0,
+               attempt_claimed = 0, capability_verified = 1, updated_at = ?
+         WHERE agent = ?
+           AND updated_at <= ?
+           AND ((? IS NULL AND attempt_claimed = 0 AND (health = 'healthy'
+                 OR (health = 'probing' AND capability_verified = 0 AND updated_at = 0)))
+             OR (? IS NOT NULL AND attempt_claimed = 1 AND updated_at = ?))
+      `).run(now, agent, now, expectedClaimedAt ?? null, expectedClaimedAt ?? null,
+        expectedClaimedAt ?? null).changes;
+
+      if (changed === 1 && expectedClaimedAt !== undefined && hasGenerationLedger) {
+        options.faultInjector?.("after_health_update_before_generation");
+        const generation = this.latestRecoveryGeneration(agent) + 1;
+        this.db.prepare(`INSERT INTO runtime_provider_recovery_generations
+          (agent, generation, probe_claim_id, probe_claimed_at, verified_at)
+          VALUES (?, ?, ?, ?, ?)`)
+          .run(agent, generation, `${agent}:${expectedClaimedAt}`, expectedClaimedAt, now);
+      }
+      return this.get(agent);
+    });
+    return commit.immediate();
+  }
+
+  latestRecoveryGeneration(agent: ReviewProviderId): number {
+    const exists = this.db.prepare(`SELECT 1 FROM sqlite_master
+      WHERE type = 'table' AND name = 'runtime_provider_recovery_generations'`).get();
+    if (exists === undefined) return 0;
+    const generation = this.db.prepare(`SELECT COALESCE(MAX(generation), 0)
+      FROM runtime_provider_recovery_generations WHERE agent = ?`).pluck().get(agent);
+    return Number(generation);
   }
 
   recordAuthReady(agent: ReviewProviderId, now: number): ProviderHealthState {
@@ -254,7 +340,8 @@ export class ProviderHealthStore {
     const current = this.get(agent);
     if (current.health === "disabled") return current;
     const preserveCapability = current.capabilityVerified && TRANSIENT_CAPABILITY_FAILURES.has(outcome.kind);
-    const retryAt = Math.max(now + this.cooldownMs,
+    const backoffMs = Math.min(this.cooldownMs * (2 ** Math.min(current.failureCount, 10)), 60 * 60_000);
+    const retryAt = Math.max(now + backoffMs,
       Number.isSafeInteger(outcome.retryAt) && outcome.retryAt! > now ? outcome.retryAt! : 0);
     this.db.prepare(`
       UPDATE runtime_provider_health

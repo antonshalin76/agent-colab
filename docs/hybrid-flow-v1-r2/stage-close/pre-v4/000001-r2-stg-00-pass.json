@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "PlanProgressEvent/v1",
+  "eventId": "r2-stg-00-pass",
+  "sequence": 1,
+  "previousEventSha256": "851b7136b5642360481b9896b154745bb8bee06adcc0017058cd964add396aee",
+  "startSha256": "851b7136b5642360481b9896b154745bb8bee06adcc0017058cd964add396aee",
+  "eventType": "step_completed",
+  "planId": "agent-collab-hybrid-flow-v1-r2",
+  "effectivePlanSha256": "af9191ea30d500de7f53cfdb57a890bfc7c1e55df3d3e738ed667bce7a787224",
+  "stageId": "R2-STG-00",
+  "gateId": "R2-STG-00",
+  "sourceFingerprint": "9366c25efe0b924cf90c3ffa42fbee7bb07bd9913e79105ce016529be91bb2f3",
+  "actor": "codex:/root",
+  "commandOrOracle": {
+    "kind": "oracle",
+    "artifactPath": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-terminal-oracle.json",
+    "sha256": "ece0da3a877da27a6af7a667c3f04033d6c1317da8b42d14abda4a5e4e091f67"
+  },
+  "inputHashes": [
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-source-manifest.json",
+      "sha256": "9366c25efe0b924cf90c3ffa42fbee7bb07bd9913e79105ce016529be91bb2f3"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-audit-packet-v12.md",
+      "sha256": "a692c1447ea5f3f760462e3322af79e5b0bb15ed35aaf77114226024679e1190"
+    }
+  ],
+  "outputHashes": [
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-test-evidence.json",
+      "sha256": "a41aa9384de75a9c7c0304ab6dca38bdcad45efedcbf9180bbb3021c70a1fb67"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-optional-providers.json",
+      "sha256": "87e308f2dbfc506e12e0bcbacf6f48d1b839366f921adefe129c38acb2e3f176"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-barrier.json",
+      "sha256": "65586c9749ad6f3d00e5095f89303f6aff2f2fbb3742047c6c1194b28d0c5704"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-terminal-oracle.json",
+      "sha256": "ece0da3a877da27a6af7a667c3f04033d6c1317da8b42d14abda4a5e4e091f67"
+    }
+  ],
+  "attemptIds": [
+    "codex-r2-final-auditor-20260901",
+    "codex-r2-final-critic-20260901"
+  ],
+  "reviewReceiptHashes": [
+    {
+      "agent": "codex",
+      "role": "auditor",
+      "attemptId": "codex-r2-final-auditor-20260901",
+      "artifactPath": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-codex-auditor-receipt.json",
+      "sha256": "9ce07f91881abd76a4bc3dcb7827d86c560b7c00f825eba722f00c7c4274b57b"
+    },
+    {
+      "agent": "codex",
+      "role": "critic",
+      "attemptId": "codex-r2-final-critic-20260901",
+      "artifactPath": "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-codex-critic-receipt.json",
+      "sha256": "50bd760ba43ecda77b5f6285006d8e12d06e3c59f9b25df86eb309aef7194706"
+    }
+  ],
+  "artifactPaths": [
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-audit-packet-v12.md",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-barrier.json",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-codex-auditor-receipt.json",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-codex-critic-receipt.json",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-optional-providers.json",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-source-manifest.json",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-terminal-oracle.json",
+    "docs/hybrid-flow-v1-r2/stage-close/R2-STG-00-test-evidence.json"
+  ],
+  "terminalResult": "PASS",
+  "recordedAt": "2026-09-01T04:58:24+08:00",
+  "eventSha256": "ca0e9dbd810ab6ed41c8b25c760b71d5bee8c621b60d3895fc778634e63c0bd7"
+}

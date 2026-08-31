@@ -1,0 +1,42 @@
+{
+  "schemaVersion": "source-manifest/v1",
+  "stageId": "R2-STG-00",
+  "files": {
+    "src/app/service.ts": "d6e1531f0e6b64db9c4f14bc16d1f6ea8ce5ba8a99ba8213c21d87a698433629",
+    "src/cli.ts": "7137caab0f70f41e26db80bf8977aa3bb67bfbcd33d8bd0f2430a3bd5d6ee3ef",
+    "src/domain/outcomes.ts": "8d64a9aa8623e820c335b6ab32a927cbf0438548bf7250f93520e423592733b2",
+    "src/domain/review.ts": "f3d6b05b838cd743f2c5934f06d5182eac8fbb62e5c98e3569b256403dbaf792",
+    "src/migration/coordinator.ts": "9ffcd029113f572907671428acab03027fdae758c1b63b4baedd4dbcffa0d39a",
+    "src/migration/review-v3-schema.ts": "7f1ec71311241f742d25e659d6e392860242bb82759d8fee0e517277ce6ad62c",
+    "src/probes/provider-probe-config.ts": "06cec9e90a18df597019a313c4bc0134e00cf137b485b70deb7367af87504c2f",
+    "src/runtime/provider-health-store.ts": "7f437cb544c20c4dfc7a56d27f07447508e38158773c48fd9eff2601f478463c",
+    "src/runtime/provider-recovery-loop.ts": "f6219fbb2c99bb27bcdca26cd49a17d431339602abd2a0b3cbb0141e9f789641",
+    "src/runtime/review-evidence-capture.ts": "c665ea8d40917671245257528d1c97efbf6545843252c4ccfab40a776c17d225",
+    "src/runtime/review-launch-admission.ts": "d288e23dbf74de278b9b79741a2e6d68bdfa1f30a26a7a52829003049b49b564",
+    "src/runtime/review-rejoin.ts": "34843e6fcccb404eeb4e0decb8fe3084c3eb76cec1b3a8e2c7c11f10116efbbd",
+    "src/runtime/run-gate-unit-of-work.ts": "502ac395e6ae98719b2ac465cdcdb45dfc39cc12512e15bcfc41f53bb728f05b",
+    "src/store/run-store.ts": "09f162fa9a17e483d03422dc4fdc7edc78b0b0f33d79a1b8e60f51e37707f36e",
+    "src/worker/durable-worker.ts": "1cff96717e3a551776211e15129cf145db5754856d0432eb5df8b59109441830",
+    "tests/cli-v4-migration.test.ts": "1beca155c99b13d447dc8bcfc8c29f2529c3f80c9ced44f55375b48b7a1b7c68",
+    "tests/provider-probe-config.test.ts": "76fb12a0e273351c9e34ca94eae5d2ec879e54dbe5d23d025860389e5b77bc4e",
+    "tests/provider-recovery-loop.test.ts": "a780670d72a93dc1ae4fc60589d1583dbfee07050882f248739418b04c7f254d",
+    "tests/review-evidence-capture.test.ts": "f902d85b043f840b8fc3d7ff8903f11765ce57ed0b61d9c21dd3bed9954cd210",
+    "tests/review-launch-admission.test.ts": "5f7090f45b430353cda8d23f3689b891f1cc23369df852baeb0d5a67fad2a803",
+    "tests/review-prelaunch-fence.test.ts": "1e6ab51322b086a2ff0c6b1937224fd10e928c36a7b0e847d7f0255af1a6b294",
+    "tests/review-receipt-ledger.test.ts": "a80a08696560f21bae229060254a4fc94129e9ac3036a4f4171effed3a201f59",
+    "tests/review-rejoin-v3.test.ts": "a720245f3177ba613dbba0f102bc3bed2e45e06e035abbe27b449fba282faad7",
+    "tests/review-v3-schema-signature.test.ts": "630e827c409a6c319f163f9dcd53fb4fe05cbed9be9fe60fe318f95c407a35ef",
+    "tests/review-v3-worker-boundary.test.ts": "e7cedda3aaad5b1f05f17ad305a0088c918aeec7b93c462c96ecd10c8e50c9e7",
+    "tests/runtime-provider-health.test.ts": "c4416106e56cb7bb34e98a1c05900bf2774708a74138ed7900b0932c09d5ed98",
+    "tests/runtime-review-barrier.test.ts": "4ba1eba85f8a29d65bce782fa6a86a491f4644f3bb4bbee8854696c5e263bb8f",
+    "tests/store.test.ts": "2c41d029f1d5dd9c01c0c2421bdbab6ded1bd985acda4a369097e8e6a0aeb4d9",
+    "tests/worker.test.ts": "6c90707a5932e4cfb4627948d30ebf515f5605f6feb6ee5b99fa378dad1339ed"
+  },
+  "verification": {
+    "typecheck": "PASS",
+    "build": "PASS",
+    "diffCheck": "PASS",
+    "focused": "178/178 PASS",
+    "repository": "1469/1469 PASS"
+  }
+}

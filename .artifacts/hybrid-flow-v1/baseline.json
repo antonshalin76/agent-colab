@@ -1,0 +1,124 @@
+{
+  "schemaVersion": "hybrid-flow-eval-report/v1",
+  "label": "baseline",
+  "generatedAt": "2026-08-30T20:01:40.560Z",
+  "suiteId": "agent-collab-hybrid-flow-v1-locked",
+  "contractSha256": "561183ec6181e4d45e468a9b749ffc4f6791eebb9cce6d89d923bdf9bb5a6edd",
+  "runnerSha256": "6ebdec0a21e4ee7d7e638cb936a95cf92f77662d35392cc69a12611ca3452dc3",
+  "runtime": {
+    "node": "v24.14.1",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "functional": {
+    "passed": 0,
+    "failed": 0,
+    "unsupported": 12,
+    "total": 12,
+    "verifiedCompletionRate": 0,
+    "cases": [
+      {
+        "id": "dag_validation",
+        "status": "unsupported"
+      },
+      {
+        "id": "cycle_rejection",
+        "status": "unsupported"
+      },
+      {
+        "id": "fan_out_readiness",
+        "status": "unsupported"
+      },
+      {
+        "id": "all_success_join",
+        "status": "unsupported"
+      },
+      {
+        "id": "all_terminal_join",
+        "status": "unsupported"
+      },
+      {
+        "id": "conditional_route",
+        "status": "unsupported"
+      },
+      {
+        "id": "unreachable_skip",
+        "status": "unsupported"
+      },
+      {
+        "id": "typed_result_validation",
+        "status": "unsupported"
+      },
+      {
+        "id": "invalid_result_fail_closed",
+        "status": "unsupported"
+      },
+      {
+        "id": "session_checkpoint_isolation",
+        "status": "unsupported"
+      },
+      {
+        "id": "usage_completeness",
+        "status": "unsupported"
+      },
+      {
+        "id": "mcp_flow_capability",
+        "status": "unsupported"
+      }
+    ]
+  },
+  "performance": {
+    "pureGraph100Nodes400Edges": {
+      "status": "unsupported",
+      "reason": "Cannot find module '/home/anton/Source/agent-collab/dist/workflow/flow-contract.js' imported from /home/anton/Source/agent-collab/evals/hybrid-flow-v1/run-evals.mjs"
+    },
+    "fanOut3x40ms": {
+      "medianMs": 120.63902600000006,
+      "p95Ms": 121.105781,
+      "samples": [
+        121.105781,
+        120.63709,
+        120.645195,
+        120.578328,
+        120.75221099999999,
+        120.67263000000003,
+        120.55986000000007,
+        120.67539199999999,
+        120.46885799999984,
+        120.63902600000006,
+        120.67683499999998,
+        120.57915000000003
+      ]
+    },
+    "legacyQueue100NodeChain": {
+      "medianMs": 29.120648999999958,
+      "p95Ms": 35.43908799999963,
+      "samples": [
+        26.90987599999994,
+        34.14638799999989,
+        30.963664999999992,
+        23.42899699999998,
+        22.33056499999998,
+        22.092039000000113,
+        23.375548999999864,
+        28.58577000000014,
+        32.77913800000033,
+        25.589100999999573,
+        35.003969999999754,
+        34.31277399999999,
+        32.37373200000002,
+        27.41204000000016,
+        41.81187100000034,
+        27.595123000000058,
+        29.120648999999958,
+        29.687141999999767,
+        35.43908799999963,
+        34.66366500000004
+      ]
+    }
+  },
+  "process": {
+    "rssBytes": 110157824,
+    "heapUsedBytes": 12166608
+  }
+}

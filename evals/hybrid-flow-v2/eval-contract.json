@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "hybrid-flow-eval/v2",
+  "suiteId": "agent-collab-hybrid-flow-v2-normative",
+  "amends": "agent-collab-hybrid-flow-v1-locked",
+  "amendmentReason": "v1 fixture violated GraphFlow/v1 depth and root contracts and contained false-pass assertions",
+  "sourceBaselineHead": "d0f6cda738cf08ff851f14192ff48e636c1f0f17",
+  "iterations": { "pureGraph": 40, "fanOutWallTime": 12, "legacyQueue": 20 },
+  "fixtures": { "graphNodes": 100, "graphEdges": 400, "branchCount": 3, "branchDelayMs": 40, "readOnlyConcurrency": 3 },
+  "functionalCases": [
+    "dag_validation", "cycle_rejection", "fan_out_readiness", "all_success_join",
+    "all_terminal_join", "conditional_route", "unreachable_skip", "typed_result_validation",
+    "invalid_result_fail_closed", "session_checkpoint_isolation", "usage_completeness",
+    "mcp_flow_capability"
+  ],
+  "thresholds": { "pureGraphP95Ms": 50, "fanOutSpeedupMinimum": 1.5, "verifiedCompletionGainPoints": 10 }
+}

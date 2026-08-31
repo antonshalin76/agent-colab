@@ -9,7 +9,11 @@ import type {
   MapLearningRuntimeAuthority,
 } from "../src/flow/map-learning.js";
 import { canonicalFindingExecutorDescriptor } from "../src/flow/learning-policy.js";
-import { createReviewRunInput, RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
+import {
+  RunGateUnitOfWork,
+  type ReviewAdmissionReceiptPair,
+} from "../src/runtime/run-gate-unit-of-work.js";
+import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 import { RunStore } from "../src/store/run-store.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
@@ -104,14 +108,46 @@ function seedReviewEvidence(databasePath: string, input: {
   projectRoot: string;
   taskPacketBytes: Uint8Array;
   sourceFingerprint: string;
+  optionalReviewState: "missing" | "grok_missing" | "claude_missing" |
+    "pass" | "provider_unavailable" |
+    "changes_requested" | "failed" | "needs_reconciliation";
+  adverseAgent: "grok" | "claude";
 }): ReturnType<RunGateUnitOfWork["get"]> {
   initializeCurrentExecutionSchema(databasePath);
   const reviews = new RunGateUnitOfWork(databasePath);
+  const health = {
+    codex: "healthy" as const,
+    grok: input.optionalReviewState === "missing" || input.optionalReviewState === "grok_missing"
+      ? "unavailable" as const : "healthy" as const,
+    claude: input.optionalReviewState === "missing" || input.optionalReviewState === "claude_missing"
+      ? "unavailable" as const : "healthy" as const,
+  };
+  const admissionReceipts: ReviewAdmissionReceiptPair[] = [];
+  for (const agent of ["grok", "claude", "codex"] as const) {
+    if (health[agent] !== "healthy") continue;
+    for (const role of ["auditor", "critic"] as const) {
+      const activationNonce = `map/${input.reviewId}/${agent}/${role}`;
+      const sourceReceiptId = `${activationNonce}/source`;
+      const readinessReceiptId = `${activationNonce}/readiness`;
+      reviews.captureReviewReceiptPair({ pairId: activationNonce, phase: "admission",
+        activationNonce, scopeRevision: 1, recoveryGeneration: null,
+        expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
+        predecessorReceiptIds: { source: null, readiness: null }, receipts: {
+          source: { receiptId: sourceReceiptId,
+            scope: `review/${input.reviewId}/${agent}/${role}/source`,
+            observation: { sourceFingerprint: input.sourceFingerprint, valid: true } },
+          readiness: { receiptId: readinessReceiptId,
+            scope: `review/${input.reviewId}/${agent}/${role}/readiness`,
+            observation: { harnessReady: true, valid: true } },
+        }, createdAt: 100 });
+      admissionReceipts.push({ agent, role, activationNonce, sourceReceiptId, readinessReceiptId });
+    }
+  }
   const review = reviews.create({
     reviewId: input.reviewId,
     stageId: "90_learning_close",
     artifact: Buffer.from(input.taskPacketBytes),
-    health: { codex: "healthy", grok: "healthy", claude: "healthy" },
+    health,
     approvalScope: "workspace-read",
     idempotencyKey: `${input.reviewId}:task-packet`,
     prompts: {
@@ -123,27 +159,67 @@ function seedReviewEvidence(databasePath: string, input: {
     requester: "codex",
     sourceFingerprint: input.sourceFingerprint,
     changedFiles: 1,
+    admissionReceipts,
   });
+  const providerHealth = new ProviderHealthStore(databasePath, { cooldownMs: 1_000 });
+  for (const agent of ["codex", "grok", "claude"] as const) providerHealth.recordSuccess(agent, 101);
+  providerHealth.close();
   if (!reviews.barrier(review.reviewId).satisfied) {
-    for (const lane of review.lanes) {
-      const attempt = lane.attempts.at(-1)!;
-      const providerResult = {
-        kind: "success",
-        agent: lane.agent,
-        reviewVerdict: {
-          schemaVersion: "review-verdict/v1",
-          verdict: "PASS",
-          findings: [],
-        },
-      };
+    const orderedLanes = [...review.lanes].sort((left, right) =>
+      (left.agent === "codex" ? 0 : 1) - (right.agent === "codex" ? 0 : 1));
+    for (const lane of orderedLanes) {
+      const attempt = lane.attempts.at(-1);
+      if (!attempt) continue;
+      const isAdverseLane = lane.agent === input.adverseAgent && lane.role === "auditor";
+      const outcome = lane.agent === "codex" || input.optionalReviewState === "pass"
+        ? "pass"
+        : input.optionalReviewState === "changes_requested" && isAdverseLane
+          ? "changes_requested"
+          : input.optionalReviewState === "failed" && isAdverseLane
+            ? "failed"
+            : input.optionalReviewState === "needs_reconciliation" && isAdverseLane
+              ? "needs_reconciliation"
+              : input.optionalReviewState === "provider_unavailable"
+                ? "provider_unavailable"
+                : "pass";
+      const providerResult = outcome === "changes_requested"
+        ? {
+            kind: "success",
+            agent: lane.agent,
+            reviewVerdict: {
+              schemaVersion: "review-verdict/v1",
+              verdict: "CHANGES_REQUESTED",
+              findings: [{ risk_level: "warn", message: "optional review found a blocking issue" }],
+            },
+          }
+        : outcome === "failed"
+          ? { kind: "task_failure", agent: lane.agent, error: "optional review failed" }
+          : outcome === "provider_unavailable"
+            ? { kind: "quota", agent: lane.agent }
+            : {
+                kind: "success",
+                agent: lane.agent,
+                reviewVerdict: {
+                  schemaVersion: "review-verdict/v1",
+                  verdict: "PASS",
+                  findings: [],
+                },
+              };
       const runs = new RunStore(databasePath);
-      const descriptor = reviews.enqueueDescriptors(review.reviewId).find(
-        (candidate) => candidate.agent === lane.agent && candidate.role === lane.role,
-      )!;
-      const queued = runs.enqueueExact(createReviewRunInput(descriptor));
+      const queued = runs.getByIdempotencyKey(attempt.idempotencyKey)!;
       const claimed = runs.claimNext({ workerId: "map-learning-fixture", leaseMs: 1_000,
         now: Date.now() + 1_000 })!;
+      if (claimed.id !== queued.id) throw new Error("learning fixture claimed the wrong review lane");
       runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: lane.agent });
+      if (outcome === "needs_reconciliation") {
+        runs.markNeedsReconciliation(claimed.id, claimed.leaseToken!, {
+          kind: "task_failure",
+          agent: lane.agent,
+          error: "optional launch outcome is ambiguous",
+        });
+        runs.close();
+        continue;
+      }
       runs.markLaunched(claimed.id, claimed.leaseToken!, {
         phase: "started",
         pid: 1234,
@@ -163,20 +239,31 @@ function seedReviewEvidence(databasePath: string, input: {
           attemptId: attempt.attemptId,
           role: lane.role,
           agent: lane.agent,
-          resultKind: "success",
+          resultKind: providerResult.kind,
           terminalAt: 300,
         },
-        status: "completed",
+        status: outcome === "failed" ? "failed" : "completed",
       });
-      reviews.recordTerminal({
-        reviewId: review.reviewId,
-        agent: lane.agent,
-        role: lane.role,
-        attemptId: attempt.attemptId,
-        status: "completed",
-        result: providerResult,
-        terminalAt: 300,
-      });
+      if (outcome === "provider_unavailable") {
+        reviews.recordProviderUnavailable({
+          reviewId: review.reviewId,
+          agent: lane.agent,
+          role: lane.role,
+          attemptId: attempt.attemptId,
+          error: providerResult,
+          terminalAt: 300,
+        });
+      } else {
+        reviews.recordTerminal({
+          reviewId: review.reviewId,
+          agent: lane.agent,
+          role: lane.role,
+          attemptId: attempt.attemptId,
+          status: outcome === "failed" ? "failed" : "completed",
+          ...(outcome === "failed" ? { error: providerResult } : { result: providerResult }),
+          terminalAt: 300,
+        });
+      }
       runs.close();
     }
   }
@@ -208,6 +295,10 @@ export function prepareLearningFixture(input: {
     preventionGuardId: string;
   };
   controlFingerprint?: () => string;
+  optionalReviewState?: "missing" | "grok_missing" | "claude_missing" |
+    "pass" | "provider_unavailable" |
+    "changes_requested" | "failed" | "needs_reconciliation";
+  adverseAgent?: "grok" | "claude";
 }): PreparedLearningFixture {
   const candidate: MapLearningCandidate = {
     ...input.candidate,
@@ -268,6 +359,8 @@ export function prepareLearningFixture(input: {
     projectRoot: input.projectRoot,
     taskPacketBytes,
     sourceFingerprint,
+    optionalReviewState: input.optionalReviewState ?? "missing",
+    adverseAgent: input.adverseAgent ?? "grok",
   })!;
   const taskPacketSha256 = sha256(taskPacketBytes);
   const regression = evidenceReceipts.find(({ id }) => id === evidenceIds[1])!;
@@ -286,7 +379,10 @@ export function prepareLearningFixture(input: {
       regressionOracleSha256: sha256(jsonBytes(regression)),
       siblingScanSha256: sha256(jsonBytes(sibling)),
     }],
-    reviewReceipts: review.lanes.map((lane) => {
+    reviewReceipts: review.lanes.filter((lane) => {
+      const result = lane.result as { reviewVerdict?: { verdict?: unknown } } | undefined;
+      return lane.status === "completed" && result?.reviewVerdict?.verdict === "PASS";
+    }).map((lane) => {
       const attempt = lane.attempts.at(-1)!;
       return {
         schemaVersion: "learning-review-receipt/v1",

@@ -14,7 +14,7 @@ import { buildCodexCommand, normalizeCodexResult } from "../runners/codex.js";
 import { buildGrokCommand, normalizeGrokResult } from "../runners/grok.js";
 import type { GrokEffort } from "../runners/grok.js";
 
-interface ProviderProbeConfig {
+export interface ProviderProbeConfig {
   enabled: boolean;
   binaryPath: string;
   expectedVersion: string;

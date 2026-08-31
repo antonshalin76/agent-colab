@@ -17,6 +17,7 @@ export interface ReviewInput {
 }
 export interface CollabService {
   status(): Promise<unknown>;
+  validateFlow(input: unknown): Promise<unknown>;
   search(input: SearchInput): Promise<unknown>;
   delegate(input: DelegateInput): Promise<unknown>;
   requestReview(input: ReviewInput): Promise<unknown>;
@@ -42,6 +43,10 @@ export function createCollabMcpServer(service: CollabService): McpServer {
   const server = new McpServer({ name: "agent-collab", version: "0.1.0" });
   server.registerTool("collab_status", { description: "Return collaboration provider and queue status" },
     guarded(async () => service.status()));
+  server.registerTool("collab_flow_validate", {
+    description: "Deterministically validate an immutable GraphFlow/v1 definition without persistence",
+    inputSchema: z.object({ definition: z.unknown() }).strict(),
+  }, guarded(async ({ definition }) => service.validateFlow(definition)));
   const boundedPath = z.string().min(1).max(4_096);
   const boundedId = z.string().min(1).max(512);
   const boundedRunId = z.string().min(1).max(1_024);

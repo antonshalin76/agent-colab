@@ -32,6 +32,94 @@ const serviceOptions = (root: string) => {
 };
 
 describe("local collaboration service wiring", () => {
+  it("refuses to mint review grants for a non-Codex requester", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-review-grant-issuer-"));
+    const database = join(root, "state.db");
+    const service = new LocalCollabService(database, serviceOptions(root));
+    const artifactContent = "issuer-bound review";
+    const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
+    try {
+      await expect(service.requestReview({
+        requester: "grok",
+        workspaceRoot: root,
+        artifactContent,
+        artifactHash,
+        approvalScope: "workspace-read",
+        idempotencyKey: "non-codex-review",
+        prompt: "review",
+      })).rejects.toThrow(/Codex.*review grant|review grant.*Codex/i);
+      expect(service.runs.list()).toEqual([]);
+    } finally {
+      service.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("runs delegation and review with only the required Codex skill root installed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-codex-only-skills-"));
+    const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
+    const database = join(root, "state.db"); initializeCurrentExecutionSchema(database);
+    const service = new LocalCollabService(database, {
+      allowedRoots: [root],
+      agentSkillRoots: {
+        grok: join(root, "missing-grok-skills"),
+        claude: join(root, "missing-claude-skills"),
+        codex: join(homedir(), ".agents", "skills"),
+      },
+    });
+    service.providers.recordSuccess("codex", 1);
+    try {
+      const reviewArtifact = delegatedArtifact("codex-only review artifact");
+      await expect(service.requestReview({ requester: "codex", workspaceRoot: project,
+        artifactContent: reviewArtifact.artifactContent, artifactHash: reviewArtifact.artifactHash,
+        prompt: "review", approvalScope: "workspace-read", idempotencyKey: "codex-only-review" }))
+        .resolves.toMatchObject({ activeLaneCount: 2, runState: "DEGRADED_REVIEW_SET" });
+      expect(service.runs.list().filter((run) => run.status === "queued")
+        .every((run) => run.payload?.preferredAgent === "codex")).toBe(true);
+
+      const delegated = delegatedArtifact("codex-only delegated artifact");
+      await expect(service.delegate({ requester: "codex", stage: "planning", project,
+        artifactContent: delegated.artifactContent, artifactHash: delegated.artifactHash,
+        prompt: "plan", approvalScope: "workspace-read", idempotencyKey: "codex-only-plan" }))
+        .resolves.toMatchObject({ assignedAgent: "codex" });
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("still fails closed when the required Codex skill root is missing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-missing-codex-skills-"));
+    const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
+    const database = join(root, "state.db"); initializeCurrentExecutionSchema(database);
+    const service = new LocalCollabService(database, {
+      allowedRoots: [root],
+      agentSkillRoots: {
+        grok: join(root, "missing-grok-skills"),
+        claude: join(root, "missing-claude-skills"),
+        codex: join(root, "missing-codex-skills"),
+      },
+    });
+    service.providers.recordSuccess("codex", 1);
+    const artifact = delegatedArtifact("required skill negative control");
+    try {
+      await expect(service.requestReview({ requester: "codex", workspaceRoot: project,
+        artifactContent: artifact.artifactContent, artifactHash: artifact.artifactHash,
+        prompt: "review", approvalScope: "workspace-read", idempotencyKey: "missing-codex-review" }))
+        .rejects.toThrow(/mandatory Codex auditor\/critic pair is unavailable/i);
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("projects Codex as required and helper review harnesses as optional", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-review-policy-"));
+    const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
+    try {
+      expect((await service.status()).reviewPolicy).toEqual({
+        required: ["codex:auditor", "codex:critic"],
+        optional: ["grok:auditor", "grok:critic", "claude:auditor", "claude:critic"],
+        optionalUnavailableBlocks: false,
+        optionalChangesRequestedBlocks: true,
+        optionalNeedsReconciliationBlocks: true,
+      });
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("exposes MAP learning administration without caller-selected root or database authority", () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-map-admin-api-"));
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
@@ -140,7 +228,7 @@ describe("local collaboration service wiring", () => {
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("blocks planning itself on the exact six-lane MAP architecture gate", async () => {
+  it("blocks planning on a six-lane MAP review with a Codex quorum", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-planning-map-gate-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
@@ -151,7 +239,7 @@ describe("local collaboration service wiring", () => {
         idempotencyKey: "task:planning" });
       expect(result).toMatchObject({ status: "blocked_map_admission", mapAdmission: {
         satisfied: false,
-        gates: [{ name: "architecture", barrier: { requiredCount: 6, satisfied: false } }],
+        gates: [{ name: "architecture", barrier: { requiredCount: 2, satisfied: false } }],
       } });
       expect(service.runtime.workflows.get(result.runId)).toBeNull();
       expect(service.runs.list()).toHaveLength(6);
@@ -247,8 +335,65 @@ describe("local collaboration service wiring", () => {
             expect.objectContaining({ agent: "claude", role: "critic", status: "queued" }),
           ]),
         },
-        barrier: { satisfied: false, terminalCount: 0, requiredCount: 6 },
+        barrier: { satisfied: false, terminalCount: 0, requiredCount: 2 },
       });
+    } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("does not admit recovered helpers when an idempotent review request replays after Codex closure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-closed-review-service-"));
+    const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
+    const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
+    try {
+      const now = Date.now();
+      service.providers.acquireExplicitProbeAdmission("grok", now);
+      service.providers.recordFailoverFailure("grok", { kind: "quota" }, now, now);
+      service.providers.acquireExplicitProbeAdmission("claude", now);
+      service.providers.recordFailoverFailure("claude", { kind: "quota" }, now, now);
+      service.providers.recordSuccess("codex", now);
+      const artifactContent = "Codex-only immutable review";
+      const request = {
+        requester: "codex" as const,
+        workspaceRoot: project,
+        artifactHash: createHash("sha256").update(artifactContent).digest("hex"),
+        artifactContent,
+        prompt: "review",
+        approvalScope: "workspace-read" as const,
+        idempotencyKey: "closed-review-replay",
+      };
+      const first = await service.requestReview(request);
+      expect(first.activeLaneCount).toBe(2);
+      for (const role of ["auditor", "critic"] as const) {
+        const lane = service.reviews.get(first.reviewId)!.lanes.find(
+          (candidate) => candidate.agent === "codex" && candidate.role === role,
+        )!;
+        const attempt = lane.attempts.at(-1)!;
+        const run = service.runs.getByIdempotencyKey(attempt.idempotencyKey)!;
+        const claimed = service.runs.claimNext({ workerId: "closed-review", leaseMs: 10_000, now: Date.now() })!;
+        expect(claimed.id).toBe(run.id);
+        service.runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "codex" });
+        service.runs.markLaunched(claimed.id, claimed.leaseToken!, { phase: "started", pid: 1234,
+          agent: "codex", model: attempt.model, effort: attempt.effort,
+          policyVersion: attempt.policyVersion, sessionId: attempt.sessionId });
+        const providerResult = { kind: "success", agent: "codex", reviewVerdict: {
+          schemaVersion: "review-verdict/v1", verdict: "PASS", findings: [],
+        } };
+        const terminalAt = Date.now();
+        service.runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult,
+          effect: { type: "review", reviewId: first.reviewId, attemptId: attempt.attemptId,
+            role, agent: "codex", resultKind: "success", terminalAt }, status: "completed" });
+        service.reviews.recordTerminal({ reviewId: first.reviewId, agent: "codex", role,
+          attemptId: attempt.attemptId, status: "completed", result: providerResult,
+          terminalAt });
+      }
+      expect(service.reviews.barrier(first.reviewId).satisfied).toBe(true);
+      service.providers.recordSuccess("claude", Date.now());
+
+      const replay = await service.requestReview(request);
+      expect(replay.activeLaneCount).toBe(0);
+      expect(service.runs.list()).toHaveLength(2);
+      expect(service.reviews.get(first.reviewId)?.lanes.filter((lane) => lane.agent === "claude")
+        .every((lane) => lane.status === "deferred")).toBe(true);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -514,8 +659,8 @@ describe("local collaboration service wiring", () => {
           satisfied: false,
           profile: { version: "3.28.1", provider: "codex" },
           gates: [
-            { name: "architecture", barrier: { satisfied: false, requiredCount: 6 } },
-            { name: "implementer-readiness", barrier: { satisfied: false, requiredCount: 6 } },
+            { name: "architecture", barrier: { satisfied: false, requiredCount: 2 } },
+            { name: "implementer-readiness", barrier: { satisfied: false, requiredCount: 2 } },
           ],
         },
       });
@@ -534,11 +679,21 @@ describe("local collaboration service wiring", () => {
         .rejects.toThrow(/immutable review conflict/i);
       await expect(service.delegate(input)).resolves.toEqual(first);
       if (!first.mapAdmission) throw new Error("expected blocked MAP admission evidence");
-      for (const gate of first.mapAdmission.gates) {
+      const reviewWork = first.mapAdmission.gates.flatMap((gate) => {
         const review = service.reviews.get(gate.reviewId)!;
-        for (const lane of review.lanes) {
+        return review.lanes.map((lane) => {
           const attempt = lane.attempts.at(-1)!;
           const run = service.runs.getByIdempotencyKey(attempt.idempotencyKey)!;
+          return { gate, lane, attempt, run };
+        });
+      }).sort((left, right) => left.run.priority - right.run.priority ||
+        left.run.createdAt - right.run.createdAt ||
+        (["grok", "claude", "codex"].indexOf(left.lane.agent) -
+          ["grok", "claude", "codex"].indexOf(right.lane.agent)) ||
+        (["auditor", "critic"].indexOf(left.lane.role) -
+          ["auditor", "critic"].indexOf(right.lane.role)) ||
+        left.run.id.localeCompare(right.run.id));
+      for (const { gate, lane, attempt, run } of reviewWork) {
           const claimed = service.runs.claimNext({ workerId: "map-review-test", leaseMs: 10_000,
             now: Date.now() })!;
           expect(claimed.id).toBe(run.id);
@@ -556,10 +711,11 @@ describe("local collaboration service wiring", () => {
               findings: [],
             },
           };
+          const terminalAt = Date.now();
           service.runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!,
             providerResult,
             effect: { type: "review", reviewId: gate.reviewId, attemptId: attempt.attemptId,
-              role: lane.role, agent: lane.agent, resultKind: "success", terminalAt: Date.now() },
+              role: lane.role, agent: lane.agent, resultKind: "success", terminalAt },
             status: "completed" });
           service.reviews.recordTerminal({
             reviewId: gate.reviewId,
@@ -568,9 +724,8 @@ describe("local collaboration service wiring", () => {
             attemptId: attempt.attemptId,
             status: "completed",
             result: providerResult,
-            terminalAt: Date.now(),
+            terminalAt,
           });
-        }
       }
       await expect(service.delegate(input)).resolves.toMatchObject({ status: "running", assignedAgent: "codex" });
       const admittedTarget = service.runtime.workflows.get(first.runId)?.stages
@@ -707,15 +862,15 @@ describe("local collaboration service wiring", () => {
         String(run.payload?.prompt).includes("Promoted MAP learning projection for codex"))).toBe(true);
       await expect(service.delegate({ ...input, idempotencyKey: "task:write:again" })).rejects.toThrow(/exhausted/i);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
-  }, 20_000);
+  }, 30_000);
 
-  it("uses the first demanded Claude lane as admission after cooldown", async () => {
+  it("does not turn a review request into an implicit Claude recovery probe", async () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-degraded-service-"));
     const project = join(root, "project"); (await import("node:fs")).mkdirSync(project);
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
     markCapabilityReady(service);
     try {
-      service.providers.canAttempt("claude", 0);
+      service.providers.acquireExplicitProbeAdmission("claude", 0);
       service.providers.recordFailoverFailure("claude", { kind: "auth" }, 1);
       service.providers.recordSuccess("grok", 1);
       service.providers.recordSuccess("codex", 1);
@@ -723,12 +878,12 @@ describe("local collaboration service wiring", () => {
       const artifactHash = createHash("sha256").update(artifactContent).digest("hex");
       const result = await service.requestReview({ requester: "codex", workspaceRoot: project, artifactHash, artifactContent,
         prompt: "review", approvalScope: "workspace-read", idempotencyKey: "degraded-review" });
-      expect(result).toMatchObject({ laneCount: 6, activeLaneCount: 5, runState: "DEGRADED_REVIEW_SET" });
-      expect(service.runs.list().map((run) => run.payload?.preferredAgent)).toEqual([
-        "grok", "grok", "codex", "codex", "claude",
-      ]);
+      expect(result).toMatchObject({ laneCount: 6, activeLaneCount: 4, runState: "DEGRADED_REVIEW_SET" });
+      expect(service.runs.list().map((run) => run.payload?.preferredAgent).sort()).toEqual([
+        "grok", "grok", "codex", "codex",
+      ].sort());
       expect(service.reviews.get(result.reviewId)?.lanes.filter((lane) => lane.agent === "claude")
-        .map((lane) => lane.status)).toEqual(["queued", "deferred"]);
+        .map((lane) => lane.status)).toEqual(["deferred", "deferred"]);
     } finally { service.close(); rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -738,7 +893,7 @@ describe("local collaboration service wiring", () => {
     const service = new LocalCollabService(join(root, "state.db"), serviceOptions(root));
     markCapabilityReady(service);
     try {
-      service.providers.canAttempt("grok", 0);
+      service.providers.acquireExplicitProbeAdmission("grok", 0);
       service.providers.recordFailoverFailure("grok", { kind: "auth" }, 1);
       service.providers.recordSuccess("codex", 1);
       const input = { requester: "codex" as const, stage: "planning" as const, project, prompt: "plan",

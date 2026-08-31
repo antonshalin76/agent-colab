@@ -55,25 +55,45 @@ export class ProviderTransportFailure extends Error {
   }
 }
 
+const terminalEvidence = (message: string): ProviderOutcome | null => {
+  if (/\btask_failure\b/.test(message)) return { kind: "task_failure" };
+  if (/\binvalid_request\b/.test(message)) return { kind: "invalid_request" };
+  if (/\bsafety_denial\b/.test(message)) return { kind: "safety_denial" };
+  if (/\bpermission_denial\b/.test(message)) return { kind: "permission_denial" };
+  if (/\buser_cancelled\b/.test(message)) return { kind: "user_cancelled" };
+  if (/malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
+    return { kind: "task_failure" };
+  }
+  if (/model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* visible result parse/.test(message)) {
+    return { kind: "task_failure" };
+  }
+  if (/unrecognized_model|unsupported model|model not found/.test(message)) return { kind: "task_failure" };
+  if (/safety (?:denial|denied)|denied (?:by|for) safety/.test(message)) return { kind: "safety_denial" };
+  if (/permission|denied/.test(message)) return { kind: "permission_denial" };
+  if (/user (?:cancelled|canceled)|(?:cancelled|canceled) by (?:the )?user/.test(message)) {
+    return { kind: "user_cancelled" };
+  }
+  if (/invalid request|bad request/.test(message)) return { kind: "invalid_request" };
+  return null;
+};
+
 export function classifyProviderFailureDetail(error: unknown, stderr = "", now = Date.now()): ProviderOutcome {
-  if (error instanceof ProviderTransportFailure) return { kind: error.outcome };
   const message = `${error instanceof Error ? error.message : String(error)} ${stderr}`.toLowerCase();
   const retryAt = parseProviderRetryAt(`${error instanceof Error ? error.message : String(error)} ${stderr}`, now);
+  const terminal = terminalEvidence(message);
+  if (terminal) return terminal;
+  if (error instanceof ProviderTransportFailure) return { kind: error.outcome };
   if (/rate.?limit|429/.test(message)) return { kind: "rate_limit", ...(retryAt ? { retryAt } : {}) };
-  if (/quota|usage limit/.test(message)) return { kind: "quota", ...(retryAt ? { retryAt } : {}) };
-  if (/unrecognized_model|unsupported model|model not found/.test(message)) return { kind: "task_failure" };
+  if (/quota|usage limit|payment required|balance exhausted|\b402\b/.test(message)) {
+    return { kind: "quota", ...(retryAt ? { retryAt } : {}) };
+  }
   if (/model (?:is )?unavailable/.test(message)) return { kind: "model_unavailable" };
   if (/enoent|command not found|no such file or directory/.test(message)) return { kind: "cli_missing" };
   if (/timed?\s*out|timeout/.test(message)) return { kind: "network_timeout" };
   if (/auth|login|not logged|credential/.test(message)) return { kind: "auth" };
-  if (/model identity mismatch|protocol mismatch|reasoning effort mismatch|malformed .* visible result parse/.test(message)) {
-    return { kind: "task_failure" };
-  }
-  if (/overload|unavailable|capacity|malformed .* (?:stream|parse)|incomplete .* (?:stream|result)|nonterminal/.test(message)) {
+  if (/overload|unavailable|capacity/.test(message)) {
     return { kind: "model_unavailable" };
   }
-  if (/permission|denied/.test(message)) return { kind: "permission_denial" };
-  if (/invalid request|bad request/.test(message)) return { kind: "invalid_request" };
   return { kind: "task_failure" };
 }
 

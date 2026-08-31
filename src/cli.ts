@@ -18,24 +18,32 @@ import {
   type ReviewProviderId,
 } from "./domain/routing.js";
 import { doctorV1, initializeCurrentExecutionSchema, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle } from "./migration/coordinator.js";
+import { assertReviewV3SchemaSignature } from "./migration/review-v3-schema.js";
 import { startStdioCollabServer } from "./mcp/server.js";
 import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
 import { captureWorkspaceFingerprint } from "./runtime/workspace-fingerprint.js";
+import { activateRecoveredReviewLanes } from "./runtime/review-rejoin.js";
+import { runAutomaticProviderRecovery } from "./runtime/provider-recovery-loop.js";
 import {
   CollaborationRuntime,
   RunnerOutcomeEvidenceError,
 } from "./runtime/collaboration-runtime.js";
 import { ProviderHealthStore } from "./runtime/provider-health-store.js";
 import { RunGateUnitOfWork } from "./runtime/run-gate-unit-of-work.js";
+import { executeReviewLaunchWithFence } from "./runtime/review-launch-admission.js";
+import { ReviewEvidenceCapture } from "./runtime/review-evidence-capture.js";
+import { matchesExactPrelaunchCliMissing } from "./runtime/prelaunch-evidence.js";
 import { defaultAllowedProjectRoots, ProjectPolicy } from "./security/project-policy.js";
-import { runCapabilityProbes } from "./probes/capability-probe.js";
+import { runCapabilityProbes, type CapabilityProbeRunner } from "./probes/capability-probe.js";
 import { ensureStateLayout } from "./store/state-layout.js";
 import { RunStore, type RunRecord } from "./store/run-store.js";
 import { DurableWorker } from "./worker/durable-worker.js";
 import { WorktreeLeaseStore, type WorktreeLease } from "./worktree/lease-store.js";
 import type { AttemptAssignment } from "./workflow/workflow.js";
 import { prepareCommandInput } from "./runners/provider-command.js";
-import { discoverProviderVersion } from "./probes/provider-version.js";
+import { discoverProviderVersion, normalizeProviderVersion } from "./probes/provider-version.js";
+import { buildCapabilityProbeProviders } from "./probes/provider-probe-config.js";
+import { auditSharedSkills, sharedSkillReadiness } from "./skills/audit.js";
 import {
   parsePersistedDomainEffect,
   assertPersistedDomainEffectMatchesRun,
@@ -51,6 +59,57 @@ const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".loca
 const allowedProjectRoots = defaultAllowedProjectRoots();
 const command = process.argv[2] ?? "status";
 const REVIEW_PROVIDERS = REVIEW_PROVIDER_IDS;
+const reviewSkillReadiness = (): Readonly<Record<ReviewProviderId, boolean>> => {
+  try {
+    return sharedSkillReadiness(auditSharedSkills({
+      canonicalRoot: join(homedir(), ".agents", "skills"),
+      agentRoots: {
+        grok: join(homedir(), ".grok", "skills"),
+        claude: join(homedir(), ".claude", "skills"),
+        codex: join(homedir(), ".codex", "skills"),
+      },
+    }));
+  } catch {
+    return { grok: false, claude: false, codex: false };
+  }
+};
+const reviewEvidenceCapture = new ReviewEvidenceCapture({
+  captureSource: ({ project }) => ({
+    sourceFingerprint: captureWorkspaceFingerprint(project).fingerprint, valid: true,
+  }),
+  captureReadiness: ({ agent }) => reviewSkillReadiness()[agent]
+    ? { harnessReady: true, state: "ready", valid: true }
+    : { harnessReady: false, state: "provider_unavailable", valid: false },
+});
+const capabilityProbeRunner: CapabilityProbeRunner = {
+  execute: async (request) => {
+    const version = spawnSync(request.file, ["--version"], { encoding: "utf8", timeout: 10_000, shell: false });
+    if (version.status !== 0) throw version.error ?? new Error(version.stderr || "version probe failed");
+    const prepared = prepareCommandInput(request);
+    try {
+      const processResult = await execa(request.file, prepared.args, {
+        cwd: request.cwd,
+        ...(prepared.input !== undefined ? { input: prepared.input } : {}),
+        shell: false,
+        reject: false,
+        timeout: request.timeoutMs,
+        cleanup: true,
+        env: { AGENT_COLLAB_RUN: "1" },
+      });
+      return { exitCode: processResult.exitCode ?? -1, version: normalizeProviderVersion(version.stdout),
+        stdout: processResult.stdout, stderr: processResult.stderr };
+    } finally {
+      prepared.cleanup();
+    }
+  },
+};
+const capabilityProbeProviders = (enabledAgent?: ReviewProviderId) => {
+  return buildCapabilityProbeProviders({
+    ...(enabledAgent === undefined ? {} : { enabledAgent }),
+    binaries: { grok: grokBinary, claude: claudeBinary, codex: codexBinary },
+    cwd: process.cwd(), discoverVersion: discoverProviderVersion,
+  });
+};
 
 const isReviewProviderId = (value: unknown): value is ReviewProviderId =>
   typeof value === "string" && REVIEW_PROVIDERS.some((agent) => agent === value);
@@ -67,9 +126,14 @@ const schemaVersion = (database: string): number => {
   finally { db.close(); }
 };
 
-const markVersion = (database: string, version: 2 | 3): void => {
+const assertCurrentAuthoritySchema = (database: string): void => {
+  const db = new Database(database, { readonly: true });
+  try { assertReviewV3SchemaSignature(db); } finally { db.close(); }
+};
+
+const markFreshHistoryV2 = (database: string): void => {
   const db = new Database(database);
-  try { db.pragma(`user_version = ${version}`); } finally { db.close(); }
+  try { db.pragma("user_version = 2"); } finally { db.close(); }
 };
 
 const prepareDatabases = (): void => {
@@ -79,15 +143,23 @@ const prepareDatabases = (): void => {
   if (hasState) {
     const stateVersion = schemaVersion(layout.database);
     const historyVersion = schemaVersion(layout.historyDatabase);
-    if (stateVersion === 3 && historyVersion === 2) return;
-    const migration = stateVersion === 2 && historyVersion === 2 ? "migrate-v3" : "migrate-v2";
+    if (stateVersion === 4 && historyVersion === 2) {
+      assertCurrentAuthoritySchema(layout.database);
+      return;
+    }
+    const migration = stateVersion === 3 && historyVersion === 2
+      ? "migrate-v4"
+      : stateVersion === 2 && historyVersion === 2 ? "migrate-v3" : "migrate-v2";
     throw new Error(`offline migration required: state=${stateVersion}, history=${historyVersion}; run ${migration} while the service is stopped`);
   }
   initializeCurrentExecutionSchema(layout.database);
   const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
   service.close();
-  markVersion(layout.database, 3);
-  markVersion(layout.historyDatabase, 2);
+  markFreshHistoryV2(layout.historyDatabase);
+  if (schemaVersion(layout.database) !== 4 || schemaVersion(layout.historyDatabase) !== 2) {
+    throw new Error("fresh database initialization did not produce the required state=4, history=2 schema pair");
+  }
+  assertCurrentAuthoritySchema(layout.database);
 };
 
 if (command === "map-learn-close") {
@@ -195,6 +267,40 @@ if (command === "migrate-v3") {
     historyDatabase: layout.historyDatabase,
   }).migrateToV3();
   console.log(JSON.stringify(result, null, 2));
+  process.exit(0);
+}
+
+if (command === "migrate-v4") {
+  assertServiceInactive();
+  const coordinator = new MigrationCoordinator({
+    stateDatabase: layout.database,
+    historyDatabase: layout.historyDatabase,
+  });
+  const stateVersion = schemaVersion(layout.database);
+  const historyVersion = schemaVersion(layout.historyDatabase);
+  if (stateVersion === 4 && historyVersion !== 2) {
+    throw new Error(`v4 migration requires history=2; found state=${stateVersion}, history=${historyVersion}`);
+  }
+  const result = stateVersion === 4
+    ? { status: "already_current" as const, fromVersion: 4, toVersion: 4 }
+    : coordinator.migrateToV4();
+  coordinator.extendReviewV3SchemaOffline();
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(0);
+}
+
+if (command === "extend-review-v3-schema") {
+  assertServiceInactive();
+  const stateVersion = schemaVersion(layout.database);
+  const historyVersion = schemaVersion(layout.historyDatabase);
+  if (stateVersion !== 4 || historyVersion !== 2) {
+    throw new Error(`review-v3 schema extension requires state=4, history=2; found state=${stateVersion}, history=${historyVersion}`);
+  }
+  new MigrationCoordinator({
+    stateDatabase: layout.database,
+    historyDatabase: layout.historyDatabase,
+  }).extendReviewV3SchemaOffline();
+  console.log(JSON.stringify({ status: "extended", stateVersion: 4 }, null, 2));
   process.exit(0);
 }
 
@@ -422,6 +528,8 @@ if (command === "mcp") {
       const admissionClaimedAt = effect.providerAdmissionClaimedAt;
       if (resultKind === "success") {
         health.recordSuccess(agent, terminalAt, admissionClaimedAt);
+        activateRecoveredReviewLanes({ agent, now: terminalAt, reviews, health,
+          evidenceCapture: reviewEvidenceCapture });
       } else if (isFailoverOutcome(resultKind)) {
         const retryAt = typeof providerResult.retryAt === "number" ? providerResult.retryAt : undefined;
         health.recordFailoverFailure(agent, { kind: resultKind, ...(retryAt ? { retryAt } : {}) }, terminalAt, admissionClaimedAt);
@@ -555,12 +663,25 @@ if (command === "mcp") {
         persistExecutionContext({ lease });
       }
 
-      const rawResult = await runner.run(
-        processTask(run),
-        onLaunch,
-        onLaunchIntent,
-        onProvenNoSpawn,
-      );
+      const launchDecision = await executeReviewLaunchWithFence({
+        run,
+        health,
+        observedAt: Date.now(),
+        evidenceCapture: reviewEvidenceCapture,
+        reviews,
+        reconcile: (reason) => effectStore.reconcileClaimedReviewIdentity(
+          run.id, run.leaseToken!, reason),
+        launch: () => runner.run(
+          processTask(run),
+          onLaunch,
+          onLaunchIntent,
+          onProvenNoSpawn,
+        ),
+      });
+      const rawResult = asObject(launchDecision.providerResult) ?? {
+        kind: "task_failure",
+        error: "review launch fence returned no provider result",
+      };
       if (rawResult.agent !== undefined && rawResult.agent !== agent) {
         throw new Error("runner result agent does not match the durable assignment");
       }
@@ -578,11 +699,12 @@ if (command === "mcp") {
           result = {
             kind: "task_failure",
             agent,
+            reviewOutputInvalid: true,
             error: error instanceof Error ? error.message : String(error),
           };
         }
       }
-      const resultKind = typeof result.kind === "string" ? result.kind : "task_failure";
+      let resultKind = typeof result.kind === "string" ? result.kind : "task_failure";
       const durableLaunch = effectStore.get(run.id);
       const durableLaunchInfo = asObject(durableLaunch?.launchInfo);
       if (durableLaunch?.launched && durableLaunchInfo?.phase !== "started") {
@@ -592,6 +714,14 @@ if (command === "mcp") {
       if (workflowId && workflowStageId && queuedAssignment && agent === "codex") {
         const terminalAt = Date.now();
         const launched = effectStore.get(run.id)?.launched === true;
+        if (!launched && isFailoverOutcome(resultKind) && !matchesExactPrelaunchCliMissing(
+          effectStore.get(run.id)!,
+          queuedAssignment as unknown as Readonly<Record<string, unknown>>,
+          resultKind,
+        )) {
+          result = { kind: "task_failure", agent, rejectedPrelaunchOutcome: resultKind };
+          resultKind = "task_failure";
+        }
         const runnerReceipt = !launched ? null : {
           schemaVersion: "runner-outcome/v1",
           runId: run.id,
@@ -683,14 +813,22 @@ if (command === "mcp") {
       }
       const recoveredQueue = new RunStore(layout.database);
       collaborationRuntime.drainDispatchOutbox(recoveredQueue, now); recoveredQueue.close();
-      for (const agent of REVIEW_PROVIDERS) {
-        for (const reviewId of reviews.deferredReviewIds(agent)) {
-          const snapshot = reviews.get(reviewId); if (!snapshot) continue;
-          const currentSourceFingerprint = snapshot.project ? captureWorkspaceFingerprint(snapshot.project).fingerprint : undefined;
-          reviews.activateDeferred({ reviewId, agent,
-            ...(currentSourceFingerprint ? { currentSourceFingerprint } : {}), now, providerHealth: health });
-        }
-      }
+      await runAutomaticProviderRecovery({ now, reviews, health,
+        evidenceCapture: reviewEvidenceCapture,
+        probe: async (agent) => {
+          const probe = await runCapabilityProbes({
+            providers: capabilityProbeProviders(agent), timeoutMs: 120_000,
+            runner: capabilityProbeRunner,
+          });
+          const result = probe.results[agent];
+          const failures = new Set(result.failures);
+          const kind = failures.has("cli_missing") ? "cli_missing" as const
+            : failures.has("probe_timeout") ? "network_timeout" as const
+              : failures.has("authentication_failed") ? "auth" as const
+                : "model_unavailable" as const;
+          return result.ready ? { ready: true } : { ready: false, failure: { kind } };
+        },
+      });
       lastRecovery = now;
     }
     await delay(500);
@@ -706,48 +844,16 @@ if (command === "mcp") {
     if (process.argv[3] !== "APPROVE_LIVE_CAPABILITY_PROBE") {
       throw new Error("live capability probing may incur provider cost; pass APPROVE_LIVE_CAPABILITY_PROBE explicitly");
     }
-    const versions = {
-      grok: discoverProviderVersion(grokBinary),
-      claude: discoverProviderVersion(claudeBinary),
-      codex: discoverProviderVersion(codexBinary),
-    };
     const probeAt = Date.now();
     const probeAdmissions = Object.fromEntries(REVIEW_PROVIDERS.map((agent) =>
       [agent, service.providers.acquireExplicitProbeAdmission(agent, probeAt)])) as
       Record<ReviewProviderId, ReturnType<ProviderHealthStore["acquireExplicitProbeAdmission"]>>;
-    const result = await runCapabilityProbes({
-      providers: {
-        grok: { enabled: probeAdmissions.grok.runnable, binaryPath: grokBinary, expectedVersion: versions.grok,
-          model: "grok-4.6", effort: "high", cwd: process.cwd() },
-        claude: { enabled: probeAdmissions.claude.runnable, binaryPath: claudeBinary, expectedVersion: versions.claude,
-          model: "glm-5.3", effort: "max", cwd: process.cwd() },
-        codex: { enabled: probeAdmissions.codex.runnable, binaryPath: codexBinary, expectedVersion: versions.codex,
-          model: "gpt-5.6-sol", effort: "high", cwd: process.cwd() },
-      },
-      timeoutMs: 120_000,
-      runner: {
-        execute: async (request) => {
-          const version = spawnSync(request.file, ["--version"], { encoding: "utf8", timeout: 10_000, shell: false });
-          if (version.status !== 0) throw version.error ?? new Error(version.stderr || "version probe failed");
-          const prepared = prepareCommandInput(request);
-          try {
-            const processResult = await execa(request.file, prepared.args, {
-              cwd: request.cwd,
-              ...(prepared.input !== undefined ? { input: prepared.input } : {}),
-              shell: false,
-              reject: false,
-              timeout: request.timeoutMs,
-              cleanup: true,
-              env: { AGENT_COLLAB_RUN: "1" },
-            });
-            return { exitCode: processResult.exitCode ?? -1, version: version.stdout.trim(),
-              stdout: processResult.stdout, stderr: processResult.stderr };
-          } finally {
-            prepared.cleanup();
-          }
-        },
-      },
-    });
+    const providerConfig = capabilityProbeProviders();
+    const result = await runCapabilityProbes({ providers: {
+      grok: { ...providerConfig.grok, enabled: probeAdmissions.grok.runnable },
+      claude: { ...providerConfig.claude, enabled: probeAdmissions.claude.runnable },
+      codex: { ...providerConfig.codex, enabled: probeAdmissions.codex.runnable },
+    }, timeoutMs: 120_000, runner: capabilityProbeRunner });
     for (const agent of REVIEW_PROVIDERS) {
       if (!probeAdmissions[agent].runnable) continue;
       const now = Date.now();

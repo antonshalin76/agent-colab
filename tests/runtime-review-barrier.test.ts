@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import canonicalize from "canonicalize";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { createReviewRunInput, RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
@@ -10,6 +11,114 @@ import { RunStore } from "../src/store/run-store.js";
 import { formatMapLearningLaunchBindingContext } from "../src/flow/map-admin.js";
 import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+
+type V3CreateInput = Parameters<RunGateUnitOfWork["create"]>[0];
+
+function createV3(store: RunGateUnitOfWork, createInput: V3CreateInput): ReturnType<RunGateUnitOfWork["create"]> {
+  const captureMethod = (store as unknown as Record<string, unknown>).captureReviewReceiptPair;
+  expect(captureMethod, "new barrier fixtures must use authority-v3 receipt pairs").toBeTypeOf("function");
+  const capturePair = (captureMethod as (input: Record<string, unknown>) => unknown).bind(store);
+  const admissionReceipts: NonNullable<V3CreateInput["admissionReceipts"]> = [];
+  for (const agent of ["grok", "claude", "codex"] as const) {
+    if (createInput.health[agent] !== "healthy") continue;
+    for (const role of ["auditor", "critic"] as const) {
+      const activationNonce = `create/${createInput.reviewId}/${agent}/${role}`;
+      const sourceReceiptId = `${activationNonce}/source`;
+      const readinessReceiptId = `${activationNonce}/readiness`;
+      capturePair({ pairId: activationNonce, phase: "admission", activationNonce,
+        scopeRevision: 1, recoveryGeneration: null,
+        expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
+        predecessorReceiptIds: { source: null, readiness: null },
+        receipts: {
+          source: { receiptId: sourceReceiptId,
+            scope: `review/${createInput.reviewId}/${agent}/${role}/source`,
+            observation: { sourceFingerprint: createInput.sourceFingerprint, valid: true } },
+          readiness: { receiptId: readinessReceiptId,
+            scope: `review/${createInput.reviewId}/${agent}/${role}/readiness`,
+            observation: { harnessReady: true, valid: true } },
+        }, createdAt: createInput.createdAt });
+      admissionReceipts.push({ agent, role, activationNonce, sourceReceiptId, readinessReceiptId });
+    }
+  }
+  return store.create({ ...createInput, admissionReceipts });
+}
+
+type LegacyActivationInput = Parameters<RunGateUnitOfWork["activateDeferred"]>[0];
+
+function activateV3(
+  store: RunGateUnitOfWork,
+  activation: LegacyActivationInput,
+): ReturnType<RunGateUnitOfWork["activateDeferred"]> {
+  if (store.barrier(activation.reviewId).satisfied) {
+    return (store.activateDeferred as unknown as (input: Record<string, unknown>) =>
+      ReturnType<RunGateUnitOfWork["activateDeferred"]>)({
+        reviewId: activation.reviewId, agent: activation.agent, now: activation.now,
+        recoveryGeneration: null, admissionReceipts: [],
+      });
+  }
+  if (activation.harnessReady !== true) {
+    return { status: "harness_unavailable", lanes: [] };
+  }
+  if (!store.get(activation.reviewId)?.lanes.some(({ agent, status }) =>
+    agent === activation.agent && status === "deferred")) {
+    return (store.activateDeferred as unknown as (input: Record<string, unknown>) =>
+      ReturnType<RunGateUnitOfWork["activateDeferred"]>)({
+        reviewId: activation.reviewId, agent: activation.agent, now: activation.now,
+        recoveryGeneration: null, admissionReceipts: [],
+      });
+  }
+  const providerHealth = activation.providerHealth;
+  if (!providerHealth) throw new Error("v3 activation fixture requires provider health");
+  const claimedAt = activation.now;
+  const probe = providerHealth.acquireExplicitProbeAdmission(activation.agent, claimedAt);
+  if (!probe.runnable) return { status: "provider_unavailable", lanes: [] };
+  providerHealth.recordSuccess(activation.agent, activation.now, probe.claimedAt);
+  const generationMethod = (providerHealth as unknown as Record<string, unknown>).latestRecoveryGeneration;
+  expect(generationMethod, "rejoin fixtures require the explicit probe generation").toBeTypeOf("function");
+  const recoveryGeneration = (generationMethod as (agent: string) => number)
+    .call(providerHealth, activation.agent);
+  const tupleMethod = (store as unknown as Record<string, unknown>).admissionTuple;
+  const captureMethod = (store as unknown as Record<string, unknown>).captureReviewReceiptPair;
+  const cursorMethod = (store as unknown as Record<string, unknown>).receiptPairCursor;
+  expect(tupleMethod).toBeTypeOf("function");
+  expect(captureMethod).toBeTypeOf("function");
+  expect(cursorMethod).toBeTypeOf("function");
+  const admissionReceipts: Array<Record<string, unknown>> = [];
+  const review = store.get(activation.reviewId)!;
+  for (const lane of review.lanes.filter(({ agent, status }) =>
+    agent === activation.agent && status === "deferred")) {
+    const expectedTuple = (tupleMethod as (...args: unknown[]) => Record<string, unknown>)
+      .call(store, activation.reviewId, activation.agent, lane.role);
+    const activationNonce = `rejoin/${activation.reviewId}/${activation.agent}/${lane.role}/${recoveryGeneration}`;
+    const sourceReceiptId = `${activationNonce}/source`;
+    const readinessReceiptId = `${activationNonce}/readiness`;
+    const sourceScope = `review/${activation.reviewId}/${activation.agent}/${lane.role}/source`;
+    const readinessScope = `review/${activation.reviewId}/${activation.agent}/${lane.role}/readiness`;
+    const cursor = (cursorMethod as (input: Record<string, unknown>) => {
+      scopeRevision: number;
+      predecessorReceiptIds: { source: string | null; readiness: string | null };
+    }).call(store, { sourceScope, readinessScope });
+    (captureMethod as (input: Record<string, unknown>) => unknown).call(store, {
+      pairId: activationNonce, phase: "admission", activationNonce,
+      scopeRevision: cursor.scopeRevision, recoveryGeneration, expectedTuple,
+      predecessorReceiptIds: cursor.predecessorReceiptIds,
+      receipts: {
+        source: { receiptId: sourceReceiptId,
+          scope: sourceScope,
+          observation: { sourceFingerprint: activation.currentSourceFingerprint, valid: true } },
+        readiness: { receiptId: readinessReceiptId,
+          scope: readinessScope,
+          observation: { harnessReady: true, valid: true } },
+      }, createdAt: activation.now,
+    });
+    admissionReceipts.push({ role: lane.role, activationNonce, sourceReceiptId, readinessReceiptId });
+  }
+  return (store.activateDeferred as unknown as (input: Record<string, unknown>) =>
+    ReturnType<RunGateUnitOfWork["activateDeferred"]>)({
+      reviewId: activation.reviewId, agent: activation.agent, now: activation.now,
+      recoveryGeneration, admissionReceipts,
+    });
+}
 
 const roots: string[] = [];
 const rawDatabase = () => {
@@ -99,6 +208,47 @@ const malformedSuccessResult = () => ({
   reviewVerdict: { verdict: "PASS", findings: [] },
 });
 
+const prioritizeRun = (path: string, idempotencyKey: string): void => {
+  const db = new Database(path);
+  db.prepare("UPDATE runs SET next_attempt_at=9000000000000000 WHERE status='queued'").run();
+  db.prepare("UPDATE runs SET next_attempt_at=0 WHERE idempotency_key=? AND status='queued'")
+    .run(idempotencyKey);
+  db.close();
+};
+
+const authorizeClaimedReview = (
+  store: RunGateUnitOfWork,
+  claimed: ReturnType<RunStore["claimNext"]> & {},
+  now: number,
+): { authorityId: string; authorityHash: string } => {
+  const attemptId = String(claimed.payload?.reviewAttemptId);
+  const source = { sourceFingerprint: String(claimed.payload?.sourceFingerprint), valid: true };
+  const readiness = { harnessReady: true, valid: true };
+  const hash = (value: unknown) => {
+    const encoded = canonicalize(value);
+    if (encoded === undefined) throw new Error("test evidence must be JSON");
+    return createHash("sha256").update(encoded).digest("hex");
+  };
+  const scope = `attempt/${attemptId}/prelaunch`;
+  const cursor = store.receiptCursor(scope);
+  const receiptId = `${attemptId}/prelaunch/${cursor.scopeRevision}`;
+  store.captureReviewReceipt({ receiptId, phase: "prelaunch", scope,
+    scopeRevision: cursor.scopeRevision, activationNonce: receiptId,
+    expectedTuple: { attemptId }, recoveryGeneration: null,
+    observation: { source, readiness, sourceObservationHash: hash(source),
+      readinessObservationHash: hash(readiness) },
+    predecessorReceiptId: cursor.predecessorReceiptId, createdAt: now });
+  const result = store.applyPrelaunchFence({ attemptId, prelaunchReceiptId: receiptId,
+    reviewId: String(claimed.payload?.reviewId), runId: claimed.id,
+    agent: (claimed.payload?.decision as { agent: "grok" | "claude" | "codex" }).agent,
+    role: claimed.payload?.reviewRole as "auditor" | "critic",
+    attemptOrdinal: Number(claimed.payload?.reviewAttemptOrdinal), now });
+  expect(result).toMatchObject({ status: "authorized", spawnAuthority: {
+    authorityId: expect.any(String), authorityHash: expect.any(String),
+  } });
+  return result.spawnAuthority as { authorityId: string; authorityHash: string };
+};
+
 const completeLaneWithEvidence = (
   path: string,
   store: RunGateUnitOfWork,
@@ -110,13 +260,16 @@ const completeLaneWithEvidence = (
   const lane = review.lanes.find((item) => item.agent === agent && item.role === role)!;
   const attempt = lane.attempts.at(-1)!;
   const result = { ...(verdict === "pass" ? passResult() : changesResult()), agent };
+  const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+  health.recordSuccess(agent, Date.now());
+  health.close();
   const runs = new RunStore(path);
-  const descriptor = store.enqueueDescriptors(review.reviewId).find(
-    (candidate) => candidate.agent === agent && candidate.role === role,
-  )!;
-  const queued = runs.enqueueExact(createReviewRunInput(descriptor));
+  const queued = runs.getByIdempotencyKey(attempt.idempotencyKey)!;
+  prioritizeRun(path, attempt.idempotencyKey);
   const claimed = runs.claimNext({ workerId: "review-test", leaseMs: 1_000, now: Date.now() + 1_000 })!;
-  runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent });
+  expect(claimed.id).toBe(queued.id);
+  const spawnAuthority = authorizeClaimedReview(store, claimed, 250);
+  runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent, ...spawnAuthority });
   runs.markLaunched(claimed.id, claimed.leaseToken!, {
     phase: "started", pid: 1234, agent, model: attempt.model, effort: attempt.effort,
     policyVersion: attempt.policyVersion, sessionId: attempt.sessionId,
@@ -129,7 +282,565 @@ const completeLaneWithEvidence = (
   runs.close();
 };
 
+const activateAndCompleteCodex = (
+  path: string,
+  store: RunGateUnitOfWork,
+  health: ProviderHealthStore,
+  now: number,
+): void => {
+  health.recordSuccess("codex", now);
+  const codexQueued = store.get(input.reviewId)?.lanes.some((lane) =>
+    lane.agent === "codex" && lane.status === "queued");
+  if (!codexQueued) {
+    expect(activateV3(store, {
+      reviewId: input.reviewId,
+      agent: "codex",
+      currentSourceFingerprint: sourceFingerprint,
+      now,
+      providerHealth: health,
+      harnessReady: true,
+    }).status).toBe("activated");
+  }
+  completeLaneWithEvidence(path, store, "codex", "auditor");
+  completeLaneWithEvidence(path, store, "codex", "critic");
+};
+
 describe("runtime durable review barrier", () => {
+  it("consumes each persisted review lane grant at most once", () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1);
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, reviewId: "one-shot-grant", idempotencyKey: "one-shot-grant",
+      health: { grok: "unavailable", claude: "unavailable", codex: "healthy" } });
+
+    const first = activateV3(store, {
+      reviewId: "one-shot-grant",
+      agent: "grok",
+      currentSourceFingerprint: sourceFingerprint,
+      now: 2,
+      providerHealth: health,
+      harnessReady: true,
+    });
+    expect(first.lanes).toHaveLength(2);
+    const auditor = first.lanes.find((lane) => lane.role === "auditor")!;
+    const db = new Database(path);
+    db.prepare(`UPDATE runtime_review_lanes SET status='deferred'
+      WHERE review_id='one-shot-grant' AND agent='grok' AND role='auditor'`).run();
+    db.close();
+
+    expect(activateV3(store, {
+      reviewId: "one-shot-grant",
+      agent: "grok",
+      currentSourceFingerprint: sourceFingerprint,
+      now: 3,
+      providerHealth: health,
+      harnessReady: true,
+    })).toEqual({ status: "none", lanes: [] });
+    expect(store.attempts("one-shot-grant", "grok", "auditor")).toEqual([
+      expect.objectContaining({ attemptId: auditor.attemptId, attemptOrdinal: 0 }),
+    ]);
+
+    store.close();
+    health.close();
+  });
+
+  it("fences legacy launch authority rows until the offline migration owns them", () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("codex", 1);
+    const store = new RunGateUnitOfWork(path);
+    const db = new Database(path);
+    db.prepare(`INSERT INTO runtime_review_barriers
+      (review_id,stage_id,artifact,artifact_hash,approval_scope,idempotency_key,
+       run_state,created_at,project,requester,source_fingerprint,changed_files,launch_authority_version)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)`).run(
+        "legacy-authority", input.stageId, input.artifact, artifactHash, input.approvalScope,
+        "legacy-authority", "DEGRADED_REVIEW_SET", input.createdAt, input.project,
+        input.requester, input.sourceFingerprint, 0);
+    db.prepare(`INSERT INTO runtime_review_lanes
+      (review_id,agent,role,status,model,effort,policy_version,reasons,session_id,
+       idempotency_key,prompt,degraded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        "legacy-authority", "codex", "auditor", "deferred", "gpt-5.6-sol", "max",
+        "routing-v5", "[]", "legacy-authority-session", "legacy-authority-lane", "audit", 1);
+    const runs = new RunStore(path);
+    expect(runs.claimNext({ workerId: "legacy", leaseMs: 10_000,
+      now: Date.now() + 1_000 })).toBeUndefined();
+    expect(store.activateDeferred({ reviewId: "legacy-authority", agent: "codex",
+      currentSourceFingerprint: sourceFingerprint, now: 2, providerHealth: health,
+      harnessReady: true })).toEqual({ status: "none", lanes: [] });
+    runs.close();
+    db.close();
+    store.close();
+    health.close();
+  });
+  it("queues required Codex review lanes ahead of optional helpers", () => {
+    const store = new RunGateUnitOfWork(database());
+    createV3(store, { ...input, health: healthyReviewProviders });
+    const priorities = store.enqueueDescriptors(input.reviewId).map((lane) => ({
+      agent: lane.agent,
+      priority: createReviewRunInput(lane).priority,
+    }));
+    expect(priorities.filter(({ agent }) => agent === "codex").every(({ priority }) => priority === 4)).toBe(true);
+    expect(priorities.filter(({ agent }) => agent !== "codex").every(({ priority }) => priority === 20)).toBe(true);
+    store.close();
+  });
+
+  it("satisfies the barrier with exact Codex quorum while optional providers are unavailable", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    completeLaneWithEvidence(path, store, "codex", "auditor");
+    completeLaneWithEvidence(path, store, "codex", "critic");
+    expect(store.barrier(input.reviewId)).toEqual({ satisfied: true, terminalCount: 2, requiredCount: 2 });
+    store.close();
+  });
+
+  it("does not let helper PASS substitute for unavailable Codex", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    expect(() => createV3(store, { ...input,
+      health: { grok: "healthy", claude: "healthy", codex: "unavailable" } }))
+      .toThrow(/mandatory Codex auditor\/critic pair is unavailable/i);
+    store.close();
+  });
+
+  it("keeps the barrier open while an optional helper attempt is scheduled", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "healthy", claude: "disabled", codex: "healthy" } });
+    completeLaneWithEvidence(path, store, "codex", "auditor");
+    completeLaneWithEvidence(path, store, "codex", "critic");
+    expect(store.get(input.reviewId)?.lanes.filter((lane) => lane.agent === "grok")
+      .every((lane) => lane.status === "queued")).toBe(true);
+    expect(store.barrier(input.reviewId)).toEqual({
+      satisfied: false,
+      terminalCount: 2,
+      requiredCount: 2,
+    });
+    store.close();
+  });
+
+  it.each(["task_failure", "invalid_request", "safety_denial", "permission_denial", "user_cancelled"] as const)(
+    "keeps the Codex barrier closed for optional adverse outcome %s", (outcome) => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const activated = activateV3(store, {
+      reviewId: input.reviewId,
+      agent: "grok",
+      currentSourceFingerprint: sourceFingerprint,
+      now: 1_001,
+      providerHealth: health,
+      harnessReady: true,
+    });
+    const lane = activated.lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, lane.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: "optional-failure", leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    expect(claimed.idempotencyKey).toBe(lane.idempotencyKey);
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+    runs.markLaunched(claimed.id, claimed.leaseToken!, { phase: "started", pid: 1234 });
+    const failure = { kind: outcome, agent: "grok" };
+    runs.commitDomainEffect({
+      id: claimed.id,
+      token: claimed.leaseToken!,
+      providerResult: failure,
+      effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+        role: lane.role, agent: "grok", resultKind: outcome, terminalAt: 2_001 },
+      status: "failed",
+    });
+    store.recordTerminal({ reviewId: input.reviewId, agent: "grok", role: lane.role,
+      attemptId: lane.attemptId, status: "failed", error: failure, terminalAt: 2_001 });
+    activateAndCompleteCodex(path, store, health, 3_001);
+
+    expect(store.barrier(input.reviewId)).toEqual({ satisfied: false, terminalCount: 2, requiredCount: 2 });
+    runs.close();
+    health.close();
+    store.close();
+  });
+
+  it("blocks the Codex barrier while an optional launched attempt needs reconciliation", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const lane = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, lane.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: "optional-reconciliation", leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    expect(claimed.idempotencyKey).toBe(lane.idempotencyKey);
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+    runs.markNeedsReconciliation(claimed.id, claimed.leaseToken!, { kind: "ambiguous" });
+    activateAndCompleteCodex(path, store, health, 3_001);
+
+    expect(store.barrier(input.reviewId)).toEqual({ satisfied: false, terminalCount: 2, requiredCount: 2 });
+    runs.close();
+    health.close();
+    store.close();
+  });
+
+  it("blocks when an optional run completed before its lane effect was replayed", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const lane = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, lane.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: "optional-crash-window", leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+    runs.markLaunched(claimed.id, claimed.leaseToken!, { phase: "started", pid: 1234 });
+    const result = { ...changesResult(), agent: "grok" };
+    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: result,
+      effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+        role: lane.role, agent: "grok", resultKind: "success", terminalAt: 2_001 },
+      status: "completed" });
+    activateAndCompleteCodex(path, store, health, 3_001);
+
+    expect(store.barrier(input.reviewId).satisfied).toBe(false);
+    runs.close(); health.close(); store.close();
+  });
+
+  it("blocks an optional malformed success that was classified as failed", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const lane = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, lane.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: "optional-malformed", leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+    runs.markLaunched(claimed.id, claimed.leaseToken!, { phase: "started", pid: 1234 });
+    const failure = { kind: "task_failure", agent: "grok", reviewOutputInvalid: true };
+    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: failure,
+      effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+        role: lane.role, agent: "grok", resultKind: "task_failure", terminalAt: 2_001 },
+      status: "failed" });
+    store.recordTerminal({ reviewId: input.reviewId, agent: "grok", role: lane.role,
+      attemptId: lane.attemptId, status: "failed", error: failure, terminalAt: 2_001 });
+    activateAndCompleteCodex(path, store, health, 3_001);
+
+    expect(store.barrier(input.reviewId).satisfied).toBe(false);
+    runs.close(); health.close(); store.close();
+  });
+
+  it("keeps an exactly persisted optional timeout non-blocking after the Codex quorum passes", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const activated = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes;
+    const runs = new RunStore(path);
+    const optionalRunIds: string[] = [];
+    for (const [index, lane] of activated.entries()) {
+      prioritizeRun(path, lane.idempotencyKey);
+      const claimed = runs.claimNext({ workerId: "optional-timeout", leaseMs: 1_000,
+        now: Date.now() + 1_000 })!;
+      optionalRunIds.push(claimed.id);
+      runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+      runs.markLaunched(claimed.id, claimed.leaseToken!, {
+        phase: "started", pid: 1234 + index, agent: "grok", model: lane.model,
+        effort: lane.effort, policyVersion: lane.policyVersion, sessionId: lane.sessionId,
+      });
+      const timeout = { kind: "network_timeout", agent: "grok" };
+      runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: timeout,
+        effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+          role: lane.role, agent: "grok", resultKind: "network_timeout", terminalAt: 2_001 + index },
+        status: "completed" });
+      store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "grok", role: lane.role,
+        attemptId: lane.attemptId, error: timeout, terminalAt: 2_001 + index });
+    }
+    activateAndCompleteCodex(path, store, health, 3_001);
+
+    expect(store.get(input.reviewId)?.lanes.map((candidate) => ({
+      lane: `${candidate.agent}:${candidate.role}`,
+      status: candidate.status,
+      attemptStatus: candidate.attempts.at(-1)?.status ?? null,
+    }))).toEqual([
+      { lane: "grok:auditor", status: "deferred", attemptStatus: "provider_unavailable" },
+      { lane: "grok:critic", status: "deferred", attemptStatus: "provider_unavailable" },
+      { lane: "claude:auditor", status: "deferred", attemptStatus: null },
+      { lane: "claude:critic", status: "deferred", attemptStatus: null },
+      { lane: "codex:auditor", status: "completed", attemptStatus: "completed" },
+      { lane: "codex:critic", status: "completed", attemptStatus: "completed" },
+    ]);
+
+    expect(store.barrier(input.reviewId)).toEqual({ satisfied: true, terminalCount: 2, requiredCount: 2 });
+    const sqlite = new Database(path);
+    const original = sqlite.prepare(`SELECT status,payload,launch_info,result FROM runs WHERE id=?`)
+      .get(optionalRunIds[0]) as { status: string; payload: string; launch_info: string; result: string };
+    for (const field of [
+      "payload", "launchSession", "reviewId", "attemptId", "role", "agent",
+      "resultKind", "terminalAt", "providerResult", "domainEffect", "runStatus",
+    ] as const) {
+      const payload = JSON.parse(original.payload) as Record<string, unknown>;
+      const launch = JSON.parse(original.launch_info) as Record<string, unknown>;
+      const envelope = JSON.parse(original.result) as {
+        domainEffect: string;
+        providerResult: Record<string, unknown>;
+        effect: Record<string, unknown>;
+      };
+      let status = original.status;
+      if (field === "payload") payload.prompt = `${String(payload.prompt)}\nforged`;
+      if (field === "launchSession") launch.sessionId = "forged-session";
+      if (field === "reviewId") envelope.effect.reviewId = `${input.reviewId}:forged`;
+      if (field === "attemptId") envelope.effect.attemptId = "123e4567-e89b-42d3-a456-426614174999";
+      if (field === "role") envelope.effect.role = "critic";
+      if (field === "agent") envelope.effect.agent = "claude";
+      if (field === "resultKind") envelope.effect.resultKind = "quota";
+      if (field === "terminalAt") envelope.effect.terminalAt = Number(envelope.effect.terminalAt) + 1;
+      if (field === "providerResult") envelope.providerResult.kind = "quota";
+      if (field === "domainEffect") envelope.domainEffect = "quarantined";
+      if (field === "runStatus") status = "failed";
+      sqlite.prepare(`UPDATE runs SET status=?,payload=?,launch_info=?,result=? WHERE id=?`).run(
+        status, JSON.stringify(payload), JSON.stringify(launch), JSON.stringify(envelope), optionalRunIds[0],
+      );
+      expect.soft(store.barrier(input.reviewId), field).toEqual({
+        satisfied: false, terminalCount: 2, requiredCount: 2,
+      });
+      sqlite.prepare(`UPDATE runs SET status=?,payload=?,launch_info=?,result=? WHERE id=?`).run(
+        original.status, original.payload, original.launch_info, original.result, optionalRunIds[0],
+      );
+      expect.soft(store.barrier(input.reviewId), `${field}:restored`).toEqual({
+        satisfied: true, terminalCount: 2, requiredCount: 2,
+      });
+    }
+    sqlite.close();
+    runs.close(); health.close(); store.close();
+  }, 15_000);
+
+  it("binds accepted optional evidence independently across lane, attempt, and run identity", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const activated = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes;
+    const runs = new RunStore(path);
+    const optionalRunIds: string[] = [];
+    for (const [index, lane] of activated.entries()) {
+      prioritizeRun(path, lane.idempotencyKey);
+      const claimed = runs.claimNext({ workerId: "optional-identity", leaseMs: 1_000,
+        now: Date.now() + 1_000 })!;
+      optionalRunIds.push(claimed.id);
+      runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+      runs.markLaunched(claimed.id, claimed.leaseToken!, {
+        phase: "started", pid: 2234 + index, agent: "grok", model: lane.model,
+        effort: lane.effort, policyVersion: lane.policyVersion, sessionId: lane.sessionId,
+      });
+      const unavailable = { kind: "network_timeout", agent: "grok" };
+      runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: unavailable,
+        effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+          role: lane.role, agent: "grok", resultKind: "network_timeout", terminalAt: 2_101 + index },
+        status: "completed" });
+      store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "grok", role: lane.role,
+        attemptId: lane.attemptId, error: unavailable, terminalAt: 2_101 + index });
+    }
+    activateAndCompleteCodex(path, store, health, 3_101);
+    expect(store.barrier(input.reviewId).satisfied).toBe(true);
+
+    const sqlite = new Database(path);
+    const originalRun = sqlite.prepare("SELECT payload,launch_info FROM runs WHERE id=?")
+      .get(optionalRunIds[0]) as { payload: string; launch_info: string };
+    const originalLane = sqlite.prepare(`SELECT model,effort,reasons,session_id,idempotency_key
+      FROM runtime_review_lanes WHERE review_id=? AND agent='grok' AND role='auditor'`)
+      .get(input.reviewId) as {
+        model: string; effort: string; reasons: string; session_id: string; idempotency_key: string;
+      };
+    for (const [field, value] of [
+      ["effort", originalLane.effort === "high" ? "xhigh" : "high"],
+      ["reasons", JSON.stringify(["forged_lane_reason"])],
+      ["session_id", "forged-lane-session"],
+      ["idempotency_key", `${originalLane.idempotency_key}:forged`],
+    ] as const) {
+      sqlite.prepare(`UPDATE runtime_review_lanes SET ${field}=?
+        WHERE review_id=? AND agent='grok' AND role='auditor'`).run(value, input.reviewId);
+      expect.soft(store.barrier(input.reviewId), `lane:${field}`).toEqual({
+        satisfied: false, terminalCount: 2, requiredCount: 2,
+      });
+      sqlite.prepare(`UPDATE runtime_review_lanes SET model=?,effort=?,reasons=?,session_id=?,idempotency_key=?
+        WHERE review_id=? AND agent='grok' AND role='auditor'`).run(
+        originalLane.model, originalLane.effort, originalLane.reasons,
+        originalLane.session_id, originalLane.idempotency_key, input.reviewId,
+      );
+    }
+    const coordinatedPayload = JSON.parse(originalRun.payload) as Record<string, unknown>;
+    const coordinatedLaunch = JSON.parse(originalRun.launch_info) as Record<string, unknown>;
+    const coordinatedEffort = originalLane.effort === "high" ? "xhigh" : "high";
+    (coordinatedPayload.decision as Record<string, unknown>).effort = coordinatedEffort;
+    (coordinatedPayload.reviewDispatchIdentity as Record<string, unknown>).effort = coordinatedEffort;
+    coordinatedLaunch.effort = coordinatedEffort;
+    sqlite.prepare("UPDATE runs SET payload=?,launch_info=? WHERE id=?").run(
+      JSON.stringify(coordinatedPayload), JSON.stringify(coordinatedLaunch), optionalRunIds[0],
+    );
+    expect.soft(store.barrier(input.reviewId), "coordinated-run-identity").toEqual({
+      satisfied: false, terminalCount: 2, requiredCount: 2,
+    });
+    sqlite.close(); runs.close(); health.close(); store.close();
+  }, 15_000);
+
+  it("keeps exact optional prelaunch cli_missing evidence non-blocking and rejects ambiguous substitutes", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const activated = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes;
+    const runs = new RunStore(path);
+    const optionalRunIds: string[] = [];
+    for (const [index, lane] of activated.entries()) {
+      prioritizeRun(path, lane.idempotencyKey);
+      const claimed = runs.claimNext({ workerId: "optional-prelaunch", leaseMs: 1_000,
+        now: Date.now() + 1_000 })!;
+      optionalRunIds.push(claimed.id);
+      runs.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+        agent: "grok", model: lane.model, effort: lane.effort,
+        policyVersion: lane.policyVersion, sessionId: lane.sessionId,
+      });
+      runs.clearLaunchIntent(claimed.id, claimed.leaseToken!);
+      const unavailable = { kind: "cli_missing", agent: "grok" };
+      runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: unavailable,
+        effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+          role: lane.role, agent: "grok", resultKind: "cli_missing", terminalAt: 2_001 + index },
+        status: "completed" });
+      store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "grok", role: lane.role,
+        attemptId: lane.attemptId, error: unavailable, terminalAt: 2_001 + index });
+    }
+    activateAndCompleteCodex(path, store, health, 3_001);
+    expect(store.barrier(input.reviewId)).toEqual({ satisfied: true, terminalCount: 2, requiredCount: 2 });
+
+    const sqlite = new Database(path);
+    const original = sqlite.prepare("SELECT launched,launch_info FROM runs WHERE id=?")
+      .get(optionalRunIds[0]) as { launched: number; launch_info: string };
+    const launch = JSON.parse(original.launch_info) as Record<string, unknown>;
+    for (const mutation of [
+      { launched: 1, launch: { ...launch } },
+      { launched: 0, launch: { ...launch, phase: "launching" } },
+      { launched: 0, launch: { ...launch, sessionId: "forged-session" } },
+      { launched: 0, launch: null },
+    ]) {
+      sqlite.prepare("UPDATE runs SET launched=?,launch_info=? WHERE id=?").run(
+        mutation.launched, mutation.launch === null ? null : JSON.stringify(mutation.launch), optionalRunIds[0],
+      );
+      expect.soft(store.barrier(input.reviewId), JSON.stringify(mutation)).toEqual({
+        satisfied: false, terminalCount: 2, requiredCount: 2,
+      });
+      sqlite.prepare("UPDATE runs SET launched=?,launch_info=? WHERE id=?").run(
+        original.launched, original.launch_info, optionalRunIds[0],
+      );
+    }
+    sqlite.close(); runs.close(); health.close(); store.close();
+  });
+
+  it("does not launder a non-cli failover through proven-no-spawn evidence", () => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const lane = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, lane.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: "optional-prelaunch-quota", leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+      agent: "grok", model: lane.model, effort: lane.effort,
+      policyVersion: lane.policyVersion, sessionId: lane.sessionId,
+    });
+    runs.clearLaunchIntent(claimed.id, claimed.leaseToken!);
+    const quota = { kind: "quota", agent: "grok" };
+    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: quota,
+      effect: { type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+        role: lane.role, agent: "grok", resultKind: "quota", terminalAt: 2_001 },
+      status: "completed" });
+
+    expect(() => store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "grok",
+      role: lane.role, attemptId: lane.attemptId, error: quota, terminalAt: 2_001 }))
+      .toThrow(/exact durable run evidence/i);
+    runs.close(); health.close(); store.close();
+  });
+
+  it.each([
+    "reviewId",
+    "attemptId",
+    "role",
+    "agent",
+    "resultKind",
+    "terminalAt",
+    "payload",
+  ] as const)("rejects optional timeout evidence with mismatched %s", (field) => {
+    const path = database();
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: { grok: "unavailable", claude: "disabled", codex: "healthy" } });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1_000);
+    const lane = activateV3(store, { reviewId: input.reviewId, agent: "grok",
+      currentSourceFingerprint: sourceFingerprint, now: 1_001, providerHealth: health,
+      harnessReady: true }).lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, lane.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: `timeout-mismatch-${field}`, leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
+    runs.markLaunched(claimed.id, claimed.leaseToken!, {
+      phase: "started", pid: 1234, agent: "grok", model: lane.model,
+      effort: lane.effort, policyVersion: lane.policyVersion, sessionId: lane.sessionId,
+    });
+    if (field === "payload") {
+      const sqlite = new Database(path);
+      const row = sqlite.prepare("SELECT payload FROM runs WHERE id=?").get(claimed.id) as { payload: string };
+      const payload = JSON.parse(row.payload); payload.prompt = `${payload.prompt}\nforged`;
+      sqlite.prepare("UPDATE runs SET payload=? WHERE id=?").run(JSON.stringify(payload), claimed.id);
+      sqlite.close();
+    }
+    const timeout = { kind: "network_timeout", agent: "grok" };
+    const effect = {
+      type: "review", reviewId: input.reviewId, attemptId: lane.attemptId,
+      role: lane.role, agent: "grok", resultKind: "network_timeout", terminalAt: 2_001,
+    } as Record<string, unknown>;
+    if (field === "reviewId") effect.reviewId = `${input.reviewId}:forged`;
+    if (field === "attemptId") effect.attemptId = "123e4567-e89b-42d3-a456-426614174999";
+    if (field === "role") effect.role = lane.role === "auditor" ? "critic" : "auditor";
+    if (field === "agent") effect.agent = "claude";
+    if (field === "resultKind") effect.resultKind = "model_unavailable";
+    if (field === "terminalAt") effect.terminalAt = 2_002;
+    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: timeout,
+      effect, status: "completed" });
+
+    expect(() => store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "grok",
+      role: lane.role, attemptId: lane.attemptId, error: timeout, terminalAt: 2_001 }))
+      .toThrow(/exact durable run evidence/i);
+
+    runs.close(); health.close(); store.close();
+  });
   it("rejects v1 review tables instead of mutating them in the constructor", () => {
     const path = rawDatabase();
     const db = new Database(path);
@@ -157,7 +868,7 @@ describe("runtime durable review barrier", () => {
   it("rejects a routing-v2 review database without mutating schema or rows", () => {
     const path = database();
     const source = new RunGateUnitOfWork(path);
-    source.create({ ...input, health: healthyReviewProviders });
+    createV3(source, { ...input, health: healthyReviewProviders });
     source.close();
 
     const schema = new Database(path);
@@ -202,7 +913,7 @@ describe("runtime durable review barrier", () => {
   it("rolls back a corrupt routing-v2 migration and rejects every reopen", () => {
     const path = database();
     const source = new RunGateUnitOfWork(path);
-    source.create({ ...input, health: healthyReviewProviders });
+    createV3(source, { ...input, health: healthyReviewProviders });
     source.close();
 
     const schema = new Database(path);
@@ -244,7 +955,7 @@ describe("runtime durable review barrier", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
     const source = Buffer.from(artifact);
-    const review = store.create({
+    const review = createV3(store, {
       ...input,
       artifact: source,
       health: healthyReviewProviders,
@@ -285,7 +996,7 @@ describe("runtime durable review barrier", () => {
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: false,
       terminalCount: 0,
-      requiredCount: 6,
+      requiredCount: 2,
     });
     const runs = new RunStore(path);
     expect(runs.list()).toHaveLength(6);
@@ -296,21 +1007,21 @@ describe("runtime durable review barrier", () => {
   it("is idempotent across reopen but rejects a conflicting immutable artifact", () => {
     const path = database();
     const first = new RunGateUnitOfWork(path);
-    const created = first.create({
+    const created = createV3(first, {
       ...input,
       health: healthyReviewProviders,
     });
     first.close();
 
     const reopened = new RunGateUnitOfWork(path);
-    const same = reopened.create({
+    const same = createV3(reopened, {
       ...input,
       artifact: Buffer.from(artifact),
       health: { ...healthyReviewProviders, grok: "unavailable" },
     });
     expect(same).toEqual(created);
     expect(() =>
-      reopened.create({
+      createV3(reopened, {
         ...input,
         artifact: Buffer.from("changed bytes"),
         health: healthyReviewProviders,
@@ -336,7 +1047,7 @@ describe("runtime durable review barrier", () => {
       BEGIN SELECT RAISE(ABORT, 'injected review run failure'); END`);
     injection.close();
 
-    expect(() => store.create({
+    expect(() => createV3(store, {
       ...input,
       health: healthyReviewProviders,
     })).toThrow(/injected review run failure/i);
@@ -356,7 +1067,7 @@ describe("runtime durable review barrier", () => {
   it("records terminality without treating failures or change requests as semantic PASS", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: healthyReviewProviders });
+    createV3(store, { ...input, health: healthyReviewProviders });
 
     store.recordTerminal({
       reviewId: input.reviewId,
@@ -416,8 +1127,8 @@ describe("runtime durable review barrier", () => {
     });
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: false,
-      terminalCount: 6,
-      requiredCount: 6,
+      terminalCount: 2,
+      requiredCount: 2,
     });
     store.close();
 
@@ -463,10 +1174,10 @@ describe("runtime durable review barrier", () => {
     ["timed_out", "timed_out", undefined],
   ] as const)("keeps one isolated %s lane from satisfying the semantic barrier", (_case, blockedStatus, blockedResult) => {
     const store = new RunGateUnitOfWork(database());
-    store.create({ ...input, health: healthyReviewProviders });
+    createV3(store, { ...input, health: healthyReviewProviders });
     const blockedAgent = "grok" as const;
     const blockedRole = "auditor" as const;
-    for (const agent of ["grok", "claude", "codex"] as const) {
+    for (const agent of ["codex", "grok", "claude"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         const blocked = agent === blockedAgent && role === blockedRole;
         store.recordTerminal({
@@ -483,25 +1194,25 @@ describe("runtime durable review barrier", () => {
     }
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: false,
-      terminalCount: 6,
-      requiredCount: 6,
+      terminalCount: 2,
+      requiredCount: 2,
     });
     store.close();
   });
 
-  it("opens the semantic barrier only when every required lane completes with PASS", () => {
+  it("opens the semantic barrier when the Codex quorum and all completed optional lanes PASS", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: healthyReviewProviders });
-    for (const agent of ["grok", "claude", "codex"] as const) {
+    createV3(store, { ...input, health: healthyReviewProviders });
+    for (const agent of ["codex", "grok", "claude"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         completeLaneWithEvidence(path, store, agent, role);
       }
     }
     expect(store.barrier(input.reviewId)).toEqual({
       satisfied: true,
-      terminalCount: 6,
-      requiredCount: 6,
+      terminalCount: 2,
+      requiredCount: 2,
     });
     store.close();
   });
@@ -509,8 +1220,8 @@ describe("runtime durable review barrier", () => {
   it("rejects completed runner rows whose payload is not the exact canonical review packet", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: healthyReviewProviders });
-    for (const agent of ["grok", "claude", "codex"] as const) {
+    createV3(store, { ...input, health: healthyReviewProviders });
+    for (const agent of ["codex", "grok", "claude"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         completeLaneWithEvidence(path, store, agent, role);
       }
@@ -529,8 +1240,8 @@ describe("runtime durable review barrier", () => {
   it("keeps exact launched runner evidence blocked when its semantic verdict requests changes", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: healthyReviewProviders });
-    for (const agent of ["grok", "claude", "codex"] as const) {
+    createV3(store, { ...input, health: healthyReviewProviders });
+    for (const agent of ["codex", "grok", "claude"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         completeLaneWithEvidence(
           path,
@@ -548,7 +1259,7 @@ describe("runtime durable review barrier", () => {
   it("creates four active and two deferred lanes, activating Claude only after provider cooldown", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    expect(health.canAttempt("claude", 0)).toBe(true);
+    expect(health.acquireExplicitProbeAdmission("claude", 0)).toEqual({ runnable: true, claimedAt: 0 });
     health.recordFailoverFailure("claude", { kind: "quota" }, 100, 0);
     health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
@@ -556,7 +1267,7 @@ describe("runtime durable review barrier", () => {
     const store = new RunGateUnitOfWork(path);
     const project = process.cwd();
     const sourceFingerprint = captureWorkspaceFingerprint(project).fingerprint;
-    const review = store.create({
+    const review = createV3(store, {
       ...input,
       health: { ...healthyReviewProviders, claude: "unavailable" },
       project,
@@ -578,35 +1289,33 @@ describe("runtime durable review barrier", () => {
       "codex",
       "codex",
     ]);
-    for (const agent of ["grok", "codex"] as const) {
-      for (const role of ["auditor", "critic"] as const) {
-        completeLaneWithEvidence(path, store, agent, role);
-      }
-    }
-    expect(store.barrier(input.reviewId)).toEqual({
-      satisfied: false,
-      terminalCount: 4,
-      requiredCount: 6,
-    });
+    expect(store.barrier(input.reviewId).satisfied).toBe(false);
     const competing = new RunGateUnitOfWork(path);
 
-    expect(store.activateDeferred({
+    expect(activateV3(store, {
       reviewId: input.reviewId,
       agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_099,
       providerHealth: health,
+      harnessReady: true,
     })).toEqual({ status: "provider_unavailable", lanes: [] });
-    const activated = store.activateDeferred({
+    expect(health.acquireExplicitProbeAdmission("claude", 1_100)).toEqual({
+      runnable: true, claimedAt: 1_100,
+    });
+    health.recordSuccess("claude", 1_101, 1_100);
+    const activated = activateV3(store, {
       reviewId: input.reviewId,
       agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
-      now: 1_100,
+      now: 1_102,
       providerHealth: health,
+      harnessReady: true,
     });
     expect(activated.status).toBe("activated");
     expect(activated.lanes.map((lane) => `${lane.agent}:${lane.role}`)).toEqual([
       "claude:auditor",
+      "claude:critic",
     ]);
     for (const lane of activated.lanes) {
       const run = createReviewRunInput(lane);
@@ -614,46 +1323,78 @@ describe("runtime durable review barrier", () => {
       const context = formatMapLearningLaunchBindingContext(run.payload.mapLearning);
       expect(run.payload.prompt.split(context)).toHaveLength(2);
     }
-    expect(health.get("claude").attemptClaimed).toBe(true);
-    expect(competing.activateDeferred({ reviewId: input.reviewId, agent: "claude",
-      currentSourceFingerprint: sourceFingerprint, now: 1_100, providerHealth: health }).status).toBe("provider_unavailable");
-    expect(store.enqueueDescriptors(input.reviewId)).toHaveLength(1);
-    expect(store.activateDeferred({
+    expect(health.get("claude").attemptClaimed).toBe(false);
+    expect(activateV3(competing, { reviewId: input.reviewId, agent: "claude",
+      currentSourceFingerprint: sourceFingerprint, now: 1_102, providerHealth: health,
+      harnessReady: true }).status).toBe("none");
+    expect(store.enqueueDescriptors(input.reviewId).filter((lane) => lane.agent === "claude")).toHaveLength(2);
+    expect(activateV3(store, {
       reviewId: input.reviewId,
       agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
-    })).toEqual({ status: "provider_unavailable", lanes: [] });
+      harnessReady: true,
+    })).toEqual({ status: "none", lanes: [] });
 
     store.close();
     competing.close();
     health.close();
   });
 
-  it("preserves the failed review attempt and creates a new adaptive decision after recovery", () => {
+  it("atomically refuses recovered helper activation after the Codex barrier is satisfied", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    health.recordSuccess("grok", 1);
-    health.recordSuccess("claude", 1);
     health.recordSuccess("codex", 1);
+    health.recordSuccess("claude", 1);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: healthyReviewProviders });
+    createV3(store, {
+      ...input,
+      health: { grok: "unavailable", claude: "unavailable", codex: "healthy" },
+    });
+    completeLaneWithEvidence(path, store, "codex", "auditor");
+    completeLaneWithEvidence(path, store, "codex", "critic");
+    expect(store.barrier(input.reviewId).satisfied).toBe(true);
+
+    const competing = new RunGateUnitOfWork(path);
+    for (const actor of [store, competing]) {
+      expect(activateV3(actor, {
+        reviewId: input.reviewId,
+        agent: "claude",
+        currentSourceFingerprint: sourceFingerprint,
+        now: 2,
+        providerHealth: health,
+        harnessReady: true,
+      })).toEqual({ status: "satisfied", lanes: [] });
+    }
+    expect(store.get(input.reviewId)?.lanes.filter((lane) => lane.agent === "claude")
+      .every((lane) => lane.status === "deferred")).toBe(true);
+
+    competing.close();
+    store.close();
+    health.close();
+  });
+
+  it("preserves the failed review attempt without creating a generic retry", () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("claude", 1);
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, health: {
+      grok: "unavailable", claude: "healthy", codex: "healthy",
+    } });
     const initial = store.enqueueDescriptors(input.reviewId)
       .find((lane) => lane.agent === "claude" && lane.role === "auditor")!;
     const attemptRuns = new RunStore(path);
-    let claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
+    prioritizeRun(path, initial.idempotencyKey);
+    const claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
       now: Date.now() + 1_000 })!;
-    while (claimedInitial.idempotencyKey !== initial.idempotencyKey) {
-      attemptRuns.releaseForRetry(claimedInitial.id, claimedInitial.leaseToken!, {
-        nextAttemptAt: Date.now() + 60_000,
-      });
-      claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
-        now: Date.now() + 1_000 })!;
-    }
     expect(claimedInitial.idempotencyKey).toBe(initial.idempotencyKey);
     attemptRuns.markLaunchIntent(claimedInitial.id, claimedInitial.leaseToken!, { agent: "claude" });
-    attemptRuns.markLaunched(claimedInitial.id, claimedInitial.leaseToken!, { pid: 1234 });
+    attemptRuns.markLaunched(claimedInitial.id, claimedInitial.leaseToken!, {
+      phase: "started", pid: 1234, agent: "claude", model: initial.model,
+      effort: initial.effort, policyVersion: initial.policyVersion, sessionId: initial.sessionId,
+    });
     attemptRuns.commitDomainEffect({
       id: claimedInitial.id,
       token: claimedInitial.leaseToken!,
@@ -691,23 +1432,17 @@ describe("runtime durable review barrier", () => {
       terminalAt: 100,
     }).attempts).toHaveLength(1);
 
-    health.recordSuccess("claude", 1_100);
-    const activated = store.activateDeferred({
+    const activated = activateV3(store, {
       reviewId: input.reviewId,
       agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
       now: 1_100,
       providerHealth: health,
+      harnessReady: true,
     });
-    const retry = activated.lanes.find((lane) => lane.role === "auditor")!;
-    expect(retry).toMatchObject({
-      attemptOrdinal: 1,
-      effort: "xhigh",
-      reasons: ["stage_baseline:code_audit:high", "retry"],
-    });
-    expect(retry.attemptId).not.toBe(initial.attemptId);
-    expect(retry.sessionId).not.toBe(initial.sessionId);
-    expect(retry.idempotencyKey).not.toBe(initial.idempotencyKey);
+    expect(activated).toMatchObject({ status: "activated", lanes: [expect.objectContaining({
+      attemptOrdinal: 1, previousOrdinal: 0,
+    })] });
     expect(store.attempts(input.reviewId, "claude", "auditor")).toHaveLength(2);
     expect(store.recordProviderUnavailable({
       reviewId: input.reviewId,
@@ -718,22 +1453,6 @@ describe("runtime durable review barrier", () => {
       terminalAt: 100,
     }).status).toBe("queued");
     expect(store.attempts(input.reviewId, "claude", "auditor")).toHaveLength(2);
-    expect(() => store.recordTerminal({
-      reviewId: input.reviewId,
-      agent: "claude",
-      role: "auditor",
-      attemptId: initial.attemptId,
-      status: "completed",
-      result: { verdict: "late" },
-      terminalAt: 1_101,
-    })).toThrow(/active attempt/i);
-    expect(store.attempts(input.reviewId, "claude", "auditor").at(-1)?.status).toBe("scheduled");
-    expect(store.activateDeferred({ reviewId: input.reviewId, agent: "claude",
-      currentSourceFingerprint: sourceFingerprint,
-      now: 1_101, providerHealth: health })).toEqual({ status: "none", lanes: [] });
-    expect(store.enqueueDescriptors(input.reviewId)
-      .find((lane) => lane.agent === "claude" && lane.role === "auditor")?.attemptId)
-      .toBe(retry.attemptId);
     store.close();
     health.close();
   });
@@ -741,22 +1460,27 @@ describe("runtime durable review barrier", () => {
   it("activates against the immutable persisted artifact without a caller-supplied hash", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    expect(health.canAttempt("claude", 0)).toBe(true);
+    expect(health.acquireExplicitProbeAdmission("claude", 0)).toEqual({ runnable: true, claimedAt: 0 });
     health.recordFailoverFailure("claude", { kind: "model_unavailable" }, 100, 0);
     health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: { ...healthyReviewProviders, claude: "unavailable" } });
+    createV3(store, { ...input, health: { ...healthyReviewProviders, claude: "unavailable" } });
+    expect(health.acquireExplicitProbeAdmission("claude", 1_100)).toEqual({
+      runnable: true, claimedAt: 1_100,
+    });
+    health.recordSuccess("claude", 1_101, 1_100);
 
-    const activated = store.activateDeferred({
+    const activated = activateV3(store, {
       reviewId: input.reviewId,
       agent: "claude",
       currentSourceFingerprint: sourceFingerprint,
-      now: 1_100,
+      now: 1_102,
       providerHealth: health,
+      harnessReady: true,
     });
     expect(activated.status).toBe("activated");
-    expect(activated.lanes).toHaveLength(1);
+    expect(activated.lanes).toHaveLength(2);
     expect(store.get(input.reviewId)?.artifactHash).toBe(artifactHash);
 
     store.close();
@@ -765,10 +1489,14 @@ describe("runtime durable review barrier", () => {
 
   it("makes a post-launch unknown attempt explicit and resolves it only by exact attempt id", () => {
     const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, health: healthyReviewProviders });
+    createV3(store, { ...input, health: { grok: "healthy", claude: "unavailable", codex: "healthy" } });
     const attemptId = attemptIdFor(store, "grok", "auditor");
     const runs = new RunStore(path);
+    prioritizeRun(path, store.enqueueDescriptors(input.reviewId)
+      .find((lane) => lane.agent === "grok" && lane.role === "auditor")!.idempotencyKey);
     const claimed = runs.claimNext({ workerId: "reconcile-test", leaseMs: 1_000,
       now: Date.now() + 1_000 })!;
     runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "grok" });
@@ -787,19 +1515,112 @@ describe("runtime durable review barrier", () => {
       .toBe("completed");
     runs.close();
     store.close();
+    health.close();
   });
 
   it("marks deferred lanes stale when the source workspace fingerprint changed", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    health.canAttempt("claude", 0); health.recordFailoverFailure("claude", { kind: "quota" }, 100, 0);
+    health.acquireExplicitProbeAdmission("claude", 0);
+    health.recordFailoverFailure("claude", { kind: "quota" }, 100, 0);
     health.recordSuccess("grok", 100);
     health.recordSuccess("codex", 100);
     const store = new RunGateUnitOfWork(path);
-    store.create({ ...input, sourceFingerprint: "workspace-v1", health: { ...healthyReviewProviders, claude: "unavailable" } });
-    expect(store.activateDeferred({ reviewId: input.reviewId, agent: "claude",
-      currentSourceFingerprint: "workspace-v2", now: 1_100, providerHealth: health })).toEqual({ status: "stale_artifact", lanes: [] });
+    createV3(store, { ...input, sourceFingerprint: "workspace-v1", health: { ...healthyReviewProviders, claude: "unavailable" } });
+    expect(activateV3(store, { reviewId: input.reviewId, agent: "claude",
+      currentSourceFingerprint: "workspace-v2", now: 1_100, providerHealth: health,
+      harnessReady: true })).toEqual({ status: "stale_artifact", lanes: [] });
     expect(health.get("claude").attemptClaimed).toBe(false);
     store.close(); health.close();
   });
+
+  it("keeps an aligned unavailable helper non-blocking when source drift wins before Codex closure", () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.acquireExplicitProbeAdmission("claude", 0);
+    health.recordFailoverFailure("claude", { kind: "quota" }, 100, 0);
+    const store = new RunGateUnitOfWork(path);
+    createV3(store, { ...input, sourceFingerprint,
+      health: { grok: "unavailable", claude: "unavailable", codex: "healthy" } });
+    expect(health.acquireExplicitProbeAdmission("claude", 1_100)).toEqual({
+      runnable: true, claimedAt: 1_100,
+    });
+    health.recordSuccess("claude", 1_101, 1_100);
+    const activated = activateV3(store, { reviewId: input.reviewId, agent: "claude",
+      currentSourceFingerprint: sourceFingerprint, now: 1_102, providerHealth: health,
+      harnessReady: true }).lanes[0]!;
+    const runs = new RunStore(path);
+    prioritizeRun(path, activated.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: "stale-unavailable", leaseMs: 1_000,
+      now: Date.now() + 1_000 })!;
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "claude" });
+    runs.markLaunched(claimed.id, claimed.leaseToken!, {
+      phase: "started", pid: 1234, agent: "claude", model: activated.model,
+      effort: activated.effort, policyVersion: activated.policyVersion, sessionId: activated.sessionId,
+    });
+    const unavailable = { kind: "model_unavailable", agent: "claude" };
+    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: unavailable,
+      effect: { type: "review", reviewId: input.reviewId, attemptId: activated.attemptId,
+        role: activated.role, agent: "claude", resultKind: "model_unavailable", terminalAt: 1_102,
+        providerAdmissionClaimedAt: activated.providerAdmissionClaimedAt },
+      status: "completed" });
+    store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
+      role: activated.role, attemptId: activated.attemptId, error: unavailable, terminalAt: 1_102 });
+
+    expect(activateV3(store, { reviewId: input.reviewId, agent: "claude",
+      currentSourceFingerprint: "workspace-v2", now: 1_103, providerHealth: health,
+      harnessReady: true }))
+      .toEqual({ status: "stale_artifact", lanes: [] });
+    expect(store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
+      role: activated.role, attemptId: activated.attemptId, error: unavailable, terminalAt: 1_102 }))
+      .toMatchObject({ status: "stale_artifact", error: unavailable, terminalAt: 1_102 });
+    expect(() => store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
+      role: activated.role, attemptId: activated.attemptId, error: unavailable, terminalAt: 1_104 }))
+      .toThrow(/exact durable run evidence/i);
+    activateAndCompleteCodex(path, store, health, 1_200);
+    expect(store.get(input.reviewId)?.lanes.map((lane) => ({
+      lane: `${lane.agent}:${lane.role}`,
+      status: lane.status,
+      attemptStatus: lane.attempts.at(-1)?.status ?? null,
+    }))).toEqual([
+      { lane: "grok:auditor", status: "deferred", attemptStatus: null },
+      { lane: "grok:critic", status: "deferred", attemptStatus: null },
+      { lane: "claude:auditor", status: "stale_artifact", attemptStatus: "provider_unavailable" },
+      { lane: "claude:critic", status: "queued", attemptStatus: "scheduled" },
+      { lane: "codex:auditor", status: "completed", attemptStatus: "completed" },
+      { lane: "codex:critic", status: "completed", attemptStatus: "completed" },
+    ]);
+    expect(store.barrier(input.reviewId).satisfied).toBe(false);
+
+    runs.close(); store.close(); health.close();
+  });
+
+  it.each([false, undefined] as const)(
+    "requires affirmative harness readiness at authoritative admission: %s",
+    (harnessReady) => {
+      const path = database();
+      const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+      health.recordSuccess("grok", 100);
+      const store = new RunGateUnitOfWork(path);
+      createV3(store, { ...input, health: {
+        grok: "unavailable", claude: "disabled", codex: "healthy",
+      } });
+      const admission = {
+        reviewId: input.reviewId,
+        agent: "grok" as const,
+        currentSourceFingerprint: sourceFingerprint,
+        now: 101,
+        providerHealth: health,
+        ...(harnessReady === undefined ? {} : { harnessReady }),
+      } as unknown as Parameters<RunGateUnitOfWork["activateDeferred"]>[0];
+
+      expect(activateV3(store, admission)).toEqual({
+        status: "harness_unavailable", lanes: [],
+      });
+      expect(health.get("grok").attemptClaimed).toBe(false);
+      expect(store.get(input.reviewId)?.lanes.filter((lane) => lane.agent === "grok")
+        .every((lane) => lane.status === "deferred")).toBe(true);
+      store.close(); health.close();
+    },
+  );
 });

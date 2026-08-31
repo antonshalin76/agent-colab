@@ -114,6 +114,15 @@ export class ReviewLane {
 const ROLES: readonly ReviewRole[] = ["auditor", "critic"];
 const AGENTS: readonly ReviewProviderId[] = REVIEW_PROVIDER_IDS;
 
+export const REVIEW_BARRIER_POLICY = Object.freeze({
+  requiredAgent: "codex" as const,
+  requiredRoles: ROLES,
+  optionalAgents: ["grok", "claude"] as const,
+  optionalUnavailableBlocks: false,
+  optionalChangesRequestedBlocks: true,
+  optionalNeedsReconciliationBlocks: true,
+});
+
 const makeLane = (
   input: ReviewInput,
   agent: ReviewProviderId,
@@ -147,6 +156,9 @@ export function createReviewPlan(input: ReviewInput): ReviewPlan {
   const healthy = AGENTS.filter((agent) => input.health[agent] === "healthy");
   if (AGENTS.every((agent) => input.health[agent] === "disabled")) {
     throw new Error("No enabled provider is available for review");
+  }
+  if (input.health.codex !== "healthy") {
+    throw new Error("mandatory Codex auditor/critic pair is unavailable");
   }
   if (healthy.length === AGENTS.length) {
     return {

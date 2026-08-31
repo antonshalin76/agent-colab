@@ -25,8 +25,11 @@
     "start": "node scripts/agent-collab-launcher.mjs"
   },
   "dependencies": {
+    "@dagrejs/graphlib": "4.0.5",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
+    "canonicalize": "4.0.0",
     "execa": "10.0.1",
     "tsx": "4.22.3",
     "zod": "4.4.3"

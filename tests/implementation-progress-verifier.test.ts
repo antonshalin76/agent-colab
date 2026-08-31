@@ -18,6 +18,11 @@ describe("implementation progress verifier", () => {
     expect(JSON.parse(output)).toMatchObject({ status: "verified", planId: "agent-collab-hybrid-flow-v1" });
   });
 
+  it("accepts the independent R2 plan root", () => {
+    const output = execFileSync(process.execPath, [verifier, "--root", repo, "--package", "docs/hybrid-flow-v1-r2"], { encoding: "utf8" });
+    expect(JSON.parse(output)).toMatchObject({ status: "verified", planId: "agent-collab-hybrid-flow-v1-r2" });
+  });
+
   it("fails closed when the start receipt is tampered", () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-start-tamper-")); roots.push(root);
     cpSync(join(repo, "docs"), join(root, "docs"), { recursive: true });

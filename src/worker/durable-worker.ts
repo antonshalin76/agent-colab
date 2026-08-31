@@ -1,6 +1,5 @@
 import type { RunRecord, RunStore } from "../store/run-store.js";
 import { sanitizeResult } from "../security/redaction.js";
-import { isFailoverOutcome } from "../domain/outcomes.js";
 
 export type CommitDomainEffect = (input: {
   providerResult: Record<string, unknown>;
@@ -50,11 +49,6 @@ export class DurableWorker {
       if (current?.launched &&
           result.kind !== "success") {
         this.store.markNeedsReconciliation(claimed.id, claimed.leaseToken!, result);
-        return this.store.get(claimed.id);
-      }
-      if (isFailoverOutcome(result.kind)) {
-        const delayMs = Math.min(30 * 60_000, 30_000 * 2 ** Math.max(0, claimed.attemptCount - 1));
-        this.store.releaseForRetry(claimed.id, claimed.leaseToken!, { nextAttemptAt: now + delayMs });
         return this.store.get(claimed.id);
       }
       if (result.kind === "success") this.store.persistResult(claimed.id, claimed.leaseToken!, result);

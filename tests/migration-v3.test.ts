@@ -227,12 +227,19 @@ describe("routing-v5 state schema v3 migration", () => {
       updatedAt: 42,
     });
     providers.close();
-    const reviews = new RunGateUnitOfWork(paths.state);
-    reviews.close();
+    expect(() => new RunGateUnitOfWork(paths.state)).toThrow(/current routing-v5 schema/i);
     expect(new MigrationCoordinator({
       stateDatabase: paths.state,
       historyDatabase: paths.history,
     }).migrateToV3()).toEqual({ status: "already_current", fromVersion: 3, toVersion: 3 });
+    const v4Coordinator = new MigrationCoordinator({
+      stateDatabase: paths.state,
+      historyDatabase: paths.history,
+    });
+    expect(v4Coordinator.migrateToV4()).toEqual({ status: "migrated", fromVersion: 3, toVersion: 4 });
+    v4Coordinator.extendReviewV3SchemaOffline();
+    const reviews = new RunGateUnitOfWork(paths.state);
+    reviews.close();
     const reopenedProviders = new ProviderHealthStore(paths.state, { cooldownMs: 1_000 });
     expect(reopenedProviders.snapshot().claude).toMatchObject({
       health: "healthy",

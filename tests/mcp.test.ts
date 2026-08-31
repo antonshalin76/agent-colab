@@ -26,6 +26,7 @@ const connect = async (service: CollabService) => {
 
 const fakeService = (): CollabService => ({
   status: vi.fn(async () => ({ providers: { grok: "probing", claude: "probing", codex: "healthy" } })),
+  validateFlow: vi.fn(async () => ({ schemaVersion: "GraphFlowValidation/v1", valid: true })),
   search: vi.fn(async ({ requester, kind }) => [{
     id: "h1",
     requester,
@@ -69,6 +70,7 @@ describe("stdio MCP collaboration boundary", () => {
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
       "collab_delegate",
+      "collab_flow_validate",
       "collab_index_now",
       "collab_request_review",
       "collab_run_status",
@@ -158,7 +160,7 @@ describe("stdio MCP collaboration boundary", () => {
           },
         }],
       },
-      barrier: { satisfied: false, terminalCount: 1, requiredCount: 6 },
+      barrier: { satisfied: false, terminalCount: 1, requiredCount: 2 },
     }));
     const { client, server } = await connect(service);
     const result = await client.callTool({
@@ -169,7 +171,7 @@ describe("stdio MCP collaboration boundary", () => {
     const text = content[0]?.type === "text" ? content[0].text ?? "" : "";
     expect(JSON.parse(text)).toMatchObject({
       review: { lanes: [{ agent: "claude", role: "critic", status: "completed" }] },
-      barrier: { satisfied: false, requiredCount: 6 },
+      barrier: { satisfied: false, requiredCount: 2 },
     });
     await client.close(); await server.close();
   });

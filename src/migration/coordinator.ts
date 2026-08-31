@@ -5,6 +5,11 @@ import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
 import { redactSensitive } from "../security/redaction.js";
 import {
+  assertReviewV3SchemaSignature,
+  extendReviewV3SchemaOffline,
+  type ReviewV3FaultPoint,
+} from "./review-v3-schema.js";
+import {
   finalizeRollbackBundle,
   prepareRollbackBundle,
   restoreV1Bundle,
@@ -19,6 +24,46 @@ export {
 const V1 = 1;
 const V2 = 2;
 const V3 = 3;
+const V4 = 4;
+
+const V4_LAUNCH_AUTHORITY_TRIGGERS = `
+  CREATE TRIGGER runtime_review_attempt_v2_insert
+  BEFORE INSERT ON runtime_review_lane_attempts
+  WHEN (SELECT launch_authority_version FROM runtime_review_barriers
+        WHERE review_id = NEW.review_id) = 2
+  BEGIN
+    SELECT CASE WHEN NEW.attempt_ordinal <> 0
+      THEN RAISE(ABORT, 'launch authority v2 requires attempt_ordinal=0') END;
+    SELECT CASE WHEN EXISTS (
+      SELECT 1 FROM runtime_review_lane_attempts
+      WHERE review_id = NEW.review_id AND agent = NEW.agent AND role = NEW.role
+    ) THEN RAISE(ABORT, 'launch authority v2 permits one lane attempt') END;
+  END;
+  CREATE TRIGGER runtime_review_attempt_v2_update
+  BEFORE UPDATE ON runtime_review_lane_attempts
+  WHEN (SELECT launch_authority_version FROM runtime_review_barriers
+        WHERE review_id = NEW.review_id) = 2
+  BEGIN
+    SELECT CASE WHEN NEW.attempt_ordinal <> 0
+      THEN RAISE(ABORT, 'launch authority v2 requires attempt_ordinal=0') END;
+    SELECT CASE WHEN EXISTS (
+      SELECT 1 FROM runtime_review_lane_attempts
+      WHERE review_id = NEW.review_id AND agent = NEW.agent AND role = NEW.role
+        AND rowid <> OLD.rowid
+    ) THEN RAISE(ABORT, 'launch authority v2 permits one lane attempt') END;
+  END;
+  CREATE TRIGGER runtime_review_barrier_v2_update
+  BEFORE UPDATE OF launch_authority_version ON runtime_review_barriers
+  WHEN NEW.launch_authority_version = 2 AND EXISTS (
+    SELECT 1 FROM runtime_review_lane_attempts
+    WHERE review_id = NEW.review_id
+    GROUP BY agent, role
+    HAVING COUNT(*) > 1 OR MIN(attempt_ordinal) <> 0 OR MAX(attempt_ordinal) <> 0
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'launch authority v2 requires one ordinal-zero lane attempt');
+  END;
+`;
 
 const V3_GUARDED_TABLES = [
   "runs",
@@ -63,7 +108,8 @@ const historyNamespace = (agent: unknown): string => {
 export type MigrationFaultPoint =
   | "after_state_commit"
   | "after_history_commit"
-  | "before_v3_commit";
+  | "before_v3_commit"
+  | ReviewV3FaultPoint;
 
 export interface MigrationCoordinatorOptions {
   stateDatabase: string;
@@ -76,7 +122,9 @@ export type MigrationResult =
   | { status: "migrated"; fromVersion: 1; toVersion: 2; rollbackBundle: string }
   | { status: "already_current"; fromVersion: 2; toVersion: 2 }
   | { status: "migrated"; fromVersion: 2; toVersion: 3 }
-  | { status: "already_current"; fromVersion: 3; toVersion: 3 };
+  | { status: "already_current"; fromVersion: 3; toVersion: 3 }
+  | { status: "migrated"; fromVersion: 3; toVersion: 4 }
+  | { status: "already_current"; fromVersion: 4; toVersion: 4 };
 
 export interface V1DoctorResult {
   readyForMigration: boolean;
@@ -112,12 +160,22 @@ const EXECUTION_TABLES = [
   "worktree_handoffs",
 ] as const;
 
-export function initializeCurrentExecutionSchema(path: string): void {
+export function initializeCurrentExecutionSchema(
+  path: string,
+  options: { faultInjector?: (point: string) => void } = {},
+): void {
   const db = new Database(path);
   db.pragma("foreign_keys = ON");
   try {
     const existing = EXECUTION_TABLES.filter((table) => tableExists(db, table));
-    if (existing.length === EXECUTION_TABLES.length) return;
+    if (existing.length === EXECUTION_TABLES.length) {
+      if (tableExists(db, "runtime_schema_capabilities")) {
+        assertReviewV3SchemaSignature(db);
+      } else {
+        extendReviewV3SchemaOffline(db, options.faultInjector);
+      }
+      return;
+    }
     if (existing.length > 0) {
       throw new Error(`execution schema is partial; offline repair required: ${existing.join(", ")}`);
     }
@@ -173,7 +231,9 @@ export function initializeCurrentExecutionSchema(path: string): void {
         project TEXT,
         requester TEXT CHECK (requester IS NULL OR requester IN ('grok', 'codex')),
         source_fingerprint TEXT,
-        changed_files INTEGER NOT NULL DEFAULT 0 CHECK (changed_files >= 0)
+        changed_files INTEGER NOT NULL DEFAULT 0 CHECK (changed_files >= 0),
+        launch_authority_version INTEGER NOT NULL DEFAULT 1
+          CHECK (launch_authority_version IN (1, 2))
       );
       CREATE TABLE runtime_review_lanes (
         review_id TEXT NOT NULL REFERENCES runtime_review_barriers(review_id) ON DELETE CASCADE,
@@ -207,6 +267,7 @@ export function initializeCurrentExecutionSchema(path: string): void {
       );
       CREATE INDEX runtime_review_attempts_lane
         ON runtime_review_lane_attempts(review_id, agent, role, attempt_ordinal);
+      ${V4_LAUNCH_AUTHORITY_TRIGGERS}
       CREATE TABLE approval_grants (
         reference TEXT NOT NULL,
         project TEXT NOT NULL,
@@ -241,10 +302,11 @@ export function initializeCurrentExecutionSchema(path: string): void {
       );
       CREATE INDEX idx_worktree_handoffs_task
         ON worktree_handoffs(task_id, id);
-      PRAGMA user_version = 3;
+      PRAGMA user_version = 4;
       `);
     });
     initialize.immediate();
+    extendReviewV3SchemaOffline(db, options.faultInjector);
   } finally {
     db.close();
   }
@@ -595,41 +657,44 @@ function schemaSql(db: Database.Database, table: string): string {
   ).get(table) as { sql: string } | undefined)?.sql ?? "";
 }
 
-function verifyV3State(state: Database.Database): void {
-  if (userVersion(state) !== V3) throw new Error("v3 state schema marker mismatch");
+function verifyRoutingV5State(state: Database.Database, version: 3 | 4): void {
+  if (userVersion(state) !== version) throw new Error(`v${version} state schema marker mismatch`);
 
   const healthSql = schemaSql(state, "runtime_provider_health");
   const barrierSql = schemaSql(state, "runtime_review_barriers");
   const laneSql = schemaSql(state, "runtime_review_lanes");
   const attemptSql = schemaSql(state, "runtime_review_lane_attempts");
   const leaseSql = schemaSql(state, "worktree_leases");
+  const compactBarrierSql = barrierSql.replace(/\s+/g, "");
+  const compactLaneSql = laneSql.replace(/\s+/g, "");
+  const compactLeaseSql = leaseSql.replace(/\s+/g, "");
   for (const provider of ["grok", "claude", "codex"]) {
     if (!healthSql.includes(`'${provider}'`) ||
         !laneSql.includes(`'${provider}'`) ||
         !attemptSql.includes(`'${provider}'`)) {
-      throw new Error(`invalid v3 review provider constraint: ${provider}`);
+      throw new Error(`invalid v${version} review provider constraint: ${provider}`);
     }
   }
   for (const model of ["grok-4.6", "glm-5.3", "gpt-5.6-sol"]) {
-    if (!laneSql.includes(`'${model}'`)) throw new Error(`invalid v3 review model constraint: ${model}`);
+    if (!laneSql.includes(`'${model}'`)) throw new Error(`invalid v${version} review model constraint: ${model}`);
   }
   for (const effort of ["high", "xhigh", "max"]) {
-    if (!laneSql.includes(`'${effort}'`)) throw new Error(`invalid v3 review effort constraint: ${effort}`);
+    if (!laneSql.includes(`'${effort}'`)) throw new Error(`invalid v${version} review effort constraint: ${effort}`);
   }
-  if (!barrierSql.includes("'DEGRADED_REVIEW_SET'") ||
-      !laneSql.includes("policy_version = 'routing-v5'") ||
-      !barrierSql.includes("requester IN ('grok', 'codex')") ||
-      !leaseSql.includes("holder IN ('grok', 'codex')") ||
-      leaseSql.includes("'claude'") ||
-      !leaseSql.includes("DEFAULT 'routing-v5'")) {
-    throw new Error("v3 routing-v5 schema constraints are incomplete");
+  if (!compactBarrierSql.includes("'DEGRADED_REVIEW_SET'") ||
+      !compactLaneSql.includes("policy_version='routing-v5'") ||
+      !compactBarrierSql.includes("requesterIN('grok','codex')") ||
+      !compactLeaseSql.includes("holderIN('grok','codex')") ||
+      compactLeaseSql.includes("'claude'") ||
+      !compactLeaseSql.includes("DEFAULT'routing-v5'")) {
+    throw new Error(`v${version} routing-v5 schema constraints are incomplete`);
   }
   const claude = state.prepare("SELECT agent FROM runtime_provider_health WHERE agent='claude'").get();
   if (!isDeepStrictEqual(claude, { agent: "claude" })) {
-    throw new Error("v3 Claude provider health row is missing");
+    throw new Error(`v${version} Claude provider health row is missing`);
   }
   if ((state.pragma("foreign_key_check") as unknown[]).length > 0) {
-    throw new Error("v3 state foreign-key verification failed");
+    throw new Error(`v${version} state foreign-key verification failed`);
   }
   for (const index of [
     "runs_due",
@@ -638,7 +703,38 @@ function verifyV3State(state: Database.Database): void {
     "runtime_review_attempts_lane",
   ]) {
     if (state.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index) === undefined) {
-      throw new Error(`missing v3 index: ${index}`);
+      throw new Error(`missing v${version} index: ${index}`);
+    }
+  }
+}
+
+function verifyV3State(state: Database.Database): void {
+  verifyRoutingV5State(state, V3);
+}
+
+function verifyV4State(state: Database.Database): void {
+  verifyRoutingV5State(state, V4);
+  const barrierSql = schemaSql(state, "runtime_review_barriers");
+  const authority = (state.prepare("PRAGMA table_info(runtime_review_barriers)").all() as Array<{
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }>).find((column) => column.name === "launch_authority_version");
+  if (!authority || authority.notnull !== 1 || authority.dflt_value !== "1" ||
+      !barrierSql.includes("launch_authority_version IN (1, 2)")) {
+    throw new Error("v4 launch authority column is invalid");
+  }
+  const triggers = {
+    runtime_review_attempt_v2_insert: ["BEFORE INSERT", "NEW.attempt_ordinal <> 0", "permits one lane attempt"],
+    runtime_review_attempt_v2_update: ["BEFORE UPDATE", "NEW.attempt_ordinal <> 0", "rowid <> OLD.rowid"],
+    runtime_review_barrier_v2_update: ["BEFORE UPDATE OF launch_authority_version", "COUNT(*) > 1", "MAX(attempt_ordinal) <> 0"],
+  } as const;
+  for (const [trigger, fragments] of Object.entries(triggers)) {
+    const sql = (state.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(trigger) as {
+      sql: string;
+    } | undefined)?.sql ?? "";
+    if (fragments.some((fragment) => !sql.includes(fragment))) {
+      throw new Error(`missing v4 launch authority trigger: ${trigger}`);
     }
   }
 }
@@ -764,6 +860,28 @@ function migrateStateToV3(
   migrate.exclusive();
 }
 
+function migrateStateToV4(
+  db: Database.Database,
+  faultInjector?: (point: MigrationFaultPoint) => void,
+): void {
+  const migrate = db.transaction(() => {
+    if (userVersion(db) !== V3) {
+      throw new Error(`state schema changed before v4 migration: ${userVersion(db)}`);
+    }
+    verifyV3State(db);
+    db.exec(`
+      ALTER TABLE runtime_review_barriers
+        ADD COLUMN launch_authority_version INTEGER NOT NULL DEFAULT 1
+          CHECK (launch_authority_version IN (1, 2));
+      ${V4_LAUNCH_AUTHORITY_TRIGGERS}
+      PRAGMA user_version = 4;
+    `);
+    verifyV4State(db);
+    faultInjector?.("before_v3_commit");
+  });
+  migrate.exclusive();
+}
+
 export class MigrationCoordinator {
   private readonly options: MigrationCoordinatorOptions;
 
@@ -774,6 +892,17 @@ export class MigrationCoordinator {
     this.options = { stateDatabase, historyDatabase,
       ...(options.backupDirectory ? { backupDirectory: resolve(options.backupDirectory) } : {}),
       ...(options.faultInjector ? { faultInjector: options.faultInjector } : {}) };
+  }
+
+  extendReviewV3SchemaOffline(): void {
+    const state = new Database(this.options.stateDatabase);
+    state.pragma("foreign_keys = ON");
+    try {
+      acquireExclusiveOwnership(state);
+      extendReviewV3SchemaOffline(state, this.options.faultInjector);
+    } finally {
+      state.close();
+    }
   }
 
   migrateToV2(): MigrationResult {
@@ -868,6 +997,31 @@ export class MigrationCoordinator {
       verifyV3State(state);
       if (userVersion(history) !== V2) throw new Error("v3 migration changed the history schema marker");
       return { status: "migrated", fromVersion: 2, toVersion: 3 };
+    } finally {
+      state.close();
+      history.close();
+    }
+  }
+
+  migrateToV4(): MigrationResult {
+    const state = new Database(this.options.stateDatabase);
+    const history = new Database(this.options.historyDatabase, { readonly: true });
+    state.pragma("foreign_keys = ON");
+    try {
+      const stateVersion = userVersion(state);
+      const historyVersion = userVersion(history);
+      if (stateVersion === V4 && historyVersion === V2) {
+        verifyV4State(state);
+        return { status: "already_current", fromVersion: 4, toVersion: 4 };
+      }
+      if (stateVersion !== V3 || historyVersion !== V2) {
+        throw new Error(`unsupported or partial schema versions: state=${stateVersion}, history=${historyVersion}`);
+      }
+
+      migrateStateToV4(state, this.options.faultInjector);
+      verifyV4State(state);
+      if (userVersion(history) !== V2) throw new Error("v4 migration changed the history schema marker");
+      return { status: "migrated", fromVersion: 3, toVersion: 4 };
     } finally {
       state.close();
       history.close();

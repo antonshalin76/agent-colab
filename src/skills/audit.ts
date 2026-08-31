@@ -119,3 +119,15 @@ export function auditSharedSkills(input: {
     brokenLinks,
   };
 }
+
+export function sharedSkillReadiness(
+  audit: ReturnType<typeof auditSharedSkills>,
+): Readonly<Record<AgentId, boolean>> {
+  const canonicalSafe = !audit.brokenLinks.some(({ scope }) => scope === "canonical");
+  const codexManifest = JSON.stringify(audit.agents.codex.manifest);
+  return Object.fromEntries((["grok", "claude", "codex"] as const).map((agent) => [
+    agent,
+    canonicalSafe && audit.agents[agent].resolvedRoot === audit.canonicalRoot &&
+      JSON.stringify(audit.agents[agent].manifest) === codexManifest,
+  ])) as Record<AgentId, boolean>;
+}

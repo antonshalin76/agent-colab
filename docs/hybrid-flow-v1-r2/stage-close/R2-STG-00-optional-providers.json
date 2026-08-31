@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "optional-review-status/v1",
+  "stageId": "R2-STG-00",
+  "providers": {
+    "grok": {
+      "auditor": "optional_unavailable",
+      "critic": "optional_unavailable",
+      "reason": "local CLI timed out before terminal verdict"
+    },
+    "claude": {
+      "auditor": "optional_unavailable",
+      "critic": "optional_unavailable",
+      "reason": "provider usage-limit 429 before terminal verdict"
+    }
+  },
+  "ambiguousLaunchedAttempts": 0,
+  "completedChangesRequested": 0,
+  "certificationLaunchesConsumed": 40,
+  "certificationLaunchCap": 40,
+  "knownCostUsd": null,
+  "costStatus": "unknown_no_further_live_launch_authorized",
+  "recordedAt": "2026-09-01T04:58:24+08:00"
+}

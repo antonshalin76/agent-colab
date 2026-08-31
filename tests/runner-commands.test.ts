@@ -9,7 +9,7 @@ import {
 import { buildCodexCommand, normalizeCodexResult } from "../src/runners/codex.js";
 import { buildProviderCommand, type CommandSpec } from "../src/runners/provider-command.js";
 import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
-import { projectMapLearning } from "../src/flow/map-admin.js";
+import { assertCurrentControlMapLearningLaunchBinding, projectMapLearning } from "../src/flow/map-admin.js";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +18,7 @@ import { CollaborationRuntime } from "../src/runtime/collaboration-runtime.js";
 import { RunStore } from "../src/store/run-store.js";
 import { createCollaborationRun } from "../src/workflow/workflow.js";
 import { normalizeReviewProviderResult } from "../src/domain/review-verdict.js";
-import { classifyProviderFailureDetail } from "../src/domain/outcomes.js";
+import { classifyProviderFailureDetail, ProviderTransportFailure } from "../src/domain/outcomes.js";
 
 const efforts = ["low", "medium", "high", "xhigh"] as const;
 
@@ -35,6 +35,35 @@ describe("provider retry evidence", () => {
 
   it.each(["unrecognized_model", "unsupported model", "model not found"])(
     "keeps deterministic model contract failure terminal: %s", (message) => {
+      expect(classifyProviderFailureDetail(new Error(message))).toEqual({ kind: "task_failure" });
+    },
+  );
+
+  it.each([
+    ["task_failure: provider unavailable", "model_unavailable"],
+    ["invalid_request: 429", "rate_limit"],
+    ["safety_denial: overloaded", "overload"],
+    ["permission_denial: authentication failed", "auth"],
+    ["user_cancelled: network timeout", "network_timeout"],
+    ["unsupported model; quota exhausted", "quota"],
+    ["model not found; provider unavailable", "model_unavailable"],
+  ] as const)("keeps terminal evidence above typed failover metadata: %s", (message, outcome) => {
+    expect(classifyProviderFailureDetail(new ProviderTransportFailure(message, outcome)))
+      .toEqual({ kind: message.startsWith("invalid_request") ? "invalid_request"
+        : message.startsWith("safety_denial") ? "safety_denial"
+          : message.startsWith("permission_denial") ? "permission_denial"
+            : message.startsWith("user_cancelled") ? "user_cancelled" : "task_failure" });
+  });
+
+  it("classifies Grok payment exhaustion as quota", () => {
+    expect(classifyProviderFailureDetail(
+      new Error("agent exited 1"),
+      "API error (status 402 Payment Required): Grok Build usage balance exhausted",
+    )).toEqual({ kind: "quota" });
+  });
+
+  it.each(["malformed Codex JSONL parse", "incomplete Codex stream: missing result"])(
+    "keeps malformed provider output terminal: %s", (message) => {
       expect(classifyProviderFailureDetail(new Error(message))).toEqual({ kind: "task_failure" });
     },
   );
@@ -67,6 +96,16 @@ const codexStream = (text = "visible Codex answer", model = "gpt-5.6-sol") => [
     payload: { type: "function_call_output", output: "TOOL_RESULT_SENTINEL" },
   }),
 ].join("\n") + "\n";
+
+const currentCodexStream = (...events: Array<Record<string, unknown>>) => [
+  { type: "thread.started", thread_id: "thread-1" },
+  ...events,
+].map((event) => JSON.stringify(event)).join("\n") + "\n";
+
+const codexAgentMessage = (text: string) => ({
+  type: "item.completed",
+  item: { type: "agent_message", text },
+});
 
 afterEach(() => vi.useRealTimers());
 
@@ -146,6 +185,67 @@ describe("BDD-8 exact adaptive Codex command contract", () => {
     expect(() => normalizeCodexResult(codexStream("answer", "gpt-5.7"))).toThrow(/model identity/i);
     expect(() => normalizeCodexResult('{"type":"session_meta"}\nnot-json\n')).toThrow(/malformed|parse/i);
   });
+
+  it("uses the terminal Codex message after a required skill announcement", () => {
+    const verdict = JSON.stringify({
+      schemaVersion: "review-verdict/v1",
+      verdict: "PASS",
+      findings: [],
+    });
+    const announcement = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "I am using the review skill." }],
+      },
+    });
+    const stream = codexStream(verdict).replace(
+      /(?=\{"type":"response_item","payload":\{"type":"message")/,
+      `${announcement}\n`,
+    );
+
+    const normalized = normalizeCodexResult(stream);
+    expect(normalized.text).toBe(verdict);
+    expect(normalizeReviewProviderResult({ kind: "success", ...normalized }))
+      .toMatchObject({ reviewVerdict: { verdict: "PASS" } });
+  });
+
+  it("accepts the ordered current Codex JSONL terminal automaton", () => {
+    expect(normalizeCodexResult(currentCodexStream(
+      { type: "turn.started" },
+      codexAgentMessage("skill announcement"),
+      codexAgentMessage("visible Codex answer"),
+      { type: "turn.completed", usage: { input_tokens: 7, output_tokens: 3 } },
+    ), { includeUsage: true })).toMatchObject({
+      text: "visible Codex answer",
+      usage: { inputTokens: 7, outputTokens: 3 },
+    });
+  });
+
+  it.each([
+    ["missing terminal", [codexAgentMessage("answer")]],
+    ["turn failed", [codexAgentMessage("answer"), { type: "turn.failed", error: { message: "failed" } }]],
+    ["error event", [codexAgentMessage("answer"), { type: "error", message: "failed" }]],
+    ["duplicate terminal", [codexAgentMessage("answer"), { type: "turn.completed" }, { type: "turn.completed" }]],
+    ["conflicting terminal", [codexAgentMessage("answer"), { type: "turn.completed" }, { type: "turn.failed" }]],
+    ["message after terminal", [codexAgentMessage("answer"), { type: "turn.completed" }, codexAgentMessage("late")]],
+    ["terminal before message", [{ type: "turn.completed" }, codexAgentMessage("late")]],
+    ["thread not first", [{ type: "thread.started", thread_id: "thread-2" }, codexAgentMessage("answer"), { type: "turn.completed" }]],
+  ] as const)("rejects a current Codex stream with %s", (_scenario, events) => {
+    expect(() => normalizeCodexResult(currentCodexStream(...events)))
+      .toThrow(/Codex stream|terminal|ordering|failure/i);
+  });
+
+  it("requires thread.started to be the first current Codex event", () => {
+    const stream = [
+      codexAgentMessage("early"),
+      { type: "thread.started", thread_id: "thread-1" },
+      { type: "turn.completed" },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n";
+
+    expect(() => normalizeCodexResult(stream)).toThrow(/thread identity|ordering/i);
+  });
 });
 
 describe("process-only AgentRunner", () => {
@@ -180,6 +280,14 @@ describe("process-only AgentRunner", () => {
     projectionBase64: Buffer.from(grokProjection.bytes).toString("base64"),
     digest: grokProjection.digest,
   } as const;
+
+  it("accepts an immutable artifact that contains the generic MAP marker", () => {
+    expect(() => assertCurrentControlMapLearningLaunchBinding(
+      "codex",
+      codexLearningBinding,
+      `${codexLearningContext}\n\nImmutable artifact:\nPromoted MAP learning projection for `,
+    )).not.toThrow();
+  });
   const task = (overrides: Record<string, unknown> = {}) => {
     const decision = {
       agent: "codex",
@@ -420,7 +528,11 @@ describe("process-only AgentRunner", () => {
     const promptDuplicated = task({
       prompt: `${codexLearningContext}\n\n${codexLearningContext}\n\nreview`,
     });
-
+    const contradictoryProjection = task({
+      prompt: `${codexLearningContext}\n\nPromoted MAP learning projection for grok (${
+        "0".repeat(64)
+      }):\n{"schemaVersion":"map-learning-projection/v1","consumer":"grok"}\n\nreview`,
+    });
     for (const candidate of [
       missing,
       malformed,
@@ -428,6 +540,7 @@ describe("process-only AgentRunner", () => {
       misrouted,
       promptDetached,
       promptDuplicated,
+      contradictoryProjection,
     ]) {
       await expect(runner.run(candidate, onLaunch)).resolves.toMatchObject({
         kind: "invalid_request",
@@ -855,10 +968,32 @@ describe("process-only AgentRunner", () => {
     expect(classifyRunnerFailure(new Error("model identity mismatch: gpt-5.7"))).toBe("task_failure");
     expect(classifyRunnerFailure(new Error("Grok protocol mismatch"))).toBe("task_failure");
     expect(classifyRunnerFailure(new Error("Grok reasoning effort mismatch"))).toBe("task_failure");
-    expect(classifyRunnerFailure(new Error("malformed Codex JSONL parse"))).toBe("model_unavailable");
+    expect(classifyRunnerFailure(new Error("malformed Codex JSONL parse"))).toBe("task_failure");
   });
 
   it("does not retry malformed visible model output as provider unavailability", () => {
     expect(classifyRunnerFailure(new Error("malformed Grok visible result parse"))).toBe("task_failure");
+  });
+
+  it.each([
+    ["invalid request: model is unavailable", "invalid_request"],
+    ["permission denied: service unavailable", "permission_denial"],
+    ["user cancelled: provider unavailable", "user_cancelled"],
+    ["safety denied: provider unavailable", "safety_denial"],
+    ["malformed Codex stream: model is unavailable", "task_failure"],
+  ] as const)("fails closed when adverse and availability evidence collide: %s", (message, expected) => {
+    expect(classifyRunnerFailure(new Error(message))).toBe(expected);
+  });
+
+  it.each([
+    ["task_failure: provider unavailable", "task_failure"],
+    ["invalid_request: model is unavailable", "invalid_request"],
+    ["safety_denial: provider unavailable", "safety_denial"],
+    ["permission_denial: provider unavailable", "permission_denial"],
+    ["user_cancelled: provider unavailable", "user_cancelled"],
+    ["unsupported model; 429 rate limit", "task_failure"],
+    ["model not found; quota exhausted", "task_failure"],
+  ] as const)("gives canonical terminal evidence precedence: %s", (message, expected) => {
+    expect(classifyRunnerFailure(new Error(message))).toBe(expected);
   });
 });

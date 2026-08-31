@@ -14,11 +14,12 @@ const canonicalJson = (value) => {
 };
 
 const parseArgs = (argv) => {
-  const result = { root: process.cwd(), gitRoot: undefined };
+  const result = { root: process.cwd(), gitRoot: undefined, packagePath: "docs/hybrid-flow-v1" };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--root") result.root = resolve(argv[++index]);
     else if (flag === "--git-root") result.gitRoot = resolve(argv[++index]);
+    else if (flag === "--package") result.packagePath = argv[++index];
     else throw new Error(`unknown argument: ${flag}`);
   }
   result.gitRoot ??= result.root;
@@ -27,9 +28,125 @@ const parseArgs = (argv) => {
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const git = (root, args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+const HASH = /^[a-f0-9]{64}$/;
+const normalizePackagePath = (packagePath) => packagePath === "R2"
+  ? "docs/hybrid-flow-v1-r2"
+  : packagePath === "v1" ? "docs/hybrid-flow-v1" : packagePath;
+const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
+  canonicalJson(Object.keys(value).sort()) === canonicalJson([...keys].sort());
+const safeArtifactPath = (root, path) => {
+  if (typeof path !== "string" || path.length === 0) throw new Error(`artifact path is invalid: ${String(path)}`);
+  const target = resolve(root, path);
+  const prefix = `${resolve(root)}/`;
+  if (target !== resolve(root) && !target.startsWith(prefix)) throw new Error(`artifact path escapes root: ${path}`);
+  if (!existsSync(target)) throw new Error(`artifact does not exist: ${path}`);
+  return target;
+};
 
-export function verifyImplementationStart({ root, gitRoot = root }) {
-  const packageRoot = resolve(root, "docs/hybrid-flow-v1");
+const validatePassEvidence = (root, event, name) => {
+  if (!HASH.test(event.sourceFingerprint)) throw new Error(`sourceFingerprint is invalid: ${name}`);
+  const readHashEntries = (field) => {
+    const entries = event[field];
+    if (!Array.isArray(entries) || entries.length === 0) throw new Error(`${field} must be nonempty for PASS: ${name}`);
+    const seen = new Set();
+    return entries.map((entry) => {
+      if (!exactKeys(entry, ["path", "sha256"]) || !HASH.test(entry.sha256) || seen.has(entry.path)) {
+        throw new Error(`${field} entry is invalid: ${name}`);
+      }
+      seen.add(entry.path);
+      const path = safeArtifactPath(root, entry.path);
+      if (sha256(readFileSync(path)) !== entry.sha256) throw new Error(`${field} artifact digest mismatch: ${entry.path}`);
+      return entry;
+    });
+  };
+  const inputHashes = readHashEntries("inputHashes");
+  const outputHashes = readHashEntries("outputHashes");
+  if (!Array.isArray(event.attemptIds) || event.attemptIds.length === 0 ||
+      event.attemptIds.some((id) => typeof id !== "string" || id.length === 0) ||
+      new Set(event.attemptIds).size !== event.attemptIds.length) {
+    throw new Error(`attemptIds are invalid for PASS: ${name}`);
+  }
+  if (!Array.isArray(event.reviewReceiptHashes) || event.reviewReceiptHashes.length !== 2) {
+    throw new Error(`reviewReceiptHashes must contain Codex auditor and critic: ${name}`);
+  }
+  const receipts = new Map();
+  for (const receiptRef of event.reviewReceiptHashes) {
+    if (!exactKeys(receiptRef, ["agent", "role", "attemptId", "artifactPath", "sha256"]) ||
+        receiptRef.agent !== "codex" || !["auditor", "critic"].includes(receiptRef.role) ||
+        typeof receiptRef.attemptId !== "string" || !receiptRef.attemptId || !HASH.test(receiptRef.sha256) ||
+        receipts.has(receiptRef.role)) {
+      throw new Error(`reviewReceiptHashes entry is invalid: ${name}`);
+    }
+    const receiptPath = safeArtifactPath(root, receiptRef.artifactPath);
+    if (sha256(readFileSync(receiptPath)) !== receiptRef.sha256) {
+      throw new Error(`review receipt artifact digest mismatch: ${receiptRef.artifactPath}`);
+    }
+    const receipt = readJson(receiptPath);
+    const verdict = receipt?.reviewVerdict;
+    if (receipt?.schemaVersion !== "review-receipt/v1" || receipt.agent !== "codex" ||
+        receipt.role !== receiptRef.role || receipt.attemptId !== receiptRef.attemptId ||
+        receipt.sourceFingerprint !== event.sourceFingerprint || verdict?.schemaVersion !== "review-verdict/v1" ||
+        verdict.verdict !== "PASS" || !Array.isArray(verdict.findings) ||
+        verdict.findings.some((finding) => finding?.risk_level !== "info")) {
+      throw new Error(`review receipt is not an exact semantic PASS: ${receiptRef.artifactPath}`);
+    }
+    receipts.set(receiptRef.role, receiptRef);
+  }
+  if (!receipts.has("auditor") || !receipts.has("critic") ||
+      canonicalJson([...event.attemptIds].sort()) !== canonicalJson([...receipts.values()].map(({ attemptId }) => attemptId).sort())) {
+    throw new Error(`attemptIds do not match Codex PASS receipts: ${name}`);
+  }
+  if (!exactKeys(event.commandOrOracle, ["kind", "artifactPath", "sha256"]) ||
+      event.commandOrOracle.kind !== "oracle" || !HASH.test(event.commandOrOracle.sha256)) {
+    throw new Error(`commandOrOracle must identify an exact terminal oracle for PASS: ${name}`);
+  }
+  const oraclePath = safeArtifactPath(root, event.commandOrOracle.artifactPath);
+  if (sha256(readFileSync(oraclePath)) !== event.commandOrOracle.sha256) {
+    throw new Error(`terminal oracle digest mismatch: ${event.commandOrOracle.artifactPath}`);
+  }
+  const oracle = readJson(oraclePath);
+  if (oracle?.schemaVersion !== "terminal-oracle/v1" || oracle.stageId !== event.stageId ||
+      oracle.gateId !== event.gateId || oracle.sourceFingerprint !== event.sourceFingerprint ||
+      oracle.terminalResult !== "PASS") throw new Error(`terminal oracle does not match PASS event: ${name}`);
+
+  const outputByPath = new Map(outputHashes.map((entry) => [entry.path, entry.sha256]));
+  if (outputByPath.get(event.commandOrOracle.artifactPath) !== event.commandOrOracle.sha256) {
+    throw new Error(`terminal oracle is not bound as output evidence: ${name}`);
+  }
+  const barrierEntries = outputHashes.filter(({ path }) => {
+    try { return readJson(resolve(root, path))?.schemaVersion === "review-barrier-evidence/v1"; } catch { return false; }
+  });
+  if (barrierEntries.length !== 1) throw new Error(`exactly one barrier evidence artifact is required for PASS: ${name}`);
+  const barrier = readJson(resolve(root, barrierEntries[0].path));
+  if (barrier.stageId !== event.stageId || barrier.gateId !== event.gateId ||
+      barrier.sourceFingerprint !== event.sourceFingerprint || barrier.satisfied !== true ||
+      barrier.requiredCount !== 2 || barrier.terminalCount !== 2 || !Array.isArray(barrier.requiredReceipts) ||
+      barrier.requiredReceipts.length !== 2) throw new Error(`barrier evidence does not prove exact closure: ${name}`);
+  const barrierRoles = new Set();
+  for (const required of barrier.requiredReceipts) {
+    const accepted = receipts.get(required?.role);
+    if (!exactKeys(required, ["agent", "role", "attemptId", "receiptSha256"]) ||
+        required?.agent !== "codex" || !accepted || barrierRoles.has(required.role) ||
+        required.attemptId !== accepted.attemptId ||
+        required.receiptSha256 !== accepted.sha256) throw new Error(`barrier receipt binding mismatch: ${name}`);
+    barrierRoles.add(required.role);
+  }
+  if (!barrierRoles.has("auditor") || !barrierRoles.has("critic")) {
+    throw new Error(`barrier does not bind both Codex PASS receipts: ${name}`);
+  }
+  const referenced = new Set([
+    ...inputHashes.map(({ path }) => path), ...outputHashes.map(({ path }) => path),
+    ...[...receipts.values()].map(({ artifactPath }) => artifactPath),
+  ]);
+  if (!Array.isArray(event.artifactPaths) || new Set(event.artifactPaths).size !== event.artifactPaths.length ||
+      canonicalJson([...event.artifactPaths].sort()) !== canonicalJson([...referenced].sort())) {
+    throw new Error(`artifactPaths do not exactly match hashed evidence: ${name}`);
+  }
+};
+
+export function verifyImplementationStart({ root, gitRoot = root, packagePath = "docs/hybrid-flow-v1" }) {
+  packagePath = normalizePackagePath(packagePath);
+  const packageRoot = resolve(root, packagePath);
   const lockPath = resolve(packageRoot, "PLAN_LOCK.json");
   const startPath = resolve(packageRoot, "IMPLEMENTATION_START.json");
   const lockBytes = readFileSync(lockPath);
@@ -93,16 +210,20 @@ export function verifyImplementationStart({ root, gitRoot = root }) {
     if (event.previousEventSha256 !== previousEventSha256) throw new Error(`previousEventSha256 mismatch: ${name}`);
     if (event.startSha256 !== start.startSha256) throw new Error(`startSha256 mismatch: ${name}`);
     if (event.planId !== lock.planId || event.effectivePlanSha256 !== lock.planSha256) throw new Error(`effectivePlanSha256 mismatch: ${name}`);
-    if (!/^STG-(0[0-9]|1[0-2])$/.test(event.stageId) || typeof event.gateId !== "string" || !event.gateId) throw new Error(`stage or gate identity mismatch: ${name}`);
+    if (!/^(?:R2-)?STG-(0[0-9]|1[0-2])$/.test(event.stageId) || typeof event.gateId !== "string" || !event.gateId) throw new Error(`stage or gate identity mismatch: ${name}`);
     if (!terminalResults.has(event.terminalResult)) throw new Error(`terminalResult is invalid: ${name}`);
+    if (!Array.isArray(event.artifactPaths)) throw new Error(`artifactPaths are invalid: ${name}`);
     for (const path of event.artifactPaths) {
       if (typeof path !== "string" || !existsSync(resolve(root, path))) throw new Error(`artifact does not exist: ${String(path)}`);
+    }
+    if (event.eventType === "step_completed" && event.terminalResult === "PASS") {
+      validatePassEvidence(root, event, name);
     }
     const digestInput = { ...event }; delete digestInput.eventSha256;
     const digest = sha256(canonicalJson(digestInput));
     if (event.eventSha256 !== digest) throw new Error(`eventSha256 mismatch: ${name}`);
     previousEventSha256 = digest;
-    events.push(event);
+    events.push({ ...event, evidenceVerified: event.eventType === "step_completed" && event.terminalResult === "PASS" });
   }
 
   return {

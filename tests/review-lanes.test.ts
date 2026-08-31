@@ -91,7 +91,6 @@ describe("BDD-C1 six-lane review policy", () => {
   it.each([
     [{ grok: "unavailable", claude: "healthy", codex: "healthy" }, ["claude", "codex"], "grok"],
     [{ grok: "healthy", claude: "unavailable", codex: "healthy" }, ["grok", "codex"], "claude"],
-    [{ grok: "healthy", claude: "healthy", codex: "unavailable" }, ["grok", "claude"], "codex"],
   ] as const)("keeps four healthy lanes active and durably defers the unavailable provider", (
     health,
     activeAgents,
@@ -117,13 +116,11 @@ describe("BDD-C1 six-lane review policy", () => {
     }
   });
 
-  it("durably defers demanded review work when enabled providers are not verified yet", () => {
-    const plan = createReviewPlan({
+  it("fails closed when mandatory Codex is not verified yet", () => {
+    expect(() => createReviewPlan({
       ...common,
       health: { grok: "unavailable", claude: "disabled", codex: "probing" },
-    });
-    expect(plan.activeLanes).toEqual([]);
-    expect(plan.deferredLanes).toHaveLength(6);
+    })).toThrow(/mandatory Codex auditor\/critic pair is unavailable/i);
   });
 
   it("rejects review creation when every provider is disabled", () => {

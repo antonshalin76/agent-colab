@@ -3,8 +3,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import canonicalize from "canonicalize";
 import { normalizeReviewProviderResult } from "../src/domain/review-verdict.js";
-import { createReviewRunInput, RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
+import {
+  createReviewRunInput,
+  RunGateUnitOfWork,
+  type ReviewAdmissionReceiptPair,
+} from "../src/runtime/run-gate-unit-of-work.js";
+import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 import { RunStore } from "../src/store/run-store.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
@@ -49,6 +55,25 @@ describe("review verdict composition boundary", () => {
     const reviewId = "review-verdict-composition";
     const project = process.cwd();
     const sourceFingerprint = captureWorkspaceFingerprint(project).fingerprint;
+    const admissionReceipts: ReviewAdmissionReceiptPair[] = [];
+    for (const agent of ["grok", "claude", "codex"] as const) {
+      for (const role of ["auditor", "critic"] as const) {
+        const activationNonce = `verdict/${agent}/${role}`;
+        const sourceReceiptId = `${activationNonce}/source`;
+        const readinessReceiptId = `${activationNonce}/readiness`;
+        store.captureReviewReceiptPair({ pairId: activationNonce, phase: "admission",
+          activationNonce, scopeRevision: 1, recoveryGeneration: null,
+          expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
+          predecessorReceiptIds: { source: null, readiness: null }, receipts: {
+            source: { receiptId: sourceReceiptId, scope: `review/${reviewId}/${agent}/${role}/source`,
+              observation: { sourceFingerprint, valid: true } },
+            readiness: { receiptId: readinessReceiptId,
+              scope: `review/${reviewId}/${agent}/${role}/readiness`,
+              observation: { harnessReady: true, valid: true } },
+          }, createdAt: 1 });
+        admissionReceipts.push({ agent, role, activationNonce, sourceReceiptId, readinessReceiptId });
+      }
+    }
     store.create({
       reviewId,
       stageId: "code-review",
@@ -61,9 +86,13 @@ describe("review verdict composition boundary", () => {
       requester: "codex",
       sourceFingerprint,
       createdAt: 1,
+      admissionReceipts,
     });
+    const providerHealth = new ProviderHealthStore(database, { cooldownMs: 1_000 });
+    for (const agent of ["codex", "grok", "claude"] as const) providerHealth.recordSuccess(agent, 1);
+    providerHealth.close();
 
-    for (const agent of ["grok", "claude", "codex"] as const) {
+    for (const agent of ["codex", "grok", "claude"] as const) {
       for (const role of ["auditor", "critic"] as const) {
         const attempt = store.attempts(reviewId, agent, role).at(-1)!;
         const result = normalizeReviewProviderResult({ kind: "success", agent, text: passText });
@@ -74,7 +103,28 @@ describe("review verdict composition boundary", () => {
         const claimed = runs.claimNext({ workerId: "verdict-test", leaseMs: 1_000,
           now: Date.now() + 1_000 })!;
         expect(claimed.id).toBe(queued.id);
-        runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent });
+        const source = { sourceFingerprint, valid: true };
+        const readiness = { harnessReady: true, valid: true };
+        const hash = (value: unknown) => {
+          const encoded = canonicalize(value);
+          if (encoded === undefined) throw new Error("test evidence must be JSON");
+          return createHash("sha256").update(encoded).digest("hex");
+        };
+        const scope = `attempt/${attempt.attemptId}/prelaunch`;
+        const cursor = store.receiptCursor(scope);
+        const receiptId = `${attempt.attemptId}/prelaunch`;
+        store.captureReviewReceipt({ receiptId, phase: "prelaunch", scope,
+          scopeRevision: cursor.scopeRevision, activationNonce: receiptId,
+          expectedTuple: { attemptId: attempt.attemptId }, recoveryGeneration: null,
+          observation: { source, readiness, sourceObservationHash: hash(source),
+            readinessObservationHash: hash(readiness) },
+          predecessorReceiptId: cursor.predecessorReceiptId, createdAt: 1 });
+        const fence = store.applyPrelaunchFence({ attemptId: attempt.attemptId,
+          prelaunchReceiptId: receiptId, now: 1 });
+        expect(fence).toMatchObject({ status: "authorized" });
+        runs.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+          agent, ...(fence.spawnAuthority as Record<string, unknown>),
+        });
         runs.markLaunched(claimed.id, claimed.leaseToken!, { phase: "started", pid: 1234,
           agent, model: attempt.model, effort: attempt.effort,
           policyVersion: attempt.policyVersion, sessionId: attempt.sessionId });

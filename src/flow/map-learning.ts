@@ -21,6 +21,7 @@ import { z } from "zod";
 import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
 import { redactSensitive } from "../security/redaction.js";
+import { ReviewVerdictEnvelopeSchema } from "../domain/review-verdict.js";
 import {
   APPROVED_LEARNING_CONTROL_IDS,
   EvidenceReceiptSchema,
@@ -95,23 +96,21 @@ export const LearningHandoffSchema = z.object({
   findingIds: z.array(FindingIdSchema).min(1).max(MAX_REFERENCES)
     .refine(unique, "learning handoff finding IDs must be unique"),
   findingClosures: z.array(FindingClosureSchema).min(1).max(MAX_REFERENCES),
-  reviewReceipts: z.array(LearningReviewReceiptSchema).length(6),
+  reviewReceipts: z.array(LearningReviewReceiptSchema).min(2).max(6),
 }).strict().superRefine((value, context) => {
   const closureIds = value.findingClosures.map(({ findingId }) => findingId).sort();
   if (!unique(closureIds) || JSON.stringify(closureIds) !== JSON.stringify([...value.findingIds].sort())) {
     context.addIssue({ code: "custom", message: "learning finding closures must match the exact finding IDs" });
   }
   const pairs = value.reviewReceipts.map(({ agent, role }) => `${agent}:${role}`).sort();
-  const expected = [
-    "claude:auditor",
-    "claude:critic",
-    "codex:auditor",
-    "codex:critic",
-    "grok:auditor",
-    "grok:critic",
-  ];
-  if (JSON.stringify(pairs) !== JSON.stringify(expected)) {
-    context.addIssue({ code: "custom", message: "learning promotion requires six independent review receipts" });
+  if (!unique(pairs)) {
+    context.addIssue({ code: "custom", message: "learning review receipt lanes must be unique" });
+  }
+  if (!pairs.includes("codex:auditor") || !pairs.includes("codex:critic")) {
+    context.addIssue({
+      code: "custom",
+      message: "learning promotion requires the Codex auditor and critic receipt quorum",
+    });
   }
   if (value.reviewReceipts.some(({ candidateSha256 }) => candidateSha256 !== value.candidateSha256)) {
     context.addIssue({ code: "custom", message: "learning review receipt candidate digest mismatch" });
@@ -319,6 +318,13 @@ function sameSorted(left: readonly string[], right: readonly string[]): boolean 
   return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
 }
 
+function isSemanticPassResult(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  const verdict = ReviewVerdictEnvelopeSchema.safeParse(result.reviewVerdict);
+  return result.kind === "success" && verdict.success && verdict.data.verdict === "PASS";
+}
+
 function verifyLearningProvenance(input: {
   projectRoot: string;
   taskPacketBytes: Uint8Array;
@@ -388,6 +394,14 @@ function verifyLearningProvenance(input: {
         !Buffer.from(review.artifact).equals(Buffer.from(input.taskPacketBytes)) ||
         !reviews.barrier(review.reviewId).satisfied) {
       throw new Error("learning review barrier lacks exact launched durable PASS evidence");
+    }
+    const durablePassPairs = review.lanes
+      .filter((lane) => lane.status === "completed" && isSemanticPassResult(lane.result))
+      .map(({ agent, role }) => `${agent}:${role}`);
+    const receiptPairs = input.handoff.reviewReceipts
+      .map(({ agent, role }) => `${agent}:${role}`);
+    if (!sameSorted(receiptPairs, durablePassPairs)) {
+      throw new Error("learning review receipts do not match the exact durable PASS lanes");
     }
     for (const receipt of input.handoff.reviewReceipts) {
       const lane = review.lanes.find(({ agent, role }) => agent === receipt.agent && role === receipt.role);

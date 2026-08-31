@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "terminal-oracle/v1",
+  "stageId": "R2-STG-00",
+  "gateId": "R2-STG-00",
+  "sourceFingerprint": "9366c25efe0b924cf90c3ffa42fbee7bb07bd9913e79105ce016529be91bb2f3",
+  "terminalResult": "PASS",
+  "checks": {
+    "codexAuditor": "PASS",
+    "codexCritic": "PASS",
+    "optionalProviders": "explicit_non_blocking_unavailable",
+    "ambiguousAttempts": 0,
+    "typecheck": "PASS",
+    "build": "PASS",
+    "repositoryTests": "1469/1469 PASS"
+  },
+  "recordedAt": "2026-09-01T04:58:24+08:00"
+}

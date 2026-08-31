@@ -497,6 +497,14 @@ describe("routing-v5 collaboration runtime and transactional outbox", () => {
       runtime.drainDispatchOutbox(runs, 1);
       const claimed = runs.claimNext({ workerId: "prelaunch", leaseMs: 1_000,
         now: Date.now() + 1_000 })!;
+      runs.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+        agent: active.assignment.agent,
+        model: active.assignment.model,
+        effort: active.assignment.effort,
+        policyVersion: active.assignment.policyVersion,
+        sessionId: active.assignment.sessionId,
+      });
+      runs.clearLaunchIntent(claimed.id, claimed.leaseToken!);
       const receipt = { schemaVersion: "prelaunch-outcome/v1", runId: claimed.id,
         runAttemptCount: claimed.attemptCount, dispatchId: claimed.idempotencyKey, workflowId: "wf",
         stageId: active.id, attemptId: active.assignment.attemptId,
@@ -515,6 +523,48 @@ describe("routing-v5 collaboration runtime and transactional outbox", () => {
       });
     } finally { runtime.close(); runs.close(); }
   });
+
+  it.each(["model_unavailable", "network_timeout", "quota"] as const)(
+    "rejects non-CLI prelaunch failover evidence instead of creating recovery: %s",
+    (resultKind) => {
+      const root = makeRoot(`prelaunch-${resultKind}`);
+      const db = join(root, "state.db");
+      const runtime = new CollaborationRuntime(db);
+      const runs = new RunStore(db);
+      try {
+        const active = runtime.createAndStart("wf", fixture(root), 1).activeStage!;
+        runtime.drainDispatchOutbox(runs, 1);
+        const claimed = runs.claimNext({ workerId: "prelaunch", leaseMs: 1_000,
+          now: Date.now() + 1_000 })!;
+        runs.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+          agent: active.assignment.agent,
+          model: active.assignment.model,
+          effort: active.assignment.effort,
+          policyVersion: active.assignment.policyVersion,
+          sessionId: active.assignment.sessionId,
+        });
+        runs.clearLaunchIntent(claimed.id, claimed.leaseToken!);
+        const receipt = { schemaVersion: "prelaunch-outcome/v1", runId: claimed.id,
+          runAttemptCount: claimed.attemptCount, dispatchId: claimed.idempotencyKey, workflowId: "wf",
+          stageId: active.id, attemptId: active.assignment.attemptId,
+          attemptOrdinal: active.assignment.attemptOrdinal, agent: active.assignment.agent,
+          model: active.assignment.model, policyVersion: active.assignment.policyVersion,
+          sessionId: active.assignment.sessionId, resultKind };
+        runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!,
+          providerResult: { kind: resultKind, agent: "codex" },
+          effect: { type: "workflow_dispatch_rejected", workflowId: "wf", stageId: active.id,
+            runId: claimed.id, reason: resultKind, prelaunchReceipt: receipt, terminalAt: 2 },
+          status: "completed" });
+
+        expect(() => runtime.recordPrelaunchOutcome("wf", receipt, 2))
+          .toThrow(/exact.*cli_missing|prelaunch.*evidence/i);
+        expect(runtime.workflows.get("wf")?.status).toBe("running");
+      } finally {
+        runtime.close();
+        runs.close();
+      }
+    },
+  );
 
   it("rejects a stale completion after the active attempt is blocked", () => {
     const root = makeRoot("stale");

@@ -4,16 +4,190 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RunStore } from "../src/store/run-store.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
-import { RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
+import {
+  RunGateUnitOfWork,
+  type ReviewAdmissionReceiptPair,
+} from "../src/runtime/run-gate-unit-of-work.js";
 import { CollaborationRunStore } from "../src/store/collaboration-run-store.js";
 import Database from "better-sqlite3";
+import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 
 const roots: string[] = [];
 const makeDb = () => { const root = mkdtempSync(join(tmpdir(), "agent-collab-store-")); roots.push(root);
   const path = join(root, "state.db"); initializeCurrentExecutionSchema(path); return path; };
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
+const createReview = (gate: RunGateUnitOfWork,
+  input: Parameters<RunGateUnitOfWork["create"]>[0]) => {
+  const admissionReceipts: ReviewAdmissionReceiptPair[] = [];
+  for (const agent of ["grok", "claude", "codex"] as const) {
+    if (input.health[agent] !== "healthy") continue;
+    for (const role of ["auditor", "critic"] as const) {
+      const activationNonce = `store/${input.reviewId}/${agent}/${role}`;
+      const sourceReceiptId = `${activationNonce}/source`;
+      const readinessReceiptId = `${activationNonce}/readiness`;
+      gate.captureReviewReceiptPair({ pairId: activationNonce, phase: "admission",
+        activationNonce, scopeRevision: 1, recoveryGeneration: null,
+        expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
+        predecessorReceiptIds: { source: null, readiness: null }, receipts: {
+          source: { receiptId: sourceReceiptId,
+            scope: `review/${input.reviewId}/${agent}/${role}/source`,
+            observation: { sourceFingerprint: input.sourceFingerprint ?? "source-v1", valid: true } },
+          readiness: { receiptId: readinessReceiptId,
+            scope: `review/${input.reviewId}/${agent}/${role}/readiness`,
+            observation: { harnessReady: true, valid: true } },
+        }, createdAt: input.createdAt });
+      admissionReceipts.push({ agent, role, activationNonce, sourceReceiptId, readinessReceiptId });
+    }
+  }
+  return gate.create({ ...input, admissionReceipts });
+};
+
 describe("durable run store", () => {
+  it.each([
+    ["probing", 0, 0],
+    ["unavailable", 1, 0],
+    ["disabled", 0, 0],
+    ["healthy-unverified", 0, 0],
+    ["healthy-probe-claimed", 1, 1],
+  ] as const)("leaves provider health classification to the prelaunch fence when state is %s",
+    (state, capabilityVerified, attemptClaimed) => {
+      const path = makeDb();
+      const gate = new RunGateUnitOfWork(path);
+      createReview(gate, {
+        reviewId: `health-${state}`,
+        stageId: "architecture-audit",
+        artifact: Buffer.from(state),
+        health: { grok: "unavailable", claude: "unavailable", codex: "healthy" },
+        approvalScope: "workspace-read",
+        idempotencyKey: `health-${state}`,
+        prompts: { auditor: "audit", critic: "critic" },
+        requester: "codex",
+        project: process.cwd(),
+        sourceFingerprint: "source-v1",
+        createdAt: 1,
+      });
+      const db = new Database(path);
+      const health = state.startsWith("healthy") ? "healthy" : state;
+      db.prepare(`UPDATE runtime_provider_health
+        SET health=?, capability_verified=?, attempt_claimed=?, updated_at=10
+        WHERE agent='codex'`).run(health, capabilityVerified, attemptClaimed);
+      db.close();
+      const runs = new RunStore(path);
+
+      expect(runs.claimNext({ workerId: "health-fence", leaseMs: 100,
+        now: Date.now() + 1_000 })).toMatchObject({
+        stage: "review:auditor", payload: { reviewId: `health-${state}` },
+      });
+
+      runs.close();
+      gate.close();
+    });
+
+  it("claims only a linked one-shot review attempt for a healthy verified provider", () => {
+    const path = makeDb();
+    const gate = new RunGateUnitOfWork(path);
+    createReview(gate, {
+      reviewId: "linked-authority",
+      stageId: "architecture-audit",
+      artifact: Buffer.from("linked"),
+      health: { grok: "unavailable", claude: "unavailable", codex: "healthy" },
+      approvalScope: "workspace-read",
+      idempotencyKey: "linked-authority",
+      prompts: { auditor: "audit", critic: "critic" },
+      requester: "codex",
+      project: process.cwd(),
+      sourceFingerprint: "source-v1",
+      createdAt: 1,
+    });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("codex", 2);
+    const runs = new RunStore(path);
+    const forged = runs.enqueue({
+      idempotencyKey: "forged-review",
+      stage: "review:auditor",
+      priority: 0,
+      now: 2,
+      payload: { decision: { agent: "codex" } },
+    });
+
+    const first = runs.claimNext({ workerId: "linked-1", leaseMs: 100, now: Date.now() + 1_000 });
+    const second = runs.claimNext({ workerId: "linked-2", leaseMs: 100, now: Date.now() + 1_000 });
+    expect([first, second].map((run) => run?.payload?.reviewId)).toEqual([
+      "linked-authority",
+      "linked-authority",
+    ]);
+    expect(runs.claimNext({ workerId: "linked-3", leaseMs: 100,
+      now: Date.now() + 1_000 })).toBeUndefined();
+    expect(runs.get(forged.id)?.status).toBe("queued");
+
+    runs.close();
+    health.close();
+    gate.close();
+  });
+
+  it("rejects generic cancellation of a linked review attempt without splitting lane state", () => {
+    const path = makeDb();
+    const gate = new RunGateUnitOfWork(path);
+    const review = createReview(gate, {
+      reviewId: "cancel-fence",
+      stageId: "architecture-audit",
+      artifact: Buffer.from("cancel"),
+      health: { grok: "unavailable", claude: "unavailable", codex: "healthy" },
+      approvalScope: "workspace-read",
+      idempotencyKey: "cancel-fence",
+      prompts: { auditor: "audit", critic: "critic" },
+      requester: "codex",
+      project: process.cwd(),
+      sourceFingerprint: "source-v1",
+      createdAt: 1,
+    });
+    const runs = new RunStore(path);
+    const runId = runs.getByIdempotencyKey(
+      review.lanes.find((lane) => lane.agent === "codex" && lane.role === "auditor")!.idempotencyKey,
+    )!.id;
+
+    expect(() => runs.cancel(runId, "operator")).toThrow(/linked review attempt/i);
+    expect(runs.get(runId)?.status).toBe("queued");
+    expect(gate.get("cancel-fence")?.lanes.find(
+      (lane) => lane.agent === "codex" && lane.role === "auditor",
+    )?.status).toBe("queued");
+
+    runs.close();
+    gate.close();
+  });
+
+  it("does not requeue a consumed review grant after its prelaunch lease expires", () => {
+    const path = makeDb();
+    const gate = new RunGateUnitOfWork(path);
+    createReview(gate, {
+      reviewId: "expired-grant",
+      stageId: "architecture-audit",
+      artifact: Buffer.from("expired"),
+      health: { grok: "unavailable", claude: "unavailable", codex: "healthy" },
+      approvalScope: "workspace-read",
+      idempotencyKey: "expired-grant",
+      prompts: { auditor: "audit", critic: "critic" },
+      requester: "codex",
+      project: process.cwd(),
+      sourceFingerprint: "source-v1",
+      createdAt: 1,
+    });
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("codex", 2);
+    const runs = new RunStore(path);
+    const claimed = runs.claimNext({ workerId: "expired", leaseMs: 10,
+      now: Date.now() + 1_000 })!;
+
+    expect(runs.recoverExpired(claimed.leaseExpiresAt! + 1)).toBe(1);
+    expect(runs.get(claimed.id)?.status).toBe("needs_reconciliation");
+    expect(runs.claimNext({ workerId: "replacement", leaseMs: 10,
+      now: claimed.leaseExpiresAt! + 2 })?.id).not.toBe(claimed.id);
+
+    runs.close();
+    health.close();
+    gate.close();
+  });
   it.each([
     ["run", (path: string) => new RunStore(path)],
     ["gate", (path: string) => new RunGateUnitOfWork(path)],
@@ -53,7 +227,7 @@ describe("durable run store", () => {
     store.close();
   });
 
-  it("claims demanded review before ordinary review at the same persisted priority", () => {
+  it("does not claim unlinked review stages regardless of payload hints", () => {
     const store = new RunStore(makeDb());
     const ordinary = store.enqueue({ idempotencyKey: "ordinary", stage: "review:critic", priority: 5, now: 1,
       payload: { providerAdmissionClaimedAt: "invalid" } });
@@ -61,8 +235,9 @@ describe("durable run store", () => {
       payload: { providerAdmissionClaimedAt: 42 } });
     const coordination = store.enqueue({ idempotencyKey: "coordination-first", stage: "coordination", priority: 1, now: 3 });
     expect(store.claimNext({ workerId: "w", leaseMs: 100, now: 10 })?.id).toBe(coordination.id);
-    expect(store.claimNext({ workerId: "w", leaseMs: 100, now: 11 })?.id).toBe(demanded.id);
+    expect(store.claimNext({ workerId: "w", leaseMs: 100, now: 11 })).toBeUndefined();
     expect(store.get(ordinary.id)?.status).toBe("queued");
+    expect(store.get(demanded.id)?.status).toBe("queued");
     store.close();
   });
 
@@ -118,6 +293,35 @@ describe("durable run store", () => {
     expect(store.recoverExpired(13)).toBe(1);
     expect(store.get(queued.id)?.status).toBe("needs_reconciliation");
     expect(store.claimNext({ workerId: "other", leaseMs: 10, now: 14 })).toBeUndefined();
+    store.close();
+  });
+
+  it("persists exact proven-no-spawn identity when launch intent is synchronously cleared", () => {
+    const store = new RunStore(makeDb());
+    const queued = store.enqueue({ idempotencyKey: "proven-no-spawn", stage: "planning",
+      priority: 1, now: 1 });
+    const claimed = store.claimNext({ workerId: "worker", leaseMs: 10, now: 2 })!;
+    store.recordExecutionContext(claimed.id, claimed.leaseToken!, { traceId: "trace-1" });
+    store.markLaunchIntent(claimed.id, claimed.leaseToken!, {
+      agent: "grok", model: "grok-4.6", effort: "high", policyVersion: "routing-v5",
+      sessionId: "session-1",
+    });
+
+    store.clearLaunchIntent(claimed.id, claimed.leaseToken!);
+
+    expect(store.get(queued.id)).toMatchObject({
+      status: "claimed",
+      launched: false,
+      launchInfo: {
+        phase: "proven_no_spawn",
+        agent: "grok",
+        model: "grok-4.6",
+        effort: "high",
+        policyVersion: "routing-v5",
+        sessionId: "session-1",
+        executionContext: { traceId: "trace-1" },
+      },
+    });
     store.close();
   });
 
