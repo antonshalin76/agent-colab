@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
 import { redactSensitive } from "../security/redaction.js";
+import { GRAPH_EXECUTION_MODE } from "../store/state-layout.js";
 import {
   assertReviewV3SchemaSignature,
   extendReviewV3SchemaOffline,
@@ -147,6 +148,44 @@ interface TableDigest {
   count: number;
   sha256: string;
 }
+
+export interface CompatibilityRuntimeObservation {
+  schemaVersion: "compatibility-runtime-open-observation/v1";
+  stateVersion: 3 | 4;
+  historyVersion: 2;
+  openMode: "read_only";
+  graphExecution: "disabled";
+  graphSchema: "absent" | "complete_disabled";
+  reviewSchema: "routing_v5" | "review_v3";
+  stateProfile: "v3_routing_v5" | "v4_routing_v5" | "v4_review_v3";
+  stateSchemaSha256: string;
+  historySchemaSha256: string;
+  integrity: { state: "ok"; history: "ok"; foreignKeys: "ok" };
+}
+
+const GRAPH_V4_TABLES = [
+  "agent_attempt_usage", "agent_event_archive_members", "agent_event_archives",
+  "agent_event_payloads", "agent_events", "agent_sessions", "agent_usage_coverage",
+  "flow_mcp_idempotency", "graph_budget_reservations", "graph_budget_settlements",
+  "graph_edge_evaluations", "graph_edges", "graph_flows", "graph_node_admission_intents",
+  "graph_node_admissions", "graph_node_attempts", "graph_node_input_bindings",
+  "graph_node_results", "graph_nodes", "plan_progress_events", "plan_progress_outbox",
+  "session_memory_revisions",
+] as const;
+const GRAPH_V4_REQUIRED_INDEXES = [
+  "agent_events_cursor", "agent_sessions_parent", "agent_usage_attempt", "archive_flow_range",
+  "flow_mcp_idempotency_status", "graph_attempts_latest", "graph_budget_flow",
+  "graph_edges_source", "graph_edges_target", "graph_intents_pending", "graph_nodes_ready",
+  "plan_progress_outbox_pending",
+] as const;
+const GRAPH_V4_TABLE_SCHEMA_SHA256 = "2b3a0f52fdbfe2e6a9ac4d2ace77423888c3d6c50787950bdaf834f978357751";
+const GRAPH_V4_REQUIRED_INDEX_SHA256 = "1c38876a1730a8fc9b00d756bc81158d5bdd894099ef3b67d9470030b1539ba5";
+const LEGACY_STATE_PROFILE_SHA256 = {
+  v3_routing_v5: "7a29baaff38b71f25e6670429398944b34b708f9f661ea4512eddacfa2b5d585",
+  v4_routing_v5: "d9843b1c811c1fddfe916b51fb6c0e90f18d4c53185f78fc2b068c2862b69bb0",
+  v4_review_v3: "761f81590bfb897a81be8fc42ae2b133d11cfe45d96d031460fc392645938ed3",
+} as const;
+const HISTORY_V2_SCHEMA_SHA256 = "58b2d0fd246bbe2ee62969dded0f2a6dcd242340ae90f6a9293abed4c2dbe2fd";
 
 const EXECUTION_TABLES = [
   "runs",
@@ -627,22 +666,13 @@ function verifyV2(state: Database.Database, history: Database.Database): void {
   if (!leaseColumns.has("authority_policy") || !outboxColumns.has("terminal_reason")) {
     throw new Error("v2 routing-v4 durability columns are missing");
   }
-  for (const table of ["sources", "history_rows", "pending_tools"]) requireAgentConstraint(history, table, true);
-  if (!tableExists(history, "memory_source_health")) throw new Error("missing v2 memory source health table");
-  const historyRowsSql = (history.prepare(
-    "SELECT sql FROM sqlite_master WHERE type='table' AND name='history_rows'",
-  ).get() as { sql: string } | undefined)?.sql ?? "";
-  for (const namespace of ["grok_native", "codex_native", "claude_legacy", "collaboration_shared"]) {
-    if (!historyRowsSql.includes(`'${namespace}'`)) {
-      throw new Error(`invalid v2 history namespace constraint: ${namespace}`);
-    }
-  }
+  verifyHistoryV2Schema(history);
   if ((state.pragma("foreign_key_check") as unknown[]).length > 0 ||
       (history.pragma("foreign_key_check") as unknown[]).length > 0) {
     throw new Error("v2 foreign-key verification failed");
   }
   for (const [db, indexes] of [[state, ["runs_due", "collaboration_outbox_pending", "runtime_review_lanes_status", "runtime_review_attempts_lane", "idx_worktree_handoffs_task"]],
-    [history, ["history_rows_project"]]] as const) {
+    [history, []]] as const) {
     for (const index of indexes) {
       if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index) === undefined) {
         throw new Error(`missing v2 index: ${index}`);
@@ -655,6 +685,128 @@ function schemaSql(db: Database.Database, table: string): string {
   return (db.prepare(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
   ).get(table) as { sql: string } | undefined)?.sql ?? "";
+}
+
+interface SchemaObjectRow {
+  type: string;
+  name: string;
+  tblName: string;
+  sql: string | null;
+}
+
+const normalizedSchemaRows = (
+  db: Database.Database,
+  names?: readonly string[],
+): SchemaObjectRow[] => {
+  const where = names === undefined
+    ? "name NOT LIKE 'sqlite_%'"
+    : `name IN (${names.map(() => "?").join(",")})`;
+  return (db.prepare(`SELECT type,name,tbl_name AS tblName,sql FROM sqlite_schema
+    WHERE ${where} ORDER BY type,name`).all(...(names ?? [])) as SchemaObjectRow[])
+    .map((row) => ({
+      ...row,
+      sql: typeof row.sql === "string" ? row.sql.replace(/\s+/g, " ").trim() : null,
+    }));
+};
+
+const schemaRowsSha256 = (rows: readonly SchemaObjectRow[]): string => {
+  const digest = createHash("sha256");
+  for (const row of rows) digest.update(`${JSON.stringify(row)}\n`);
+  return digest.digest("hex");
+};
+
+const schemaSha256 = (db: Database.Database): string =>
+  schemaRowsSha256(normalizedSchemaRows(db));
+
+const legacyStateSchemaSha256 = (db: Database.Database): string => {
+  const graphTables = new Set<string>(GRAPH_V4_TABLES);
+  return schemaRowsSha256(normalizedSchemaRows(db).filter((row) =>
+    (row.type === "table" || row.type === "trigger" || row.type === "view") &&
+    !graphTables.has(row.name)));
+};
+
+const assertExactIndex = (
+  db: Database.Database,
+  name: string,
+  columns: readonly string[],
+): void => {
+  const schema = db.prepare("SELECT tbl_name AS tableName FROM sqlite_schema WHERE type='index' AND name=?")
+    .get(name) as { tableName: string } | undefined;
+  const escapedTable = schema?.tableName.replaceAll("'", "''") ?? "";
+  const metadata = schema === undefined ? undefined : (db.pragma(
+    `index_list('${escapedTable}')`,
+  ) as Array<{ name: string; unique: 0 | 1; origin: string; partial: 0 | 1 }>)
+    .find((index) => index.name === name);
+  const escapedName = name.replaceAll("'", "''");
+  const keyColumns = schema === undefined ? [] : (db.pragma(
+    `index_xinfo('${escapedName}')`,
+  ) as Array<{ seqno: number; name: string | null; desc: 0 | 1; coll: string; key: 0 | 1 }>)
+    .filter(({ key }) => key === 1)
+    .sort((left, right) => left.seqno - right.seqno);
+  if (!metadata || metadata.unique !== 0 || metadata.origin !== "c" || metadata.partial !== 0 ||
+      keyColumns.length !== columns.length || keyColumns.some((column, offset) =>
+        column.name !== columns[offset] || column.desc !== 0 || column.coll.toUpperCase() !== "BINARY")) {
+    throw new Error(`invalid index signature: ${name}`);
+  }
+};
+
+const assertNoAdditiveUniqueIndexes = (db: Database.Database): void => {
+  const tables = db.prepare(`SELECT name FROM sqlite_schema
+    WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).pluck().all() as string[];
+  const unexpected = tables.flatMap((table) => db.pragma(
+    `index_list('${table.replaceAll("'", "''")}')`,
+  ) as Array<{ name: string; unique: 0 | 1; origin: string }>).filter((index) =>
+    index.origin === "c" && index.unique === 1);
+  if (unexpected.length > 0) {
+    throw new Error(`additive unique indexes are forbidden: ${unexpected.map(({ name }) => name).join(", ")}`);
+  }
+};
+
+function verifyHistoryV2Schema(history: Database.Database, exactProfile = false): void {
+  if (userVersion(history) !== V2) throw new Error("v2 history schema marker mismatch");
+  for (const table of ["sources", "history_rows", "pending_tools"]) {
+    requireAgentConstraint(history, table, true);
+  }
+  if (!tableExists(history, "history_issues") || !tableExists(history, "memory_source_health")) {
+    throw new Error("missing v2 history table");
+  }
+  const historyRowsSql = schemaSql(history, "history_rows");
+  for (const namespace of ["grok_native", "codex_native", "claude_legacy", "collaboration_shared"]) {
+    if (!historyRowsSql.includes(`'${namespace}'`)) {
+      throw new Error(`invalid v2 history namespace constraint: ${namespace}`);
+    }
+  }
+  if (history.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='history_rows_project'",
+  ).get() === undefined) {
+    throw new Error("missing v2 index: history_rows_project");
+  }
+  if (exactProfile) {
+    assertExactIndex(history, "history_rows_project", ["project", "source_agent", "source_path", "source_line"]);
+    assertNoAdditiveUniqueIndexes(history);
+    const exactSchema = schemaRowsSha256(normalizedSchemaRows(history).filter((row) =>
+      row.type === "table" || row.type === "trigger" || row.type === "view"));
+    if (exactSchema !== HISTORY_V2_SCHEMA_SHA256) {
+      throw new Error("history v2 schema profile mismatch");
+    }
+  }
+}
+
+function graphSchemaState(state: Database.Database): "absent" | "complete_disabled" {
+  const tables = normalizedSchemaRows(state, GRAPH_V4_TABLES);
+  const requiredIndexes = normalizedSchemaRows(state, GRAPH_V4_REQUIRED_INDEXES);
+  const graphTableSet = new Set<string>(GRAPH_V4_TABLES);
+  const graphNamedObjects = normalizedSchemaRows(state).filter((row) =>
+    row.name.startsWith("graph_") || graphTableSet.has(row.tblName));
+  if (tables.length === 0 && requiredIndexes.length === 0 && graphNamedObjects.length === 0) return "absent";
+  if (tables.length !== GRAPH_V4_TABLES.length ||
+      schemaRowsSha256(tables) !== GRAPH_V4_TABLE_SCHEMA_SHA256 ||
+      requiredIndexes.length !== GRAPH_V4_REQUIRED_INDEXES.length ||
+      schemaRowsSha256(requiredIndexes) !== GRAPH_V4_REQUIRED_INDEX_SHA256 ||
+      graphNamedObjects.some((row) => row.type === "trigger" || row.type === "view")) {
+    throw new Error("partial or altered graph v4 schema");
+  }
+  return "complete_disabled";
 }
 
 function verifyRoutingV5State(state: Database.Database, version: 3 | 4): void {
@@ -696,14 +848,16 @@ function verifyRoutingV5State(state: Database.Database, version: 3 | 4): void {
   if ((state.pragma("foreign_key_check") as unknown[]).length > 0) {
     throw new Error(`v${version} state foreign-key verification failed`);
   }
-  for (const index of [
-    "runs_due",
-    "collaboration_outbox_pending",
-    "runtime_review_lanes_status",
-    "runtime_review_attempts_lane",
-  ]) {
-    if (state.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index) === undefined) {
-      throw new Error(`missing v${version} index: ${index}`);
+  for (const [index, columns] of [
+    ["runs_due", ["status", "next_attempt_at", "priority", "created_at"]],
+    ["collaboration_outbox_pending", ["published_at", "dispatch_id"]],
+    ["runtime_review_lanes_status", ["review_id", "status"]],
+    ["runtime_review_attempts_lane", ["review_id", "agent", "role", "attempt_ordinal"]],
+  ] as const) {
+    try {
+      assertExactIndex(state, index, columns);
+    } catch {
+      throw new Error(`missing v${version} index: ${index}; or invalid signature`);
     }
   }
 }
@@ -736,6 +890,100 @@ function verifyV4State(state: Database.Database): void {
     if (fragments.some((fragment) => !sql.includes(fragment))) {
       throw new Error(`missing v4 launch authority trigger: ${trigger}`);
     }
+  }
+}
+
+export function verifyCompatibilityRuntime(input: {
+  stateDatabase: string;
+  historyDatabase: string;
+  faultInjector?: (point: "after_snapshot") => void;
+}): CompatibilityRuntimeObservation {
+  const statePath = resolve(input.stateDatabase);
+  const historyPath = resolve(input.historyDatabase);
+  if (statePath === historyPath) throw new Error("state and history databases must be distinct");
+  const state = new Database(statePath, { readonly: true, fileMustExist: true });
+  let history: Database.Database | null = null;
+  try {
+    history = new Database(historyPath, { readonly: true, fileMustExist: true });
+    state.pragma("query_only = ON");
+    history.pragma("query_only = ON");
+    const stateVersion = userVersion(state);
+    const historyVersion = userVersion(history);
+    if ((stateVersion !== V3 && stateVersion !== V4) || historyVersion !== V2) {
+      throw new Error(`unsupported compatibility schema pair: state=${stateVersion}, history=${historyVersion}`);
+    }
+
+    const stateDataVersion = Number(state.pragma("data_version", { simple: true }));
+    const historyDataVersion = Number(history.pragma("data_version", { simple: true }));
+    state.exec("BEGIN");
+    history.exec("BEGIN");
+    let reviewSchema: CompatibilityRuntimeObservation["reviewSchema"];
+    let stateProfile: CompatibilityRuntimeObservation["stateProfile"];
+    if (stateVersion === V3) {
+      verifyV3State(state);
+      reviewSchema = "routing_v5";
+      stateProfile = "v3_routing_v5";
+    } else if (tableExists(state, "runtime_schema_capabilities")) {
+      verifyRoutingV5State(state, V4);
+      assertReviewV3SchemaSignature(state);
+      reviewSchema = "review_v3";
+      stateProfile = "v4_review_v3";
+    } else {
+      verifyV4State(state);
+      reviewSchema = "routing_v5";
+      stateProfile = "v4_routing_v5";
+    }
+    input.faultInjector?.("after_snapshot");
+    verifyHistoryV2Schema(history, true);
+    const graphSchema = graphSchemaState(state);
+    if (stateVersion === V3 && graphSchema !== "absent") {
+      throw new Error("graph v4 schema cannot be present on state v3");
+    }
+    if (legacyStateSchemaSha256(state) !== LEGACY_STATE_PROFILE_SHA256[stateProfile]) {
+      throw new Error(`legacy state schema profile mismatch: ${stateProfile}`);
+    }
+    assertExactIndex(state, "idx_worktree_handoffs_task", ["task_id", "id"]);
+    assertNoAdditiveUniqueIndexes(state);
+    if (String(state.pragma("integrity_check", { simple: true })) !== "ok" ||
+        String(history.pragma("integrity_check", { simple: true })) !== "ok") {
+      throw new Error("compatibility database integrity check failed");
+    }
+    if ((state.pragma("foreign_key_check") as unknown[]).length > 0 ||
+        (history.pragma("foreign_key_check") as unknown[]).length > 0) {
+      throw new Error("compatibility database foreign-key check failed");
+    }
+    const stateSchemaSha256 = schemaSha256(state);
+    const historySchemaSha256 = schemaSha256(history);
+    state.exec("COMMIT");
+    history.exec("COMMIT");
+    if (Number(state.pragma("data_version", { simple: true })) !== stateDataVersion ||
+        Number(history.pragma("data_version", { simple: true })) !== historyDataVersion) {
+      throw new Error("compatibility database changed while it was being verified");
+    }
+    if (GRAPH_EXECUTION_MODE !== "disabled") {
+      throw new Error("compatibility runtime requires graph execution to be disabled");
+    }
+    return {
+      schemaVersion: "compatibility-runtime-open-observation/v1",
+      stateVersion,
+      historyVersion: 2,
+      openMode: "read_only",
+      graphExecution: GRAPH_EXECUTION_MODE,
+      graphSchema,
+      reviewSchema,
+      stateProfile,
+      stateSchemaSha256,
+      historySchemaSha256,
+      integrity: { state: "ok", history: "ok", foreignKeys: "ok" },
+    };
+  } catch (error) {
+    if (state.inTransaction) state.exec("ROLLBACK");
+    if (history?.inTransaction) history.exec("ROLLBACK");
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`compatibility schema verification failed: ${detail}`, { cause: error });
+  } finally {
+    history?.close();
+    state.close();
   }
 }
 

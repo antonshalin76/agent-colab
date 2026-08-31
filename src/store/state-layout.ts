@@ -3,6 +3,28 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 
 export interface StateLayout { root: string; database: string; historyDatabase: string; socket?: never }
 
+export const GRAPH_EXECUTION_MODE = "disabled" as const;
+
+const assertRegularFile = (path: string, label: string): void => {
+  if (!existsSync(path) || !lstatSync(path).isFile()) {
+    throw new Error(`existing ${label} database is required for compatibility runtime`);
+  }
+};
+
+export function openExistingStateLayout(root: string): StateLayout {
+  const requestedRoot = resolve(root);
+  if (!existsSync(requestedRoot) || !lstatSync(requestedRoot).isDirectory() ||
+      lstatSync(requestedRoot).isSymbolicLink()) {
+    throw new Error("existing state root directory is required for compatibility runtime");
+  }
+  const canonicalRoot = realpathSync(requestedRoot);
+  const database = resolve(canonicalRoot, "collaboration.db");
+  const historyDatabase = resolve(canonicalRoot, "history.db");
+  assertRegularFile(database, "state");
+  assertRegularFile(historyDatabase, "history");
+  return { root: canonicalRoot, database, historyDatabase };
+}
+
 export function ensureStateLayout(root: string): StateLayout {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);

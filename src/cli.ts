@@ -17,7 +17,7 @@ import {
   type ProviderHealthSnapshot,
   type ReviewProviderId,
 } from "./domain/routing.js";
-import { doctorV1, initializeCurrentExecutionSchema, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle } from "./migration/coordinator.js";
+import { doctorV1, initializeCurrentExecutionSchema, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle, verifyCompatibilityRuntime } from "./migration/coordinator.js";
 import { assertReviewV3SchemaSignature } from "./migration/review-v3-schema.js";
 import { startStdioCollabServer } from "./mcp/server.js";
 import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
@@ -36,7 +36,7 @@ import { ReviewEvidenceCapture } from "./runtime/review-evidence-capture.js";
 import { matchesExactPrelaunchCliMissing } from "./runtime/prelaunch-evidence.js";
 import { defaultAllowedProjectRoots, ProjectPolicy } from "./security/project-policy.js";
 import { runCapabilityProbes, type CapabilityProbeRunner } from "./probes/capability-probe.js";
-import { ensureStateLayout } from "./store/state-layout.js";
+import { ensureStateLayout, GRAPH_EXECUTION_MODE, openExistingStateLayout } from "./store/state-layout.js";
 import { RunStore, type RunRecord } from "./store/run-store.js";
 import { DurableWorker } from "./worker/durable-worker.js";
 import { WorktreeLeaseStore, type WorktreeLease } from "./worktree/lease-store.js";
@@ -57,7 +57,42 @@ const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local"
 if (command === "mcp" || command === "worker") {
   assertProductionRuntimeReleased();
 }
-const layout = ensureStateLayout(stateRoot);
+const compatibilityOnly = command === "compatibility-status" || command === "compatibility-runtime";
+const layout = compatibilityOnly ? openExistingStateLayout(stateRoot) : ensureStateLayout(stateRoot);
+
+if (compatibilityOnly) {
+  const compatibility = verifyCompatibilityRuntime({
+    stateDatabase: layout.database,
+    historyDatabase: layout.historyDatabase,
+  });
+  if (command === "compatibility-status") {
+    console.log(JSON.stringify(compatibility, null, 2));
+    process.exit(0);
+  }
+  const stopped = new Promise<void>((resolveStop) => {
+    const stop = () => resolveStop();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+  console.log(JSON.stringify({
+    schemaVersion: "compatibility-runtime-process-observation/v1",
+    processId: process.pid,
+    startedAt: new Date().toISOString(),
+    graphExecution: GRAPH_EXECUTION_MODE,
+    serviceSurface: "compatibility_only",
+    queueClaim: "disabled",
+    providerLaunch: "disabled",
+    mcpServing: "disabled",
+    compatibility,
+  }));
+  const keepAlive = setInterval(() => {}, 60_000);
+  try {
+    await stopped;
+  } finally {
+    clearInterval(keepAlive);
+  }
+  process.exit(0);
+}
 const grokBinary = process.env.AGENT_COLLAB_GROK_BIN ?? join(homedir(), ".local", "bin", "grok");
 const claudeBinary = process.env.AGENT_COLLAB_CLAUDE_BIN ?? join(homedir(), ".local", "bin", "claude");
 const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".local", "bin", "codex");
@@ -147,14 +182,21 @@ const prepareDatabases = (): void => {
   if (hasState) {
     const stateVersion = schemaVersion(layout.database);
     const historyVersion = schemaVersion(layout.historyDatabase);
-    if (stateVersion === 4 && historyVersion === 2) {
+    if (stateVersion === 2 && historyVersion === 2) {
+      throw new Error("offline migration required: state=2, history=2; run migrate-v3 while the service is stopped");
+    }
+    if (!((stateVersion === 3 || stateVersion === 4) && historyVersion === 2)) {
+      throw new Error(`offline migration required: state=${stateVersion}, history=${historyVersion}; run migrate-v2 while the service is stopped`);
+    }
+    const compatibility = verifyCompatibilityRuntime({
+      stateDatabase: layout.database,
+      historyDatabase: layout.historyDatabase,
+    });
+    if (compatibility.stateVersion === 4) {
       assertCurrentAuthoritySchema(layout.database);
       return;
     }
-    const migration = stateVersion === 3 && historyVersion === 2
-      ? "migrate-v4"
-      : stateVersion === 2 && historyVersion === 2 ? "migrate-v3" : "migrate-v2";
-    throw new Error(`offline migration required: state=${stateVersion}, history=${historyVersion}; run ${migration} while the service is stopped`);
+    throw new Error(`offline migration required: state=${compatibility.stateVersion}, history=${compatibility.historyVersion}; run migrate-v4 while the service is stopped`);
   }
   initializeCurrentExecutionSchema(layout.database);
   const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
@@ -276,6 +318,10 @@ if (command === "migrate-v3") {
 
 if (command === "migrate-v4") {
   assertServiceInactive();
+  verifyCompatibilityRuntime({
+    stateDatabase: layout.database,
+    historyDatabase: layout.historyDatabase,
+  });
   const coordinator = new MigrationCoordinator({
     stateDatabase: layout.database,
     historyDatabase: layout.historyDatabase,
