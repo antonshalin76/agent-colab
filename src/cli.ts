@@ -22,6 +22,7 @@ import { assertReviewV3SchemaSignature } from "./migration/review-v3-schema.js";
 import { startStdioCollabServer } from "./mcp/server.js";
 import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
 import { captureWorkspaceFingerprint } from "./runtime/workspace-fingerprint.js";
+import { assertProductionRuntimeReleased } from "./runtime/production-release-gate.js";
 import { activateRecoveredReviewLanes } from "./runtime/review-rejoin.js";
 import { runAutomaticProviderRecovery } from "./runtime/provider-recovery-loop.js";
 import {
@@ -51,13 +52,16 @@ import {
   type PersistedDomainEffect,
 } from "./worker/domain-effect.js";
 
+const command = process.argv[2] ?? "status";
 const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local", "share", "agent-collab");
+if (command === "mcp" || command === "worker") {
+  assertProductionRuntimeReleased();
+}
 const layout = ensureStateLayout(stateRoot);
 const grokBinary = process.env.AGENT_COLLAB_GROK_BIN ?? join(homedir(), ".local", "bin", "grok");
 const claudeBinary = process.env.AGENT_COLLAB_CLAUDE_BIN ?? join(homedir(), ".local", "bin", "claude");
 const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".local", "bin", "codex");
 const allowedProjectRoots = defaultAllowedProjectRoots();
-const command = process.argv[2] ?? "status";
 const REVIEW_PROVIDERS = REVIEW_PROVIDER_IDS;
 const reviewSkillReadiness = (): Readonly<Record<ReviewProviderId, boolean>> => {
   try {
