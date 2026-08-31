@@ -19,7 +19,7 @@ progress verifier accepts the complete chain.
 
 ## `R2-STG-00` readiness
 
-- [ ] `R2-STG-00` Provider availability, recovery, evidence, and review barrier
+- [x] `R2-STG-00` Provider availability, recovery, evidence, and review barrier
   stage is closed.
   - [x] `R2-STG-00-G1` Terminal-first provider failure classification is
     implemented and collision-tested.
@@ -46,7 +46,7 @@ progress verifier accepts the complete chain.
     lanes explicit and no reconciliation-required attempt.
   - [x] `R2-STG-00-G12` A start-rooted stage-close progress event is recorded
     and verified.
-  - [ ] `R2-STG-00-G13` The exact reviewed source is committed and pushed to
+  - [x] `R2-STG-00-G13` The exact reviewed source is committed and pushed to
     `origin/master`.
 
 ## Inherited stages
@@ -66,8 +66,8 @@ progress verifier accepts the complete chain.
 
 ## Current measured progress
 
-- Closed implementation stages: `0/13`.
-- `R2-STG-00` readiness gates with evidence: `12/13`.
+- Closed implementation stages: `1/13`.
+- `R2-STG-00` readiness gates with evidence: `13/13`.
 - Frozen graph capability stages closed: `0/12`.
 - Deterministic graph eval capability: `12/12` PASS on the candidate versus
   `0/12` PASS on baseline SHA `d0f6cda738cf08ff851f14192ff48e636c1f0f17`.
@@ -76,5 +76,7 @@ progress verifier accepts the complete chain.
   success is not substituted for formal stage closure.
 - Current repository gate: `65/65` files and `1469/1469` tests PASS; the older
   numeric minima in G7 remain satisfied by the larger current suite.
-- Next authoritative transition: commit and push the exact reviewed R2 source,
-  then execute inherited `STG-01` through `STG-12` in immutable order.
+- Exact reviewed R2 source: `1e652ef1e48d7cc7487c7cea21e79554a839b1ee`,
+  pushed to `origin/master`.
+- Next authoritative transition: execute inherited `STG-01` through `STG-12`
+  in immutable order.
