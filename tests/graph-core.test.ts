@@ -3,47 +3,74 @@ import { appendFlowEvent, aggregateUsage, verifyFlowEvent } from "../src/runtime
 import { runReadOnlyFanOut } from "../src/runtime/graph-scheduler.js";
 import { validateNodeResult } from "../src/runtime/node-result.js";
 import { createSessionCheckpoint, verifySessionCheckpoint } from "../src/runtime/session-context.js";
-import { validateGraphFlow } from "../src/workflow/flow-contract.js";
+import { computeGraphDefinitionSha256, validateGraphFlow } from "../src/workflow/flow-contract.js";
 import { flowIsTerminal, initialFlowState, readyNodeIds, reduceFlow } from "../src/workflow/flow-reducer.js";
 
-const node = (id: string, kind = "task") => ({
-  id,
-  kind,
+const node = (nodeId: string, stageKind = "implementation") => ({
+  nodeId,
+  stageKind,
+  role: stageKind === "coordination" ? "coordinator" : "stage-owner",
   approvalScope: "workspace-read",
-  inputSchema: { type: "object" },
+  promptTemplateRef: `prompt:${nodeId}`,
+  artifactRef: `artifact:${nodeId}`,
+  inputPorts: [],
   outputSchema: {
     type: "object",
     properties: { route: { type: "string", enum: ["yes", "no"] } },
     required: ["route"],
     additionalProperties: false,
   },
+  joinPolicy: "all_success",
+  allowedRoutes: ["yes", "no"],
+  timeoutMs: 60_000,
+  maxAttempts: 2,
+  requestedTokenLimit: 1_000,
 });
 
-const flow = () => ({
-  schemaVersion: "GraphFlow/v1",
-  flowId: "focused",
-  project: "/tmp/project",
-  budget: { maxNodes: 8, maxCostUsd: 1 },
-  nodes: [node("root", "coordination"), node("left"), node("right"), node("join"), node("conditional")],
-  edges: [
-    { from: "root", to: "left", join: "all_success" },
-    { from: "root", to: "right", join: "all_success" },
-    { from: "left", to: "join", join: "all_success" },
-    { from: "right", to: "join", join: "all_success" },
-    { from: "join", to: "conditional", join: "all_terminal", condition: { route: "yes" } },
-  ],
-});
+const flow = () => {
+  const definition = {
+    schemaVersion: "GraphFlow/v1",
+    flowId: "focused",
+    taskId: "focused-task",
+    project: "/tmp/project",
+    origin: "codex",
+    budget: { maxNodes: 8, maxActiveReadOnly: 3, maxChildDepth: 8, maxTokens: 20_000, maxWallTimeMs: 600_000, maxCostMicrousd: 1_000_000 },
+    nodes: [node("root", "coordination"), node("left"), node("right"), node("join"), { ...node("conditional"), joinPolicy: "all_terminal" }],
+    edges: [
+      { edgeId: "root-left", sourceId: "root", targetId: "left", condition: { kind: "outcome", outcomes: ["succeeded"] } },
+      { edgeId: "root-right", sourceId: "root", targetId: "right", condition: { kind: "outcome", outcomes: ["succeeded"] } },
+      { edgeId: "left-join", sourceId: "left", targetId: "join", condition: { kind: "outcome", outcomes: ["succeeded"] } },
+      { edgeId: "right-join", sourceId: "right", targetId: "join", condition: { kind: "outcome", outcomes: ["succeeded"] } },
+      { edgeId: "join-conditional", sourceId: "join", targetId: "conditional", condition: { kind: "route", routes: ["yes"] } },
+    ],
+  };
+  return { ...definition, definitionSha256: computeGraphDefinitionSha256(definition) };
+};
 
 describe("graph flow contracts and reducer", () => {
   it("validates a single-root DAG and rejects cycles, dangling edges, and routing authority", () => {
     expect(validateGraphFlow(flow()).index.topologicalOrder).toHaveLength(5);
-    expect(() => validateGraphFlow({ ...flow(), edges: [...flow().edges, { from: "join", to: "root", join: "all_success" }] })).toThrow(/cycle/);
-    expect(() => validateGraphFlow({ ...flow(), edges: [{ from: "root", to: "missing", join: "all_success" }] })).toThrow(/unknown node/);
-    expect(() => validateGraphFlow({ ...flow(), budget: { maxNodes: 8, maxDepth: 3 } })).toThrow(/maxDepth/);
-    expect(() => validateGraphFlow({ ...flow(), edges: [...flow().edges, { from: "join", to: "left", join: "all_success", condition: { route: "maybe" } }] })).toThrow(/not declared/);
-    expect(() => validateGraphFlow({ ...flow(), nodes: [...flow().nodes, node("second-root", "coordination")] })).toThrow(/exactly one root/);
+    const cycle = flow();
+    cycle.edges.push({ edgeId: "cycle", sourceId: "join", targetId: "root", condition: { kind: "outcome", outcomes: ["succeeded"] } });
+    cycle.definitionSha256 = computeGraphDefinitionSha256(cycle);
+    expect(() => validateGraphFlow(cycle)).toThrow(/cycle/);
+    const dangling = flow();
+    dangling.edges[0]!.targetId = "missing";
+    dangling.definitionSha256 = computeGraphDefinitionSha256(dangling);
+    expect(() => validateGraphFlow(dangling)).toThrow(/unknown node/);
+    expect(() => validateGraphFlow({ ...flow(), budget: { maxNodes: 8, maxDepth: 3 } })).toThrow(/maxDepth|additional properties/);
+    const badRoute = flow();
+    badRoute.edges.push({ edgeId: "bad-route", sourceId: "join", targetId: "left", condition: { kind: "route", routes: ["maybe"] } });
+    badRoute.definitionSha256 = computeGraphDefinitionSha256(badRoute);
+    expect(() => validateGraphFlow(badRoute)).toThrow(/not declared/);
+    const secondRoot = flow();
+    secondRoot.nodes.push(node("second-root", "coordination"));
+    secondRoot.definitionSha256 = computeGraphDefinitionSha256(secondRoot);
+    expect(() => validateGraphFlow(secondRoot)).toThrow(/exactly one root/);
     const withProvider = flow();
-    expect(() => validateGraphFlow({ ...withProvider, nodes: [{ ...withProvider.nodes[0], provider: "caller-selected" }, ...withProvider.nodes.slice(1)] })).toThrow(/forbidden routing field/);
+    const providerDefinition = { ...withProvider, nodes: [{ ...withProvider.nodes[0], provider: "caller-selected" }, ...withProvider.nodes.slice(1)] };
+    providerDefinition.definitionSha256 = computeGraphDefinitionSha256(providerDefinition);
+    expect(() => validateGraphFlow(providerDefinition)).toThrow(/provider|additional/);
   });
 
   it("fans out, waits for all_success, and terminally skips an inactive route", () => {
@@ -62,8 +89,14 @@ describe("graph flow contracts and reducer", () => {
 
   it("opens all_terminal after failure but blocks an all_success join", () => {
     const definition = flow();
-    definition.edges[2] = { from: "left", to: "join", join: "all_terminal" };
-    definition.edges[3] = { from: "right", to: "join", join: "all_terminal" };
+    definition.nodes[3]!.joinPolicy = "all_terminal";
+    definition.edges.push({
+      edgeId: "left-join-failed",
+      sourceId: "left",
+      targetId: "join",
+      condition: { kind: "outcome", outcomes: ["failed"] },
+    });
+    definition.definitionSha256 = computeGraphDefinitionSha256(definition);
     const graph = validateGraphFlow(definition).graph;
     let state = reduceFlow(graph, initialFlowState(graph), { type: "node_succeeded", nodeId: "root", result: { route: "yes" } });
     state = reduceFlow(graph, state, { type: "node_failed", nodeId: "left" });

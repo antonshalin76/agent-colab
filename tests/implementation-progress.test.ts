@@ -19,6 +19,7 @@ const fixture = () => {
   const root = mkdtempSync(join(tmpdir(), "agent-collab-progress-")); roots.push(root);
   cpSync(join(repo, "docs"), join(root, "docs"), { recursive: true }); cpSync(join(repo, "repo-c4.json"), join(root, "repo-c4.json"));
   cpSync(join(repo, "evals"), join(root, "evals"), { recursive: true });
+  rmSync(join(root, "docs", "hybrid-flow-v1-r2", "stage-close", "pre-v4"), { recursive: true, force: true });
   return root;
 };
 
