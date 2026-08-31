@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "test-evidence/v1",
+  "stageId": "STG-01",
+  "sourceFingerprint": "b9699e89eb40e5bef1ea96111a61ab3a3c1d4d4b171f4ded9f663e98009b77b9",
+  "commands": [
+    { "command": "npm test -- --run tests/flow-contract.test.ts tests/graph-core.test.ts --maxWorkers=1 --no-file-parallelism", "result": "59/59 PASS" },
+    { "command": "npm test -- --run tests/implementation-progress.test.ts --maxWorkers=1 --no-file-parallelism", "result": "12/12 PASS" },
+    { "command": "npm run typecheck", "result": "PASS" },
+    { "command": "npm run build", "result": "PASS" },
+    { "command": "git diff --check", "result": "PASS" },
+    { "command": "npm test -- --maxWorkers=1 --no-file-parallelism", "result": "67 files, 1525/1525 PASS, 767.36 s" }
+  ],
+  "priorFullRun": {
+    "result": "66 files and 1524 tests passed; one progress-fixture isolation test failed",
+    "correction": "the temporary fixture now removes copied real R2 pre-v4 evidence before creating its synthetic sequence-1 chain; isolated rerun 12/12 PASS"
+  },
+  "recordedAt": "2026-09-01T06:22:49+08:00"
+}

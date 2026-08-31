@@ -51,7 +51,7 @@ progress verifier accepts the complete chain.
 
 ## Inherited stages
 
-- [ ] `STG-01` Immutable graph and result contracts.
+- [x] `STG-01` Immutable graph and result contracts.
 - [ ] `STG-02` Deployed compatibility runtime.
 - [ ] `STG-03` Additive schema v4.
 - [ ] `STG-04` Event/session telemetry on the linear path.
@@ -66,17 +66,21 @@ progress verifier accepts the complete chain.
 
 ## Current measured progress
 
-- Closed implementation stages: `1/13`.
+- Closed implementation stages: `2/13`.
 - `R2-STG-00` readiness gates with evidence: `13/13`.
-- Frozen graph capability stages closed: `0/12`.
+- Frozen graph capability stages closed: `1/12`.
 - Deterministic graph eval capability: `12/12` PASS on the candidate versus
   `0/12` PASS on baseline SHA `d0f6cda738cf08ff851f14192ff48e636c1f0f17`.
 - Stage checkboxes remain open until their mandatory architect audit,
   stage-close evidence, commit, and push gates are satisfied; functional eval
   success is not substituted for formal stage closure.
-- Current repository gate: `65/65` files and `1469/1469` tests PASS; the older
+- Current repository gate: `67/67` files and `1525/1525` tests PASS; the older
   numeric minima in G7 remain satisfied by the larger current suite.
 - Exact reviewed R2 source: `1e652ef1e48d7cc7487c7cea21e79554a839b1ee`,
   pushed to `origin/master`.
-- Next authoritative transition: execute inherited `STG-01` through `STG-12`
+- Exact reviewed STG-01 source: `b31a83917182ef4d406040e74e9fb31c42f6570e`,
+  pushed to `origin/master`; progress event `98e901f40784a4b7d2bba23847b80e491f808eb710e14f9ce2fc59f070bb8b97`.
+- Production runtime remains under unconditional quarantine until the certified
+  STG-12 cutover.
+- Next authoritative transition: execute inherited `STG-02` through `STG-12`
   in immutable order.

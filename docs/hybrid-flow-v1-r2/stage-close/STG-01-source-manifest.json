@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "source-manifest/v1",
+  "stageId": "STG-01",
+  "sourceCommit": "b31a83917182ef4d406040e74e9fb31c42f6570e",
+  "files": {
+    "src/workflow/flow-contract.ts": "3ce823fce9ad27f4eec2c39e6875f9a84a85ac29fb392cf36330c4d92f056a9c",
+    "src/workflow/flow-graph.ts": "5537f34603ec0d8a4649f04a681c9d07679fc9e17ee16faa9efd27152577f18c",
+    "tests/flow-contract.test.ts": "39f1d8c6d08b705ceb6e94325ca5e465b59a87c6dca42f1daa8b0121ffa978eb",
+    "tests/graph-core.test.ts": "8742c84cc7ff2a7f341a489ebb7d44e8df017a75a351617009e131524e2a7212",
+    "tests/implementation-progress.test.ts": "c0322e42621476ad7df3de9be4b01e8247cd7167098944640860e0ecbd4a73fc"
+  },
+  "verification": {
+    "focused": "59/59 PASS",
+    "progressFixture": "12/12 PASS",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "diffCheck": "PASS",
+    "repository": "67 files, 1525/1525 PASS"
+  }
+}

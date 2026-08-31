@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "review-receipt/v1",
+  "agent": "codex",
+  "role": "auditor",
+  "attemptId": "codex-stg-01-final-auditor-20260901",
+  "sourceFingerprint": "b9699e89eb40e5bef1ea96111a61ab3a3c1d4d4b171f4ded9f663e98009b77b9",
+  "reviewVerdict": {
+    "schemaVersion": "review-verdict/v1",
+    "verdict": "PASS",
+    "findings": [
+      { "risk_level": "info", "message": "Canonical graph and result contracts, immutable topology, exact identities, truthful usage, and compatibility fixture isolation satisfy STG-01." }
+    ]
+  }
+}
