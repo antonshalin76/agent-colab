@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "source-manifest/v1",
+  "stageId": "STG-03",
+  "sourceCommit": "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50",
+  "sourceCommits": [
+    "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50"
+  ],
+  "reviewedWorkspaceFingerprint": "a6ecbb4c1535e9ec24842d9be589560a2f8fcb01e7d84e5c47490d108853da55",
+  "files": {
+    "repo-c4.json": "e96ba28f603025c796c6e328226335c4ee94892da7e0ecec1241104679865784",
+    "src/migration/coordinator.ts": "448f8a55531ee72602cbaedc93be38b7fdb08ce113f84168d0b41622f9e04ffc",
+    "src/migration/operational-restore.ts": "239f0afed74eccc202488cc11e82bd28f55fccc4c700fba8e0f7c3983e8a4de8",
+    "src/migration/graph-v4-schema.ts": "664df85727221a68f79b3f915ff54a32c8fcf3d0cab74b3c861e70e2742a798c",
+    "src/migration/state-v4-restore-authority.ts": "f0a979b1ef7c3e92225040658e7571dfc271293819048d00a36f0eb7e1d7c6e7",
+    "src/store/state-layout.ts": "81956bb61bc119b15c8c4295cb9fec71ee1d43defe95640b3bf32c2fac804bf5",
+    "src/store/state-database-fence.ts": "57f41eee4bfa47526bf5a1aa5d5c6a666d27335d414254ada2e6bbf441fac51d",
+    "src/store/graph-flow-store.ts": "0d91e217aa63eb58caf63f651dda49be9329e1b3ce3034075d749a7240e2ceb7",
+    "tests/migration-v4.test.ts": "febd9a0e5e9b33a1acae2cd2dd1b92e9ee60f21969b46f5355c66745b8cc831b",
+    "tests/graph-flow-store.test.ts": "c8766e11759eee14aee37c665b96dd60b6685617ee1f41d35e4d0ee97c60a386",
+    "tests/state-database-fence.test.ts": "bcb42b13a50d99a006684d3c139a960cf7ef27948ffc4181e5dc58a954397b71",
+    "tests/state-fence-architecture.test.ts": "c3623546ccd716b972ae15b1d91a7b221dc9d432053adb10080762281449c698",
+    "tests/schema-compatibility.test.ts": "f827fe09169e5d812181a33ef9e53aca212a24fa802446bd971f0f070551e308",
+    "tests/helpers/state-database.ts": "9bfcd9311c69e19b2dc32a2908ebb2afd2f64ba0ebd0aae7401ccd662770a801"
+  },
+  "buildArtifact": {
+    "path": "dist/cli.js",
+    "sha256": "59dee4901ce66067ec88361ae870ad2ad7e24dae10a3ae9dfc5be31e01d8e791"
+  },
+  "verification": {
+    "focused": "8 files, 138/138 PASS",
+    "fixtureContract": "8 files, 102/102 PASS",
+    "integration": "24 files, 454/454 PASS",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "mapVerify": "PASS",
+    "repoC4": "PASS",
+    "diffCheck": "PASS",
+    "monolithicRepository": "INCONCLUSIVE: host ext4 jbd2_log_wait_commit stalled the worker twice; two observed 5-second timeouts passed 2/2 in isolation"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "review-barrier-evidence/v1",
+  "stageId": "STG-03",
+  "gateId": "STG-03",
+  "sourceFingerprint": "77aded37d2f062601b5bf40dcd284052db90bb2d31b4e44746891f0737acd6a8",
+  "satisfied": true,
+  "requiredCount": 2,
+  "terminalCount": 2,
+  "requiredReceipts": [
+    {
+      "agent": "codex",
+      "role": "auditor",
+      "attemptId": "codex-stg-03-final-auditor-20260901",
+      "receiptSha256": "d29914f5142d7ea6fd7269653e4a9dceef2abc65ce0cc1dc2323c08dd7124350"
+    },
+    {
+      "agent": "codex",
+      "role": "critic",
+      "attemptId": "codex-stg-03-final-critic-20260901",
+      "receiptSha256": "0a3e08e7b3e91bd4232cd4d464d26a5510adf2974ecd380bb46eeb8e8e1b7443"
+    }
+  ],
+  "optionalLanes": [
+    { "agent": "grok", "role": "auditor", "status": "optional_unavailable" },
+    { "agent": "grok", "role": "critic", "status": "optional_unavailable" },
+    { "agent": "claude", "role": "auditor", "status": "optional_unavailable" },
+    { "agent": "claude", "role": "critic", "status": "optional_unavailable" }
+  ],
+  "optionalStatusSha256": "fd8aab0952d4f3c1aee2137bc9e058463a7d0050eec833f71bd8fc8b928d1751",
+  "ambiguousLaunchedAttempts": 0
+}

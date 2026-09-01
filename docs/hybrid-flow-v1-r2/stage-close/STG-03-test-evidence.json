@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "test-evidence/v1",
+  "stageId": "STG-03",
+  "sourceFingerprint": "77aded37d2f062601b5bf40dcd284052db90bb2d31b4e44746891f0737acd6a8",
+  "commands": [
+    {
+      "command": "npm test -- --run tests/migration-v4.test.ts tests/graph-flow-store.test.ts tests/state-database-fence.test.ts tests/state-fence-architecture.test.ts tests/schema-compatibility.test.ts tests/operational-restore.test.ts tests/cli-v4-migration.test.ts tests/execution-admission.test.ts --maxWorkers=1 --no-file-parallelism",
+      "result": "8 files, 138/138 PASS"
+    },
+    {
+      "command": "npm run typecheck && git diff --check && npx vitest run tests/review-evidence-capture.test.ts tests/routing-v5-contract.test.ts tests/execution-admission.test.ts tests/review-v3-schema-signature.test.ts tests/evidence-ledger.test.ts tests/runtime-provider-health.test.ts tests/worktree-lease.test.ts tests/store.test.ts --maxWorkers=1 --no-file-parallelism",
+      "result": "8 files, 102/102 PASS"
+    },
+    {
+      "command": "npm run test:flow",
+      "result": "24 files, 454/454 PASS, 271.28 s"
+    },
+    {
+      "command": "npm test -- --run tests/app-service.test.ts -t 'serializes concurrent enqueue|does not claim a second run' --maxWorkers=1 --no-file-parallelism",
+      "result": "2/2 PASS, 4.13 s"
+    },
+    { "command": "npm run typecheck", "result": "PASS" },
+    { "command": "npm run build", "result": "PASS" },
+    { "command": "npm run map:verify", "result": "PASS, MAP 3.28.1" },
+    {
+      "command": "python3 /home/anton/.agents/skills/repo-c4-scan/scripts/generate_repo_c4.py .",
+      "result": "PASS; generated index was then semantically corrected from the false web-app/Vite classification to the reviewed CLI/stdio-MCP/private-SQLite topology"
+    },
+    {
+      "command": "python3 /home/anton/.agents/skills/repo-c4-scan/scripts/validate_repo_c4.py repo-c4.json",
+      "result": "PASS after semantic correction"
+    },
+    { "command": "git diff --check", "result": "PASS" }
+  ],
+  "monolithicRepositoryRun": {
+    "result": "INCONCLUSIVE",
+    "attempts": 2,
+    "reason": "The host worker entered kernel D state in jbd2_log_wait_commit during both attempts.",
+    "findings": [
+      "The first attempt exposed stale fixture construction; the fixture contract and all eleven store constructors were corrected as one ownership boundary.",
+      "The second attempt exposed only two default five-second app-service timeouts under filesystem contention; the same scenarios passed 2/2 in isolation in 4.13 seconds."
+    ],
+    "disposition": "Not used as the STG-03 oracle. The frozen mandatory focused, flow, type, build, MAP, C4, and diff gates are terminal PASS."
+  },
+  "recordedAt": "2026-09-01T15:48:00+08:00"
+}

@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "PlanProgressEvent/v1",
+  "eventId": "stg-03-pass",
+  "sequence": 4,
+  "previousEventSha256": "924887cd4205a7b5b9a9fabad426162d32c3ec6da886eff24b8bc074ba0c5469",
+  "startSha256": "851b7136b5642360481b9896b154745bb8bee06adcc0017058cd964add396aee",
+  "eventType": "step_completed",
+  "planId": "agent-collab-hybrid-flow-v1-r2",
+  "effectivePlanSha256": "af9191ea30d500de7f53cfdb57a890bfc7c1e55df3d3e738ed667bce7a787224",
+  "stageId": "STG-03",
+  "gateId": "STG-03",
+  "sourceFingerprint": "77aded37d2f062601b5bf40dcd284052db90bb2d31b4e44746891f0737acd6a8",
+  "actor": "codex:/root",
+  "commandOrOracle": {
+    "kind": "oracle",
+    "artifactPath": "docs/hybrid-flow-v1-r2/stage-close/STG-03-terminal-oracle.json",
+    "sha256": "55948788c9d6d635a6d2bd517bd496b7c30585782039bc30890238e6d6abb3f2"
+  },
+  "inputHashes": [
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/STG-03-source-manifest.json",
+      "sha256": "77aded37d2f062601b5bf40dcd284052db90bb2d31b4e44746891f0737acd6a8"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/STG-03-audit-packet.md",
+      "sha256": "aa895981bf51c2e197be9fe2fc24d13f461880d755bbe146bea6d25410ebe62f"
+    }
+  ],
+  "outputHashes": [
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/STG-03-test-evidence.json",
+      "sha256": "2fddeef9fdd3902cd1188d2a4a23a36ba12a7af315aa07736ff776463340c0eb"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/STG-03-optional-providers.json",
+      "sha256": "fd8aab0952d4f3c1aee2137bc9e058463a7d0050eec833f71bd8fc8b928d1751"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/STG-03-barrier.json",
+      "sha256": "4ca2c66abf31ba269f566befdd52ed22ac59e79be21a6a38ff451a62b81830bf"
+    },
+    {
+      "path": "docs/hybrid-flow-v1-r2/stage-close/STG-03-terminal-oracle.json",
+      "sha256": "55948788c9d6d635a6d2bd517bd496b7c30585782039bc30890238e6d6abb3f2"
+    }
+  ],
+  "attemptIds": [
+    "codex-stg-03-final-auditor-20260901",
+    "codex-stg-03-final-critic-20260901"
+  ],
+  "reviewReceiptHashes": [
+    {
+      "agent": "codex",
+      "role": "auditor",
+      "attemptId": "codex-stg-03-final-auditor-20260901",
+      "artifactPath": "docs/hybrid-flow-v1-r2/stage-close/STG-03-codex-auditor-receipt.json",
+      "sha256": "d29914f5142d7ea6fd7269653e4a9dceef2abc65ce0cc1dc2323c08dd7124350"
+    },
+    {
+      "agent": "codex",
+      "role": "critic",
+      "attemptId": "codex-stg-03-final-critic-20260901",
+      "artifactPath": "docs/hybrid-flow-v1-r2/stage-close/STG-03-codex-critic-receipt.json",
+      "sha256": "0a3e08e7b3e91bd4232cd4d464d26a5510adf2974ecd380bb46eeb8e8e1b7443"
+    }
+  ],
+  "artifactPaths": [
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-audit-packet.md",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-barrier.json",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-codex-auditor-receipt.json",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-codex-critic-receipt.json",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-optional-providers.json",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-source-manifest.json",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-terminal-oracle.json",
+    "docs/hybrid-flow-v1-r2/stage-close/STG-03-test-evidence.json"
+  ],
+  "terminalResult": "PASS",
+  "recordedAt": "2026-09-01T15:48:00+08:00",
+  "eventSha256": "6685e9a79886b7f895fb4533b2f95d5c03e3a544bc3c4a99b48b6d46527bf12d"
+}

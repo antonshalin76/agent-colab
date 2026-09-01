@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "terminal-oracle/v1",
+  "stageId": "STG-03",
+  "gateId": "STG-03",
+  "sourceFingerprint": "77aded37d2f062601b5bf40dcd284052db90bb2d31b4e44746891f0737acd6a8",
+  "terminalResult": "PASS",
+  "checks": {
+    "codexAuditor": "PASS",
+    "codexCritic": "PASS",
+    "grokAuditor": "optional_unavailable",
+    "grokCritic": "optional_unavailable",
+    "claudeAuditor": "optional_unavailable",
+    "claudeCritic": "optional_unavailable",
+    "ambiguousAttempts": 0,
+    "focusedTests": "8 files, 138/138 PASS",
+    "fixtureContractTests": "8 files, 102/102 PASS",
+    "flowIntegrationTests": "24 files, 454/454 PASS, 271.28 s",
+    "filesystemSensitiveIsolation": "2/2 PASS, 4.13 s",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "mapVerify": "PASS",
+    "repoC4": "PASS",
+    "diffCheck": "PASS",
+    "monolithicRepository": "INCONCLUSIVE_HOST_FILESYSTEM_NOT_ORACLE",
+    "graphExecution": "disabled",
+    "productionMcpWorkerQuarantine": "enabled"
+  },
+  "recordedAt": "2026-09-01T15:48:00+08:00"
+}
