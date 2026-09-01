@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "source-manifest/v1",
+  "stageId": "STG-02",
+  "sourceCommit": "2f10c719690063cf2546e16fb21dadefd2610f6b",
+  "sourceCommits": [
+    "6c9bd8536d1ceffd447e89296aa9c03e0708a5e5",
+    "2f10c719690063cf2546e16fb21dadefd2610f6b"
+  ],
+  "files": {
+    "src/cli.ts": "469c8809a3190777b78b64ff4765feed21d326750e40baf6e4e35efd4a425cbc",
+    "src/migration/coordinator.ts": "98d3db85e0b8faf655f3cfb586b8dc6b0ada5b18cfe751ce280816ad9c15a308",
+    "src/store/state-layout.ts": "18a0538a4a0af0c48e7d217a83783cc127c52ed9116685ab8e427ee0d728d829",
+    "tests/schema-compatibility.test.ts": "044eb2d508b3b2fb5014ef380d8541ced03d2813d9f9ae9da6b053db076b91b0"
+  },
+  "buildArtifact": {
+    "path": "dist/cli.js",
+    "sha256": "181437d0d3ff7711fb2c2ff59f268c90c821cf48b45290b82daaabe122dfaac6"
+  },
+  "verification": {
+    "focused": "7 files, 86/86 PASS",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "diffCheck": "PASS",
+    "repository": "68 files, 1550/1550 PASS, 743.82 s",
+    "productionPreflight": "PASS"
+  }
+}

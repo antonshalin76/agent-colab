@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "review-receipt/v1",
+  "agent": "codex",
+  "role": "critic",
+  "attemptId": "codex-stg-02-final-critic-20260901",
+  "reviewerTask": "/root/release_audit",
+  "sourceFingerprint": "fe6b4e76630498dd05b2b585cdf36de4beafa517c182bf0de35bcb6a423b506a",
+  "reviewVerdict": {
+    "schemaVersion": "review-verdict/v1",
+    "verdict": "PASS",
+    "findings": [
+      {
+        "risk_level": "info",
+        "message": "Attacks on partial DDL, altered indexes, commented unique-index bypasses, stale concurrent reads, file creation, and real-store replay/conflict equivalence are closed by source checks and regression tests."
+      }
+    ]
+  }
+}

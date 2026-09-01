@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "test-evidence/v1",
+  "stageId": "STG-02",
+  "sourceFingerprint": "fe6b4e76630498dd05b2b585cdf36de4beafa517c182bf0de35bcb6a423b506a",
+  "commands": [
+    {
+      "command": "npm test -- --run tests/schema-compatibility.test.ts tests/migration-v2.test.ts tests/migration-v3.test.ts tests/run-store.test.ts tests/provider-health-store.test.ts tests/cli.test.ts tests/production-quarantine.test.ts --maxWorkers=1 --no-file-parallelism",
+      "result": "7 files, 86/86 PASS"
+    },
+    { "command": "npm run typecheck", "result": "PASS" },
+    { "command": "npm run build", "result": "PASS" },
+    { "command": "git diff --check", "result": "PASS" },
+    {
+      "command": "npm test -- --maxWorkers=1 --no-file-parallelism",
+      "result": "68 files, 1550/1550 PASS, 743.82 s"
+    },
+    {
+      "command": "node dist/cli.js compatibility-status",
+      "result": "PASS on production state/history 3/2 in read_only mode with graph execution disabled"
+    }
+  ],
+  "faultFoundAndClosed": {
+    "symptom": "the first full run rejected historical production schema fingerprints through a legacy migration verifier",
+    "correction": "exact historical state/history profiles were added to the compatibility boundary; the general legacy verifier remained non-strict",
+    "regression": "focused 86/86 and repository 1550/1550 both PASS after the correction"
+  },
+  "deployRestartReopenReceipt": {
+    "path": "docs/hybrid-flow-v1-r2/stage-close/STG-02-deploy-restart-reopen.json",
+    "sha256": "d6a5788e321c70ae2d360df4d44ca62dbcac9fe2e71ec44883fdea7eec1a602c",
+    "result": "PASS"
+  },
+  "recordedAt": "2026-09-01T07:58:46+08:00"
+}

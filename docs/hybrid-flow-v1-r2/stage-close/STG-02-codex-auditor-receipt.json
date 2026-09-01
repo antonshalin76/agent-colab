@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "review-receipt/v1",
+  "agent": "codex",
+  "role": "auditor",
+  "attemptId": "codex-stg-02-final-auditor-20260901",
+  "reviewerTask": "/root/activation_surface",
+  "sourceFingerprint": "fe6b4e76630498dd05b2b585cdf36de4beafa517c182bf0de35bcb6a423b506a",
+  "reviewVerdict": {
+    "schemaVersion": "review-verdict/v1",
+    "verdict": "PASS",
+    "findings": [
+      {
+        "risk_level": "info",
+        "message": "The compatibility-only runtime is read-only, hard-disables graph execution and all service surfaces, validates exact v3/v4 schema profiles, and preserves the production quarantine."
+      }
+    ]
+  }
+}

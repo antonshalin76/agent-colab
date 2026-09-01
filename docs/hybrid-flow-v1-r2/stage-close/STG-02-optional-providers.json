@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "optional-review-status/v1",
+  "stageId": "STG-02",
+  "providers": {
+    "grok": {
+      "auditor": "optional_unavailable",
+      "critic": "optional_unavailable",
+      "reason": "fixed certification launch cap exhausted; no new launch admitted"
+    },
+    "claude": {
+      "auditor": "optional_unavailable",
+      "critic": "optional_unavailable",
+      "reason": "fixed certification launch cap exhausted; no new launch admitted"
+    }
+  },
+  "requiredTopology": {
+    "codex": ["auditor", "critic"],
+    "grok": ["auditor", "critic"],
+    "claude": ["auditor", "critic"]
+  },
+  "blockingPolicy": "codex_pair_required_optional_pairs_non_blocking_when_unavailable",
+  "automaticRejoin": "enabled_by_runtime_health_admission_when_capacity_and_provider_health_return",
+  "ambiguousLaunchedAttempts": 0,
+  "completedChangesRequested": 0,
+  "certificationLaunchesConsumed": 40,
+  "certificationLaunchCap": 40,
+  "newLaunchesForStage": 0,
+  "knownCostUsd": null,
+  "costStatus": "unknown_no_further_live_launch_authorized",
+  "recordedAt": "2026-09-01T07:58:46+08:00"
+}

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "terminal-oracle/v1",
+  "stageId": "STG-02",
+  "gateId": "STG-02",
+  "sourceFingerprint": "fe6b4e76630498dd05b2b585cdf36de4beafa517c182bf0de35bcb6a423b506a",
+  "terminalResult": "PASS",
+  "checks": {
+    "codexAuditor": "PASS",
+    "codexCritic": "PASS",
+    "grokAuditor": "optional_unavailable",
+    "grokCritic": "optional_unavailable",
+    "claudeAuditor": "optional_unavailable",
+    "claudeCritic": "optional_unavailable",
+    "ambiguousAttempts": 0,
+    "focusedTests": "7 files, 86/86 PASS",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "repositoryTests": "68 files, 1550/1550 PASS, 743.82 s",
+    "productionPreflight": "PASS",
+    "deployRestartReopen": "PASS",
+    "physicalDatabaseHashesUnchanged": true,
+    "graphExecution": "disabled",
+    "productionMcpWorkerQuarantine": "masked_inactive_no_process"
+  },
+  "recordedAt": "2026-09-01T07:58:46+08:00"
+}

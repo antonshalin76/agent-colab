@@ -1,0 +1,116 @@
+{
+  "schemaVersion": "deploy-restart-reopen-receipt/v1",
+  "stageId": "STG-02",
+  "actor": "codex:/root",
+  "authority": {
+    "consumer": "codex:/root:hybrid-flow-v1-r2",
+    "receiptSha256": "d26b47fd2f13eab1b3c2d717c390315edded3251546700b74aceb5d29c3c1ebb"
+  },
+  "sourceCommit": "2f10c719690063cf2546e16fb21dadefd2610f6b",
+  "artifact": {
+    "path": "dist/cli.js",
+    "sha256": "181437d0d3ff7711fb2c2ff59f268c90c821cf48b45290b82daaabe122dfaac6",
+    "packageLockSha256": "bf41fadea55441e1d4d3c65472293cebb642e2fd86405e003ac7a0218575bf5a"
+  },
+  "deployment": {
+    "manager": "systemd --user transient service",
+    "unit": "agent-collab-compatibility-r2.service",
+    "command": "/home/anton/.nvm/versions/node/v24.14.1/bin/node /home/anton/Source/agent-collab/dist/cli.js compatibility-runtime",
+    "workingDirectory": "/home/anton/Source/agent-collab",
+    "stateDirectory": "/home/anton/.local/share/agent-collab",
+    "persistentProductionUnit": {
+      "unit": "agent-collab.service",
+      "enabledState": "masked",
+      "activeState": "inactive",
+      "repositoryUnitSha256": "d9cedc4c09a19f5210a8b8886911c1fc0a7d059deff1a899fa06e8d7f5c6b08a"
+    }
+  },
+  "firstOpen": {
+    "systemd": {
+      "pid": 343583,
+      "invocationId": "c6f68ca6f72c48c0b311690af7625432",
+      "activeEnterTimestamp": "2026-09-01T07:55:02+08:00"
+    },
+    "emittedObservation": {
+      "schemaVersion": "compatibility-runtime-process-observation/v1",
+      "processId": 343583,
+      "startedAt": "2026-08-31T23:55:03.036Z",
+      "graphExecution": "disabled",
+      "serviceSurface": "compatibility_only",
+      "queueClaim": "disabled",
+      "providerLaunch": "disabled",
+      "mcpServing": "disabled",
+      "compatibility": {
+        "schemaVersion": "compatibility-runtime-open-observation/v1",
+        "stateVersion": 3,
+        "historyVersion": 2,
+        "openMode": "read_only",
+        "graphExecution": "disabled",
+        "graphSchema": "absent",
+        "reviewSchema": "routing_v5",
+        "stateProfile": "v3_routing_v5",
+        "stateSchemaSha256": "b6557d9b5d3c28d98955f8302c9187ce97aa4d10301d3a7523ea6786e131253d",
+        "historySchemaSha256": "41ab7b8cb238d4c53cd8aceb3428972fe1f24d5d30b2349ed41d308e9025dea3",
+        "integrity": { "state": "ok", "history": "ok", "foreignKeys": "ok" }
+      }
+    }
+  },
+  "restartOpen": {
+    "systemd": {
+      "pid": 349790,
+      "invocationId": "251a0c0c797c4353b8bf89c5e99ec4e3",
+      "activeEnterTimestamp": "2026-09-01T07:55:32+08:00",
+      "verifiedAt": "2026-09-01T07:58:46+08:00",
+      "activeState": "active",
+      "subState": "running"
+    },
+    "emittedObservation": {
+      "schemaVersion": "compatibility-runtime-process-observation/v1",
+      "processId": 349790,
+      "startedAt": "2026-08-31T23:55:32.825Z",
+      "graphExecution": "disabled",
+      "serviceSurface": "compatibility_only",
+      "queueClaim": "disabled",
+      "providerLaunch": "disabled",
+      "mcpServing": "disabled",
+      "compatibility": {
+        "schemaVersion": "compatibility-runtime-open-observation/v1",
+        "stateVersion": 3,
+        "historyVersion": 2,
+        "openMode": "read_only",
+        "graphExecution": "disabled",
+        "graphSchema": "absent",
+        "reviewSchema": "routing_v5",
+        "stateProfile": "v3_routing_v5",
+        "stateSchemaSha256": "b6557d9b5d3c28d98955f8302c9187ce97aa4d10301d3a7523ea6786e131253d",
+        "historySchemaSha256": "41ab7b8cb238d4c53cd8aceb3428972fe1f24d5d30b2349ed41d308e9025dea3",
+        "integrity": { "state": "ok", "history": "ok", "foreignKeys": "ok" }
+      }
+    }
+  },
+  "physicalHashes": {
+    "beforeFirstOpen": {
+      "collaboration.db": "f24a5a8e415bdd2e8f1ce9a882c223f71ba95b147c7711b2d789628d7fec2db4",
+      "collaboration.db-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "collaboration.db-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+      "history.db": "1b00c7e391a9d1d532d529a03661fa41b4ca3a11658ff9381969ce36bf1f63f2",
+      "history.db-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "history.db-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    "afterRestartVerification": {
+      "collaboration.db": "f24a5a8e415bdd2e8f1ce9a882c223f71ba95b147c7711b2d789628d7fec2db4",
+      "collaboration.db-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "collaboration.db-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+      "history.db": "1b00c7e391a9d1d532d529a03661fa41b4ca3a11658ff9381969ce36bf1f63f2",
+      "history.db-wal": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "history.db-shm": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+    },
+    "unchanged": true
+  },
+  "independence": {
+    "runtimeSelfCertificationAccepted": false,
+    "externalSystemdAndHashVerification": true,
+    "mcpOrWorkerProcessesObserved": 0
+  },
+  "result": "PASS"
+}
