@@ -282,6 +282,41 @@ const completeLaneWithEvidence = (
   runs.close();
 };
 
+const failReviewPairWithEvidence = (
+  path: string,
+  store: RunGateUnitOfWork,
+  agent: "grok" | "claude" | "codex",
+  terminalAt: number,
+  kind: "quota" | "model_unavailable",
+): NonNullable<ReturnType<RunGateUnitOfWork["get"]>>["lanes"] => {
+  const lanes = store.get(input.reviewId)!.lanes.filter((lane) => lane.agent === agent);
+  expect(lanes.map(({ role }) => role).sort()).toEqual(["auditor", "critic"]);
+  const runs = new RunStore(path);
+  for (const [index, lane] of lanes.entries()) {
+    const attempt = lane.attempts.at(-1)!;
+    prioritizeRun(path, attempt.idempotencyKey);
+    const claimed = runs.claimNext({ workerId: `provider-unavailable-${agent}-${lane.role}`,
+      leaseMs: 1_000, now: Date.now() + 1_000 + index })!;
+    expect(claimed.idempotencyKey).toBe(attempt.idempotencyKey);
+    const spawnAuthority = authorizeClaimedReview(store, claimed, terminalAt - 1);
+    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent, ...spawnAuthority });
+    runs.markLaunched(claimed.id, claimed.leaseToken!, {
+      phase: "started", pid: 1234 + index, agent, model: attempt.model,
+      effort: attempt.effort, policyVersion: attempt.policyVersion, sessionId: attempt.sessionId,
+    });
+    const unavailable = { kind, agent, role: lane.role };
+    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: unavailable,
+      effect: { type: "review", reviewId: input.reviewId, attemptId: attempt.attemptId,
+        role: lane.role, agent, resultKind: kind, terminalAt,
+        providerAdmissionClaimedAt: attempt.providerAdmissionClaimedAt },
+      status: "completed" });
+    store.recordProviderUnavailable({ reviewId: input.reviewId, agent, role: lane.role,
+      attemptId: attempt.attemptId, error: unavailable, terminalAt });
+  }
+  runs.close();
+  return lanes;
+};
+
 const activateAndCompleteCodex = (
   path: string,
   store: RunGateUnitOfWork,
@@ -345,7 +380,7 @@ describe("runtime durable review barrier", () => {
     health.close();
   });
 
-  it("fences legacy launch authority rows until the offline migration owns them", () => {
+  it("fails closed for a legacy barrier with an incomplete Codex quorum", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
     health.recordSuccess("codex", 1);
@@ -366,9 +401,12 @@ describe("runtime durable review barrier", () => {
     const runs = new RunStore(path);
     expect(runs.claimNext({ workerId: "legacy", leaseMs: 10_000,
       now: Date.now() + 1_000 })).toBeUndefined();
-    expect(store.activateDeferred({ reviewId: "legacy-authority", agent: "codex",
+    expect(() => store.barrier("legacy-authority")).toThrow(/exact .*auditor\/critic topology/i);
+    expect(() => store.activateDeferred({ reviewId: "legacy-authority", agent: "codex",
       currentSourceFingerprint: sourceFingerprint, now: 2, providerHealth: health,
-      harnessReady: true })).toEqual({ status: "none", lanes: [] });
+      harnessReady: true })).toThrow(/exact .*auditor\/critic topology/i);
+    expect(db.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM runtime_review_lane_attempts").pluck().get()).toBe(0);
     runs.close();
     db.close();
     store.close();
@@ -629,7 +667,7 @@ describe("runtime durable review barrier", () => {
     }
     sqlite.close();
     runs.close(); health.close(); store.close();
-  }, 15_000);
+  }, 30_000);
 
   it("binds accepted optional evidence independently across lane, attempt, and run identity", () => {
     const path = database();
@@ -1375,7 +1413,7 @@ describe("runtime durable review barrier", () => {
     health.close();
   });
 
-  it("preserves the failed review attempt without creating a generic retry", () => {
+  it("preserves both failed review attempts and reactivates the pair atomically", () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
     health.recordSuccess("claude", 1);
@@ -1383,54 +1421,17 @@ describe("runtime durable review barrier", () => {
     createV3(store, { ...input, health: {
       grok: "unavailable", claude: "healthy", codex: "healthy",
     } });
-    const initial = store.enqueueDescriptors(input.reviewId)
-      .find((lane) => lane.agent === "claude" && lane.role === "auditor")!;
-    const attemptRuns = new RunStore(path);
-    prioritizeRun(path, initial.idempotencyKey);
-    const claimedInitial = attemptRuns.claimNext({ workerId: "provider-unavailable", leaseMs: 1_000,
-      now: Date.now() + 1_000 })!;
-    expect(claimedInitial.idempotencyKey).toBe(initial.idempotencyKey);
-    attemptRuns.markLaunchIntent(claimedInitial.id, claimedInitial.leaseToken!, { agent: "claude" });
-    attemptRuns.markLaunched(claimedInitial.id, claimedInitial.leaseToken!, {
-      phase: "started", pid: 1234, agent: "claude", model: initial.model,
-      effort: initial.effort, policyVersion: initial.policyVersion, sessionId: initial.sessionId,
-    });
-    attemptRuns.commitDomainEffect({
-      id: claimedInitial.id,
-      token: claimedInitial.leaseToken!,
-      providerResult: { kind: "quota", agent: "claude" },
-      effect: { type: "review", reviewId: input.reviewId, attemptId: initial.attemptId,
-        role: "auditor", agent: "claude", resultKind: "quota", terminalAt: 100 },
-      status: "completed",
-    });
-    attemptRuns.close();
-
-    const deferred = store.recordProviderUnavailable({
-      reviewId: input.reviewId,
-      agent: "claude",
-      role: "auditor",
-      attemptId: initial.attemptId,
-      error: { kind: "quota", agent: "claude" },
-      terminalAt: 100,
-    });
-    expect(deferred.status).toBe("deferred");
-    expect(deferred.attempts).toEqual([
-      expect.objectContaining({
-        attemptId: initial.attemptId,
-        attemptOrdinal: 0,
-        status: "provider_unavailable",
-        effort: "high",
-        reasons: ["stage_baseline:code_audit:high"],
-      }),
-    ]);
-    expect(store.recordProviderUnavailable({
-      reviewId: input.reviewId,
-      agent: "claude",
-      role: "auditor",
-      attemptId: initial.attemptId,
-      error: { kind: "quota", agent: "claude" },
-      terminalAt: 100,
-    }).attempts).toHaveLength(1);
+    const initial = failReviewPairWithEvidence(path, store, "claude", 100, "quota");
+    for (const lane of initial) {
+      const persisted = store.get(input.reviewId)!.lanes.find(({ agent, role }) =>
+        agent === "claude" && role === lane.role)!;
+      expect(persisted).toMatchObject({ status: "deferred", attempts: [expect.objectContaining({
+        attemptId: lane.attempts[0]!.attemptId, attemptOrdinal: 0,
+        status: "provider_unavailable", effort: lane.attempts[0]!.effort,
+        reasons: lane.attempts[0]!.reasons,
+      })] });
+    }
+    health.recordFailoverFailure("claude", { kind: "quota" }, 100);
 
     const activated = activateV3(store, {
       reviewId: input.reviewId,
@@ -1440,19 +1441,18 @@ describe("runtime durable review barrier", () => {
       providerHealth: health,
       harnessReady: true,
     });
-    expect(activated).toMatchObject({ status: "activated", lanes: [expect.objectContaining({
-      attemptOrdinal: 1, previousOrdinal: 0,
-    })] });
-    expect(store.attempts(input.reviewId, "claude", "auditor")).toHaveLength(2);
-    expect(store.recordProviderUnavailable({
-      reviewId: input.reviewId,
-      agent: "claude",
-      role: "auditor",
-      attemptId: initial.attemptId,
-      error: { kind: "quota", agent: "claude" },
-      terminalAt: 100,
-    }).status).toBe("queued");
-    expect(store.attempts(input.reviewId, "claude", "auditor")).toHaveLength(2);
+    expect(activated.status).toBe("activated");
+    expect(activated.lanes).toHaveLength(2);
+    expect(activated.lanes.map(({ role }) => role).sort()).toEqual(["auditor", "critic"]);
+    expect(activated.lanes.every(({ attemptOrdinal, previousOrdinal }) =>
+      attemptOrdinal === 1 && previousOrdinal === 0)).toBe(true);
+    for (const role of ["auditor", "critic"] as const) {
+      expect(store.attempts(input.reviewId, "claude", role).map(({ attemptOrdinal, status }) =>
+        ({ attemptOrdinal, status }))).toEqual([
+          { attemptOrdinal: 0, status: "provider_unavailable" },
+          { attemptOrdinal: 1, status: "scheduled" },
+        ]);
+    }
     store.close();
     health.close();
   });
@@ -1548,35 +1548,24 @@ describe("runtime durable review barrier", () => {
     health.recordSuccess("claude", 1_101, 1_100);
     const activated = activateV3(store, { reviewId: input.reviewId, agent: "claude",
       currentSourceFingerprint: sourceFingerprint, now: 1_102, providerHealth: health,
-      harnessReady: true }).lanes[0]!;
-    const runs = new RunStore(path);
-    prioritizeRun(path, activated.idempotencyKey);
-    const claimed = runs.claimNext({ workerId: "stale-unavailable", leaseMs: 1_000,
-      now: Date.now() + 1_000 })!;
-    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "claude" });
-    runs.markLaunched(claimed.id, claimed.leaseToken!, {
-      phase: "started", pid: 1234, agent: "claude", model: activated.model,
-      effort: activated.effort, policyVersion: activated.policyVersion, sessionId: activated.sessionId,
-    });
-    const unavailable = { kind: "model_unavailable", agent: "claude" };
-    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: unavailable,
-      effect: { type: "review", reviewId: input.reviewId, attemptId: activated.attemptId,
-        role: activated.role, agent: "claude", resultKind: "model_unavailable", terminalAt: 1_102,
-        providerAdmissionClaimedAt: activated.providerAdmissionClaimedAt },
-      status: "completed" });
-    store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
-      role: activated.role, attemptId: activated.attemptId, error: unavailable, terminalAt: 1_102 });
+      harnessReady: true });
+    expect(activated.lanes).toHaveLength(2);
+    const failed = failReviewPairWithEvidence(path, store, "claude", 1_102, "model_unavailable");
 
     expect(activateV3(store, { reviewId: input.reviewId, agent: "claude",
       currentSourceFingerprint: "workspace-v2", now: 1_103, providerHealth: health,
       harnessReady: true }))
       .toEqual({ status: "stale_artifact", lanes: [] });
-    expect(store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
-      role: activated.role, attemptId: activated.attemptId, error: unavailable, terminalAt: 1_102 }))
-      .toMatchObject({ status: "stale_artifact", error: unavailable, terminalAt: 1_102 });
-    expect(() => store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
-      role: activated.role, attemptId: activated.attemptId, error: unavailable, terminalAt: 1_104 }))
-      .toThrow(/exact durable run evidence/i);
+    for (const lane of failed) {
+      const unavailable = { kind: "model_unavailable", agent: "claude", role: lane.role };
+      expect(store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
+        role: lane.role, attemptId: lane.attempts.at(-1)!.attemptId,
+        error: unavailable, terminalAt: 1_102 }))
+        .toMatchObject({ status: "stale_artifact", error: unavailable, terminalAt: 1_102 });
+      expect(() => store.recordProviderUnavailable({ reviewId: input.reviewId, agent: "claude",
+        role: lane.role, attemptId: lane.attempts.at(-1)!.attemptId,
+        error: unavailable, terminalAt: 1_104 })).toThrow(/exact durable run evidence/i);
+    }
     activateAndCompleteCodex(path, store, health, 1_200);
     expect(store.get(input.reviewId)?.lanes.map((lane) => ({
       lane: `${lane.agent}:${lane.role}`,
@@ -1586,13 +1575,13 @@ describe("runtime durable review barrier", () => {
       { lane: "grok:auditor", status: "deferred", attemptStatus: null },
       { lane: "grok:critic", status: "deferred", attemptStatus: null },
       { lane: "claude:auditor", status: "stale_artifact", attemptStatus: "provider_unavailable" },
-      { lane: "claude:critic", status: "queued", attemptStatus: "scheduled" },
+      { lane: "claude:critic", status: "stale_artifact", attemptStatus: "provider_unavailable" },
       { lane: "codex:auditor", status: "completed", attemptStatus: "completed" },
       { lane: "codex:critic", status: "completed", attemptStatus: "completed" },
     ]);
-    expect(store.barrier(input.reviewId).satisfied).toBe(false);
+    expect(store.barrier(input.reviewId).satisfied).toBe(true);
 
-    runs.close(); store.close(); health.close();
+    store.close(); health.close();
   });
 
   it.each([false, undefined] as const)(

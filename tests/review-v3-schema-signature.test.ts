@@ -7,6 +7,7 @@ import { initializeCurrentExecutionSchema, MigrationCoordinator } from "../src/m
 import * as reviewV3Schema from "../src/migration/review-v3-schema.js";
 import { RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
 import { LocalCollabService } from "../src/app/service.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
 
 const roots: string[] = [];
 
@@ -329,8 +330,10 @@ describe("review-v3 exact schema signature", () => {
     const path = database();
     dropSchemaObject(path, "DROP TRIGGER runtime_review_authority_update_immutable");
     const before = schemaSnapshot(path);
+    const historyDatabase = join(dirname(path), "history.db");
+    createEmptyStateDatabase(historyDatabase);
     const coordinator = new MigrationCoordinator({ stateDatabase: path,
-      historyDatabase: join(dirname(path), "history.db") });
+      historyDatabase });
     expect(() => (writer as () => unknown).call(coordinator))
       .toThrow(/schema|signature|offline|repair/i);
     expect(schemaSnapshot(path)).toBe(before);

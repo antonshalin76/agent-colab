@@ -91,6 +91,18 @@ function seedV2(statePath: string, historyPath: string): void {
       capability_verified INTEGER NOT NULL DEFAULT 0 CHECK (capability_verified IN (0, 1)),
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE approval_grants (
+      reference TEXT NOT NULL, project TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
+      expires_at INTEGER NOT NULL, max_uses INTEGER NOT NULL CHECK (max_uses > 0),
+      used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count >= 0 AND used_count <= max_uses),
+      PRIMARY KEY (reference, project, scope)
+    );
+    CREATE TABLE approval_consumptions (
+      consumer_key TEXT PRIMARY KEY, reference TEXT NOT NULL, project TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK (scope IN ('workspace-read', 'workspace-write', 'external')),
+      consumed_at INTEGER NOT NULL
+    );
     CREATE TABLE worktree_leases (
       worktree_path TEXT PRIMARY KEY, task_id TEXT NOT NULL, lease_id TEXT NOT NULL,
       holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
@@ -98,6 +110,11 @@ function seedV2(statePath: string, historyPath: string): void {
       authority_policy TEXT NOT NULL DEFAULT 'routing-v4'
         CHECK (authority_policy IN ('routing-v3', 'routing-v4'))
     );
+    CREATE TABLE worktree_handoffs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL, payload TEXT NOT NULL
+    );
+    CREATE INDEX idx_worktree_handoffs_task ON worktree_handoffs(task_id, id);
     PRAGMA user_version = 2;
   `);
   state.close();
@@ -110,6 +127,37 @@ function seedV2(statePath: string, historyPath: string): void {
       checkpoint_offset INTEGER NOT NULL, checkpoint_line INTEGER NOT NULL,
       prefix_hash TEXT NOT NULL, session_id TEXT,
       PRIMARY KEY (project, source_path)
+    );
+    CREATE TABLE history_rows (
+      project TEXT NOT NULL, source_path TEXT NOT NULL, record_key TEXT NOT NULL,
+      source_agent TEXT NOT NULL CHECK (source_agent IN ('grok', 'codex', 'claude_legacy')),
+      namespace TEXT NOT NULL CHECK (namespace IN ('grok_native', 'codex_native', 'claude_legacy', 'collaboration_shared')),
+      kind TEXT NOT NULL CHECK (kind IN ('memory', 'message', 'tool_summary')),
+      session_id TEXT, role TEXT NOT NULL CHECK (role IN ('assistant', 'memory', 'user')),
+      content TEXT NOT NULL, source_line INTEGER NOT NULL, timestamp TEXT,
+      content_hash TEXT NOT NULL, trust TEXT NOT NULL CHECK (trust = 'untrusted'),
+      PRIMARY KEY (project, source_path, record_key)
+    );
+    CREATE INDEX history_rows_project
+      ON history_rows(project, source_agent, source_path, source_line);
+    CREATE TABLE pending_tools (
+      project TEXT NOT NULL, source_path TEXT NOT NULL, call_id TEXT NOT NULL,
+      agent TEXT NOT NULL CHECK (agent IN ('grok', 'codex', 'claude_legacy')),
+      name TEXT NOT NULL, session_id TEXT, source_line INTEGER NOT NULL,
+      timestamp TEXT, record_key TEXT NOT NULL,
+      PRIMARY KEY (project, source_path, call_id)
+    );
+    CREATE TABLE history_issues (
+      project TEXT NOT NULL, source_path TEXT NOT NULL, code TEXT NOT NULL,
+      source_line INTEGER NOT NULL DEFAULT -1, details TEXT,
+      PRIMARY KEY (project, source_path, code, source_line)
+    );
+    CREATE TABLE memory_source_health (
+      project TEXT NOT NULL,
+      namespace TEXT NOT NULL CHECK (namespace IN ('grok_native', 'codex_native')),
+      status TEXT NOT NULL CHECK (status IN ('projected', 'unavailable', 'no_project_section')),
+      source_path TEXT, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (project, namespace)
     );
     INSERT INTO sources VALUES ('/repo', '/repo/legacy.jsonl', 'claude_legacy', 7, 1, 'abc', 'legacy-session');
     PRAGMA user_version = 2;
@@ -236,7 +284,7 @@ describe("routing-v5 state schema v3 migration", () => {
       stateDatabase: paths.state,
       historyDatabase: paths.history,
     });
-    expect(v4Coordinator.migrateToV4()).toEqual({ status: "migrated", fromVersion: 3, toVersion: 4 });
+    expect(v4Coordinator.migrateToV4()).toMatchObject({ status: "migrated", fromVersion: 3, toVersion: 4 });
     v4Coordinator.extendReviewV3SchemaOffline();
     const reviews = new RunGateUnitOfWork(paths.state);
     reviews.close();

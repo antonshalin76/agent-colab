@@ -1,5 +1,6 @@
 import { chmodSync } from "node:fs";
 import Database from "better-sqlite3";
+import { openStateStoreAccess, type StateStoreInput } from "../store/state-database-fence.js";
 
 export type ApprovalScope = "workspace-read" | "workspace-write" | "external";
 export type ApprovalDenialReason =
@@ -51,22 +52,27 @@ function requireTime(value: number, field: string): void {
 
 export class ApprovalLedger {
   private readonly db: Database.Database;
-  private readonly ownsDatabase: boolean;
+  private readonly closeAccess: () => void;
 
-  constructor(pathOrDatabase: string | Database.Database) {
-    this.ownsDatabase = typeof pathOrDatabase === "string";
-    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
-    if (typeof pathOrDatabase === "string" && pathOrDatabase !== ":memory:") chmodSync(pathOrDatabase, 0o600);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    const grants = new Set((this.db.prepare("PRAGMA table_info(approval_grants)").all() as Array<{ name: string }>)
-      .map(({ name }) => name));
-    const consumptions = new Set((this.db.prepare("PRAGMA table_info(approval_consumptions)").all() as Array<{ name: string }>)
-      .map(({ name }) => name));
-    if (!["reference", "project", "scope", "expires_at", "max_uses", "used_count"].every((name) => grants.has(name)) ||
-        !["consumer_key", "reference", "project", "scope", "consumed_at"].every((name) => consumptions.has(name))) {
-      if (this.ownsDatabase) this.db.close();
-      throw new Error("approval ledger requires current migration-owned schema");
+  constructor(pathOrDatabase: StateStoreInput) {
+    const opened = openStateStoreAccess(pathOrDatabase);
+    try {
+      this.db = opened.access.database;
+      this.closeAccess = opened.close;
+      if (typeof pathOrDatabase === "string" && pathOrDatabase !== ":memory:") chmodSync(pathOrDatabase, 0o600);
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("busy_timeout = 5000");
+      const grants = new Set((this.db.prepare("PRAGMA table_info(approval_grants)").all() as Array<{ name: string }>)
+        .map(({ name }) => name));
+      const consumptions = new Set((this.db.prepare("PRAGMA table_info(approval_consumptions)").all() as Array<{ name: string }>)
+        .map(({ name }) => name));
+      if (!["reference", "project", "scope", "expires_at", "max_uses", "used_count"].every((name) => grants.has(name)) ||
+          !["consumer_key", "reference", "project", "scope", "consumed_at"].every((name) => consumptions.has(name))) {
+        throw new Error("approval ledger requires current migration-owned schema");
+      }
+    } catch (error) {
+      opened.close();
+      throw error;
     }
   }
 
@@ -198,7 +204,7 @@ export class ApprovalLedger {
   }
 
   close(): void {
-    if (this.ownsDatabase) this.db.close();
+    this.closeAccess();
   }
 
   private mismatchReason(input: ApprovalRequest): ApprovalValidation {

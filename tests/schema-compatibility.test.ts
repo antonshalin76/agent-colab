@@ -1,4 +1,6 @@
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
+} from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
@@ -14,6 +16,7 @@ import {
   openExistingStateLayout,
 } from "../src/store/state-layout.js";
 import { RunStore } from "../src/store/run-store.js";
+import { dropGraphV4Schema } from "./helpers/graph-schema.js";
 
 const launcher = resolve("scripts/agent-collab-launcher.mjs");
 const roots: string[] = [];
@@ -104,6 +107,7 @@ const removeReviewExtension = (path: string): void => {
 
 const downgradeToV3 = (path: string): void => {
   removeReviewExtension(path);
+  dropGraphV4Schema(path);
   const db = new Database(path);
   try {
     db.exec(`
@@ -208,7 +212,9 @@ describe("deployed v3/v4 compatibility runtime", () => {
     expect(new MigrationCoordinator({
       stateDatabase: fx.state,
       historyDatabase: fx.history,
-    }).migrateToV4()).toEqual({ status: "migrated", fromVersion: 3, toVersion: 4 });
+    }).migrateToV4()).toMatchObject({
+      status: "migrated", fromVersion: 3, toVersion: 4, importedProgressEvents: 3,
+    });
     expect(verifyCompatibilityRuntime({
       stateDatabase: fx.state,
       historyDatabase: fx.history,
@@ -348,12 +354,36 @@ describe("deployed v3/v4 compatibility runtime", () => {
     })).toThrow(/changed while it was being verified/i);
   });
 
+  it("fails closed when the public state root is replaced during inspection", () => {
+    const fx = fixture();
+    expect(fx.run("status").status).toBe(0);
+    const displaced = `${fx.stateRoot}.displaced`;
+    expect(() => verifyCompatibilityRuntime({
+      stateDatabase: fx.state,
+      historyDatabase: fx.history,
+      faultInjector: (point) => {
+        if (point !== "after_snapshot") return;
+        renameSync(fx.stateRoot, displaced);
+        mkdirSync(fx.stateRoot, { mode: 0o700 });
+      },
+    })).toThrow(/state root identity changed while its fence was held/i);
+    expect(readdirSync(fx.stateRoot)).toEqual([]);
+  });
+
+  it("rejects a history database from a different state root", () => {
+    const state = fixture();
+    const foreign = fixture();
+    expect(state.run("status").status).toBe(0);
+    expect(foreign.run("status").status).toBe(0);
+    expect(() => verifyCompatibilityRuntime({
+      stateDatabase: state.state,
+      historyDatabase: foreign.history,
+    })).toThrow(/must share one canonical fenced root/i);
+  });
+
   it("distinguishes complete synthetic graph v4 from partial graph DDL while keeping execution disabled", () => {
     const complete = fixture();
     expect(complete.run("status").status).toBe(0);
-    const completeDb = new Database(complete.state);
-    completeDb.exec(readFileSync(resolve("docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"), "utf8"));
-    completeDb.close();
     const completeBefore = schemaAndRows(complete.state);
     expect(verifyCompatibilityRuntime({
       stateDatabase: complete.state,
@@ -380,6 +410,7 @@ describe("deployed v3/v4 compatibility runtime", () => {
 
     const partial = fixture();
     expect(partial.run("status").status).toBe(0);
+    dropGraphV4Schema(partial.state);
     const partialDb = new Database(partial.state);
     partialDb.exec("CREATE TABLE graph_flows(flow_id TEXT PRIMARY KEY)");
     partialDb.close();
@@ -402,7 +433,7 @@ describe("deployed v3/v4 compatibility runtime", () => {
 
     expect(legacyStoreContractBytes(v3.state, v3.history)).toBe(legacyStoreContractBytes(v4.state, v4.history));
     expect(verifyCompatibilityRuntime({ stateDatabase: v3.state, historyDatabase: v3.history }).graphSchema).toBe("absent");
-    expect(verifyCompatibilityRuntime({ stateDatabase: v4.state, historyDatabase: v4.history }).graphSchema).toBe("absent");
+    expect(verifyCompatibilityRuntime({ stateDatabase: v4.state, historyDatabase: v4.history }).graphSchema).toBe("complete_disabled");
   });
 
   it("exposes a deterministic CLI reopen receipt and never honors an environment enable switch", () => {

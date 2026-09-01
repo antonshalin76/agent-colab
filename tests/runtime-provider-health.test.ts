@@ -4,12 +4,14 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
 
 const roots: string[] = [];
 const database = () => {
   const root = mkdtempSync(join(tmpdir(), "agent-collab-health-"));
   roots.push(root);
-  return join(root, "state.db");
+  const path = join(root, "state.db");
+  return createEmptyStateDatabase(path);
 };
 
 afterEach(() => {

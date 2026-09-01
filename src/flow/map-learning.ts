@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { join, parse, relative, resolve, sep } from "node:path";
 import Database from "better-sqlite3";
+import type { StateDatabaseAccess } from "../store/state-database-fence.js";
 import { z } from "zod";
 import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
@@ -239,7 +240,7 @@ export interface MapLearningProjection {
 
 /** @internal */
 export interface MapLearningRuntimeAuthority {
-  databasePath: string;
+  database: StateDatabaseAccess;
   controlFingerprint?: () => string;
   promotionCheckpoint?: (phase: "before_publish" | "after_publish") => void;
 }
@@ -332,8 +333,8 @@ function verifyLearningProvenance(input: {
   candidate: MapLearningCandidate;
   authority: MapLearningRuntimeAuthority;
 }): void {
-  const reviews = new RunGateUnitOfWork(input.authority.databasePath);
-  const evidenceLedger = new FlowEvidenceLedger(input.authority.databasePath, {
+  const reviews = new RunGateUnitOfWork(input.authority.database.borrow());
+  const evidenceLedger = new FlowEvidenceLedger(input.authority.database.borrow(), {
     ...(input.authority.controlFingerprint
       ? { controlFingerprint: input.authority.controlFingerprint }
       : {}),
@@ -939,7 +940,7 @@ class MapLearningRegistry {
 /** @internal */
 export interface MapLearningAdministrationConfig {
   controlRoot: string;
-  databasePath: string;
+  database: StateDatabaseAccess;
   controlFingerprint?: () => string;
   promotionCheckpoint?: (phase: "before_publish" | "after_publish") => void;
 }
@@ -954,7 +955,7 @@ export class MapLearningAdministration {
 
   constructor(config: MapLearningAdministrationConfig) {
     this.registry = new MapLearningRegistry(config.controlRoot, {
-      databasePath: config.databasePath,
+      database: config.database,
       ...(config.controlFingerprint ? { controlFingerprint: config.controlFingerprint } : {}),
       ...(config.promotionCheckpoint ? { promotionCheckpoint: config.promotionCheckpoint } : {}),
     });

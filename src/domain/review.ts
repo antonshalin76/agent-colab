@@ -111,12 +111,31 @@ export class ReviewLane {
   }
 }
 
-const ROLES: readonly ReviewRole[] = ["auditor", "critic"];
+export const REVIEW_ROLES: readonly ReviewRole[] = ["auditor", "critic"];
 const AGENTS: readonly ReviewProviderId[] = REVIEW_PROVIDER_IDS;
+export const REVIEW_TOPOLOGY_KEYS = Object.freeze(
+  AGENTS.flatMap((agent) => REVIEW_ROLES.map((role) => `${agent}:${role}`)).sort(),
+);
+
+export const hasExactReviewTopology = (
+  lanes: readonly { agent: ReviewProviderId; role: ReviewRole }[],
+): boolean => {
+  const keys = lanes.map(({ agent, role }) => `${agent}:${role}`).sort();
+  return keys.length === REVIEW_TOPOLOGY_KEYS.length &&
+    keys.every((key, index) => key === REVIEW_TOPOLOGY_KEYS[index]);
+};
+
+export const assertExactReviewTopology = (
+  lanes: readonly { agent: ReviewProviderId; role: ReviewRole }[],
+): void => {
+  if (!hasExactReviewTopology(lanes)) {
+    throw new Error("review barrier requires the exact codex/grok/claude auditor/critic topology");
+  }
+};
 
 export const REVIEW_BARRIER_POLICY = Object.freeze({
   requiredAgent: "codex" as const,
-  requiredRoles: ROLES,
+  requiredRoles: REVIEW_ROLES,
   optionalAgents: ["grok", "claude"] as const,
   optionalUnavailableBlocks: false,
   optionalChangesRequestedBlocks: true,
@@ -163,15 +182,15 @@ export function createReviewPlan(input: ReviewInput): ReviewPlan {
   if (healthy.length === AGENTS.length) {
     return {
       runState: "FULL_CROSS_PROVIDER",
-      activeLanes: AGENTS.flatMap((agent) => ROLES.map((role) => makeLane(input, agent, role, false))),
+      activeLanes: AGENTS.flatMap((agent) => REVIEW_ROLES.map((role) => makeLane(input, agent, role, false))),
       deferredLanes: [],
     };
   }
   const deferred = AGENTS.filter((agent) => !healthy.includes(agent));
   return {
     runState: "DEGRADED_REVIEW_SET",
-    activeLanes: healthy.flatMap((agent) => ROLES.map((role) => makeLane(input, agent, role, true))),
-    deferredLanes: deferred.flatMap((agent) => ROLES.map((role) => makeLane(input, agent, role, true))),
+    activeLanes: healthy.flatMap((agent) => REVIEW_ROLES.map((role) => makeLane(input, agent, role, true))),
+    deferredLanes: deferred.flatMap((agent) => REVIEW_ROLES.map((role) => makeLane(input, agent, role, true))),
   };
 }
 

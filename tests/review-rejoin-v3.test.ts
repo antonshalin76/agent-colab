@@ -130,6 +130,55 @@ function activationSnapshot(path: string, reviewId: string): Record<string, unkn
   return snapshot;
 }
 
+function captureAdmissionReceiptSet(reviews: RunGateUnitOfWork, input: {
+  reviewId: string;
+  generation: number;
+  receiptPrefix: string;
+  noncePrefix: string;
+  scopeRevision?: number;
+  createdAt?: number;
+  expectedTuple?: (role: "auditor" | "critic") => Record<string, unknown>;
+  predecessorReceiptId?: (role: "auditor" | "critic", kind: "source" | "readiness") => string | null;
+  sourceObservation?: (role: "auditor" | "critic") => Record<string, unknown>;
+  readinessObservation?: (role: "auditor" | "critic") => Record<string, unknown>;
+}): Array<Record<string, unknown>> {
+  const captureMethod = (reviews as unknown as Record<string, unknown>).captureReviewReceipt;
+  expect(captureMethod).toBeTypeOf("function");
+  const capture = (captureMethod as (receipt: Record<string, unknown>) => Record<string, unknown>)
+    .bind(reviews);
+  return (["auditor", "critic"] as const).map((role) => {
+    const activationNonce = `${input.noncePrefix}-${role}`;
+    const pair: Record<string, unknown> = { agent: "claude", role, activationNonce };
+    for (const kind of ["source", "readiness"] as const) {
+      const receiptId = `${input.receiptPrefix}-${role}-${kind}`;
+      capture({ receiptId, phase: "admission", scope: `review/${input.reviewId}/claude/${role}/${kind}`,
+        scopeRevision: input.scopeRevision ?? 1, activationNonce,
+        expectedTuple: input.expectedTuple?.(role) ?? {
+          laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null,
+        }, recoveryGeneration: input.generation,
+        observation: kind === "source"
+          ? input.sourceObservation?.(role) ?? { sourceFingerprint: "source-v1", valid: true }
+          : input.readinessObservation?.(role) ?? { harnessReady: true, valid: true },
+        predecessorReceiptId: input.predecessorReceiptId?.(role, kind) ?? null,
+        createdAt: input.createdAt ?? 102 });
+      pair[`${kind}ReceiptId`] = receiptId;
+    }
+    return pair;
+  });
+}
+
+function expectNoActivationMutation(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+): void {
+  for (const table of [
+    "runs", "runtime_provider_health", "runtime_review_barriers", "runtime_review_lanes",
+    "runtime_review_attempt_base_policies", "runtime_review_lane_attempts",
+    "runtime_review_attempt_authorities", "runtime_review_generation_consumptions",
+    "runtime_review_receipts",
+  ]) expect(after[table], table).toEqual(before[table]);
+}
+
 function preparedDeferred(path: string, reviewId: string): {
   reviews: RunGateUnitOfWork;
   health: ProviderHealthStore;
@@ -140,33 +189,15 @@ function preparedDeferred(path: string, reviewId: string): {
   const reviews = new RunGateUnitOfWork(path);
   createWithAdmission(path, reviews, { ...reviewInput, reviewId, idempotencyKey: reviewId });
   const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-  const db = new Database(path);
-  db.prepare(`DELETE FROM runtime_review_lanes
-    WHERE review_id=? AND agent<>'codex' AND NOT (agent='claude' AND role='auditor')`).run(reviewId);
-  db.close();
   expect(health.acquireExplicitProbeAdmission("claude", 100)).toEqual({ runnable: true, claimedAt: 100 });
   health.recordSuccess("claude", 101, 100);
   const generationDb = new Database(path, { readonly: true });
   const generation = generationDb.prepare(`SELECT MAX(generation)
     FROM runtime_provider_recovery_generations WHERE agent='claude'`).pluck().get() as number;
   generationDb.close();
-  const captureCandidate = (reviews as unknown as Record<string, unknown>).captureReviewReceipt;
-  expect(captureCandidate).toBeTypeOf("function");
-  const capture = (captureCandidate as (input: Record<string, unknown>) => Record<string, unknown>)
-    .bind(reviews);
-  const activationNonce = `${reviewId}-nonce`;
-  const pair: Record<string, unknown> = { role: "auditor", activationNonce };
-  for (const kind of ["source", "readiness"] as const) {
-    const receiptId = `${reviewId}-${kind}`;
-    capture({ receiptId, phase: "admission", scope: `review/${reviewId}/claude/auditor/${kind}`,
-      scopeRevision: 1, activationNonce,
-      expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
-      recoveryGeneration: generation,
-      observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-        : { harnessReady: true, valid: true }, predecessorReceiptId: null, createdAt: 102 });
-    pair[`${kind}ReceiptId`] = receiptId;
-  }
-  return { reviews, health, generation, admissionReceipts: [pair] };
+  const admissionReceipts = captureAdmissionReceiptSet(reviews, { reviewId, generation,
+    receiptPrefix: reviewId, noncePrefix: `${reviewId}-nonce` });
+  return { reviews, health, generation, admissionReceipts };
 }
 
 function workerActivation(input: {
@@ -220,8 +251,10 @@ describe("authority-v3 recovered review admission", () => {
       (input: Record<string, unknown>) => Record<string, unknown>;
     expect(activate({ agent: "claude", now: 103, reviews: prepared.reviews,
       health: prepared.health, evidenceCapture }))
-      .toMatchObject({ activated: 1, stale: 0, skippedSatisfied: 0 });
+      .toMatchObject({ activated: 2, stale: 0, skippedSatisfied: 0 });
     expect(prepared.reviews.attempts("automatic-rejoin", "claude", "auditor"))
+      .toHaveLength(1);
+    expect(prepared.reviews.attempts("automatic-rejoin", "claude", "critic"))
       .toHaveLength(1);
     prepared.reviews.close(); prepared.health.close();
   });
@@ -260,9 +293,9 @@ describe("authority-v3 recovered review admission", () => {
     expect(replay).toEqual(winner);
     const db = new Database(path, { readonly: true });
     expect(db.prepare(`SELECT COUNT(*) FROM runtime_review_lane_attempts
-      WHERE review_id='activation-race' AND agent='claude' AND role='auditor'`).pluck().get()).toBe(1);
+      WHERE review_id='activation-race' AND agent='claude'`).pluck().get()).toBe(2);
     expect(db.prepare(`SELECT COUNT(*) FROM runtime_review_generation_consumptions
-      WHERE review_id='activation-race' AND agent='claude' AND role='auditor'`).pluck().get()).toBe(1);
+      WHERE review_id='activation-race' AND agent='claude'`).pluck().get()).toBe(2);
     db.close();
     prepared.health.close();
   });
@@ -270,22 +303,12 @@ describe("authority-v3 recovered review admission", () => {
   it("supersedes pair A with B before activation and lets only B authorize", () => {
     const path = database();
     const prepared = preparedDeferred(path, "activation-supersession");
-    const captureMethod = (prepared.reviews as unknown as Record<string, unknown>).captureReviewReceipt;
-    const capture = (captureMethod as (input: Record<string, unknown>) => Record<string, unknown>)
-      .bind(prepared.reviews);
-    const pairB: Record<string, unknown> = { role: "auditor", activationNonce: "pair-b" };
-    for (const kind of ["source", "readiness"] as const) {
-      const predecessorReceiptId = `activation-supersession-${kind}`;
-      const receiptId = `${predecessorReceiptId}-b`;
-      capture({ receiptId, phase: "admission",
-        scope: `review/activation-supersession/claude/auditor/${kind}`, scopeRevision: 2,
-        activationNonce: "pair-b", expectedTuple: {
-          laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null,
-        }, recoveryGeneration: prepared.generation,
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-          : { harnessReady: true, valid: true }, predecessorReceiptId, createdAt: 103 });
-      pairB[`${kind}ReceiptId`] = receiptId;
-    }
+    const pairB = captureAdmissionReceiptSet(prepared.reviews, {
+      reviewId: "activation-supersession", generation: prepared.generation,
+      receiptPrefix: "activation-supersession-b", noncePrefix: "pair-b",
+      scopeRevision: 2, createdAt: 103,
+      predecessorReceiptId: (role, kind) => `activation-supersession-${role}-${kind}`,
+    });
     const activate = prepared.reviews.activateDeferred.bind(prepared.reviews) as unknown as
       (input: Record<string, unknown>) => Record<string, unknown>;
     const before = activationSnapshot(path, "activation-supersession");
@@ -294,37 +317,32 @@ describe("authority-v3 recovered review admission", () => {
       .toMatchObject({ status: "none", lanes: [] });
     expect(activationSnapshot(path, "activation-supersession")).toEqual(before);
     expect(activate({ reviewId: "activation-supersession", agent: "claude", now: 105,
-      recoveryGeneration: prepared.generation, admissionReceipts: [pairB] }))
+      recoveryGeneration: prepared.generation, admissionReceipts: pairB }))
       .toMatchObject({ status: "activated" });
     prepared.reviews.close(); prepared.health.close();
   });
 
-  it("rejects a current invalid admission observation with byte-identical durable state", () => {
+  it("rejects an invalid pair, creates no activation state, and orphans all four receipts", () => {
     const path = database();
     const reviewId = "activation-invalid-observation";
     const prepared = preparedDeferred(path, reviewId);
-    const captureMethod = (prepared.reviews as unknown as Record<string, unknown>).captureReviewReceipt;
-    const capture = (captureMethod as (input: Record<string, unknown>) => Record<string, unknown>)
-      .bind(prepared.reviews);
-    const pair: Record<string, unknown> = { role: "auditor", activationNonce: "invalid-pair" };
-    for (const kind of ["source", "readiness"] as const) {
-      const predecessorReceiptId = `${reviewId}-${kind}`;
-      const receiptId = `${predecessorReceiptId}-invalid`;
-      capture({ receiptId, phase: "admission", scope: `review/${reviewId}/claude/auditor/${kind}`,
-        scopeRevision: 2, activationNonce: "invalid-pair", expectedTuple: {
-          laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null,
-        }, recoveryGeneration: prepared.generation,
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: false }
-          : { harnessReady: true, valid: true }, predecessorReceiptId, createdAt: 103 });
-      pair[`${kind}ReceiptId`] = receiptId;
-    }
+    const pair = captureAdmissionReceiptSet(prepared.reviews, { reviewId,
+      generation: prepared.generation, receiptPrefix: `${reviewId}-invalid`,
+      noncePrefix: "invalid-pair", scopeRevision: 2, createdAt: 103,
+      predecessorReceiptId: (role, kind) => `${reviewId}-${role}-${kind}`,
+      sourceObservation: (role) => ({ sourceFingerprint: "source-v1", valid: role !== "auditor" }),
+    });
     const before = activationSnapshot(path, reviewId);
     const activate = prepared.reviews.activateDeferred.bind(prepared.reviews) as unknown as
       (input: Record<string, unknown>) => Record<string, unknown>;
     expect(activate({ reviewId, agent: "claude", now: 104,
-      recoveryGeneration: prepared.generation, admissionReceipts: [pair] }))
+      recoveryGeneration: prepared.generation, admissionReceipts: pair }))
       .toEqual({ status: "none", lanes: [] });
-    expect(activationSnapshot(path, reviewId)).toEqual(before);
+    const after = activationSnapshot(path, reviewId);
+    expectNoActivationMutation(before, after);
+    expect((after.runtime_review_receipt_lifecycle as Array<{ receipt_id: string; state: string }>)
+      .filter(({ receipt_id }) => receipt_id.startsWith(`${reviewId}-invalid-`))
+      .map(({ state }) => state)).toEqual(["orphaned", "orphaned", "orphaned", "orphaned"]);
     prepared.reviews.close(); prepared.health.close();
   });
 
@@ -358,37 +376,31 @@ describe("authority-v3 recovered review admission", () => {
     expect(() => activate({ ...input, faultInjector: (point: string) => {
       if (point === "after_activation_commit_before_response") throw new Error("response lost");
     } })).toThrow(/response lost/i);
-    const captureMethod = (prepared.reviews as unknown as Record<string, unknown>).captureReviewReceipt;
-    const capture = (captureMethod as (input: Record<string, unknown>) => Record<string, unknown>)
-      .bind(prepared.reviews);
-    const replayNonce = "activation-response-loss-replay";
-    const replayPair: Record<string, unknown> = { role: "auditor", activationNonce: replayNonce };
-    for (const kind of ["source", "readiness"] as const) {
-      const predecessorReceiptId = `activation-response-loss-${kind}`;
-      const receiptId = `${predecessorReceiptId}-replay`;
-      capture({ receiptId, phase: "admission",
-        scope: `review/activation-response-loss/claude/auditor/${kind}`, scopeRevision: 2,
-        activationNonce: replayNonce, expectedTuple: {
-          laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null,
-        }, recoveryGeneration: prepared.generation,
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-          : { harnessReady: true, valid: true }, predecessorReceiptId, createdAt: 104 });
-      replayPair[`${kind}ReceiptId`] = receiptId;
-    }
-    const replay = activate({ ...input, now: 105, admissionReceipts: [replayPair] });
-    expect(replay).toMatchObject({ status: "activated", lanes: [expect.objectContaining({
-      attemptOrdinal: 0, recoveryGeneration: prepared.generation,
-    })] });
+    const replayPair = captureAdmissionReceiptSet(prepared.reviews, {
+      reviewId: "activation-response-loss", generation: prepared.generation,
+      receiptPrefix: "activation-response-loss-replay",
+      noncePrefix: "activation-response-loss-replay", scopeRevision: 2, createdAt: 104,
+      predecessorReceiptId: (role, kind) => `activation-response-loss-${role}-${kind}`,
+    });
+    const replay = activate({ ...input, now: 105, admissionReceipts: replayPair });
+    expect(replay).toMatchObject({ status: "activated", lanes: [
+      expect.objectContaining({ role: "auditor", attemptOrdinal: 0,
+        recoveryGeneration: prepared.generation }),
+      expect.objectContaining({ role: "critic", attemptOrdinal: 0,
+        recoveryGeneration: prepared.generation }),
+    ] });
     const db = new Database(path, { readonly: true });
     expect(db.prepare(`SELECT COUNT(*) FROM runtime_review_lane_attempts
-      WHERE review_id='activation-response-loss' AND agent='claude' AND role='auditor'`)
-      .pluck().get()).toBe(1);
+      WHERE review_id='activation-response-loss' AND agent='claude'`)
+      .pluck().get()).toBe(2);
     expect(db.prepare(`SELECT COUNT(*) FROM runtime_review_generation_consumptions
-      WHERE review_id='activation-response-loss'`).pluck().get()).toBe(1);
+      WHERE review_id='activation-response-loss'`).pluck().get()).toBe(2);
     expect(db.prepare(`SELECT receipt_id,state FROM runtime_review_receipt_lifecycle
-      WHERE receipt_id LIKE 'activation-response-loss-%-replay' ORDER BY receipt_id`).all()).toEqual([
-      { receipt_id: "activation-response-loss-readiness-replay", state: "orphaned" },
-      { receipt_id: "activation-response-loss-source-replay", state: "orphaned" },
+      WHERE receipt_id LIKE 'activation-response-loss-replay-%' ORDER BY receipt_id`).all()).toEqual([
+      { receipt_id: "activation-response-loss-replay-auditor-readiness", state: "orphaned" },
+      { receipt_id: "activation-response-loss-replay-auditor-source", state: "orphaned" },
+      { receipt_id: "activation-response-loss-replay-critic-readiness", state: "orphaned" },
+      { receipt_id: "activation-response-loss-replay-critic-source", state: "orphaned" },
     ]);
     db.close();
     prepared.reviews.close(); prepared.health.close();
@@ -404,32 +416,24 @@ describe("authority-v3 recovered review admission", () => {
       faultInjector: (point: string) => {
         if (point === "before_activation_begin") throw new Error("pre-BEGIN crash");
       } })).toThrow(/pre-BEGIN crash/i);
-    const captureMethod = (prepared.reviews as unknown as Record<string, unknown>).captureReviewReceipt;
-    const capture = (captureMethod as (input: Record<string, unknown>) => Record<string, unknown>)
-      .bind(prepared.reviews);
-    const activationNonce = "activation-prebegin-retry";
-    const retryPair: Record<string, unknown> = { role: "auditor", activationNonce };
-    for (const kind of ["source", "readiness"] as const) {
-      const predecessorReceiptId = `activation-prebegin-${kind}`;
-      const receiptId = `${predecessorReceiptId}-retry`;
-      capture({ receiptId, phase: "admission",
-        scope: `review/activation-prebegin/claude/auditor/${kind}`, scopeRevision: 2,
-        activationNonce, expectedTuple: {
-          laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null,
-        }, recoveryGeneration: prepared.generation,
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-          : { harnessReady: true, valid: true }, predecessorReceiptId, createdAt: 104 });
-      retryPair[`${kind}ReceiptId`] = receiptId;
-    }
+    const retryPair = captureAdmissionReceiptSet(prepared.reviews, {
+      reviewId: "activation-prebegin", generation: prepared.generation,
+      receiptPrefix: "activation-prebegin-retry", noncePrefix: "activation-prebegin-retry",
+      scopeRevision: 2, createdAt: 104,
+      predecessorReceiptId: (role, kind) => `activation-prebegin-${role}-${kind}`,
+    });
     expect(activate({ reviewId: "activation-prebegin", agent: "claude", now: 105,
-      recoveryGeneration: prepared.generation, admissionReceipts: [retryPair] }))
+      recoveryGeneration: prepared.generation, admissionReceipts: retryPair }))
       .toMatchObject({ status: "activated" });
     const db = new Database(path, { readonly: true });
     expect(db.prepare(`SELECT receipt_id,state FROM runtime_review_receipt_lifecycle
-      WHERE receipt_id IN ('activation-prebegin-source','activation-prebegin-readiness')
+      WHERE receipt_id LIKE 'activation-prebegin-%'
+        AND receipt_id NOT LIKE 'activation-prebegin-retry-%'
       ORDER BY receipt_id`).all()).toEqual([
-      { receipt_id: "activation-prebegin-readiness", state: "superseded" },
-      { receipt_id: "activation-prebegin-source", state: "superseded" },
+      { receipt_id: "activation-prebegin-auditor-readiness", state: "superseded" },
+      { receipt_id: "activation-prebegin-auditor-source", state: "superseded" },
+      { receipt_id: "activation-prebegin-critic-readiness", state: "superseded" },
+      { receipt_id: "activation-prebegin-critic-source", state: "superseded" },
     ]);
     db.close(); prepared.reviews.close(); prepared.health.close();
   });
@@ -440,7 +444,7 @@ describe("authority-v3 recovered review admission", () => {
       const path = database();
       const prepared = preparedDeferred(path, `activation-reject-${terminalState}`);
       const reviewId = `activation-reject-${terminalState}`;
-      const sourceReceiptId = `${reviewId}-source`;
+      const sourceReceiptId = `${reviewId}-auditor-source`;
       const db = new Database(path);
       db.prepare(`INSERT INTO runtime_review_receipt_lifecycle
         (receipt_id,state,scope_revision,activation_nonce,expected_tuple_json,
@@ -455,7 +459,17 @@ describe("authority-v3 recovered review admission", () => {
       expect(activate({ reviewId, agent: "claude", now: 104,
         recoveryGeneration: prepared.generation, admissionReceipts: prepared.admissionReceipts }))
         .toMatchObject({ status: "none", lanes: [] });
-      expect(activationSnapshot(path, reviewId)).toEqual(before);
+      const after = activationSnapshot(path, reviewId);
+      expectNoActivationMutation(before, after);
+      const terminal = after.runtime_review_receipt_lifecycle as Array<{
+        receipt_id: string; state: string;
+      }>;
+      const states = Object.fromEntries(terminal
+        .filter(({ receipt_id }) => receipt_id.startsWith(`${reviewId}-`))
+        .map(({ receipt_id, state }) => [receipt_id, state]));
+      expect(states[`${reviewId}-auditor-source`]).toBe(terminalState);
+      expect(Object.entries(states).filter(([receiptId]) => receiptId !== `${reviewId}-auditor-source`)
+        .every(([, state]) => state === "orphaned")).toBe(true);
       prepared.reviews.close(); prepared.health.close();
     },
   );
@@ -464,8 +478,8 @@ describe("authority-v3 recovered review admission", () => {
     { variant: "missing-receipt", expected: "needs_reconciliation" },
     { variant: "unverified-health", expected: "provider_unavailable" },
     { variant: "claimed-probe", expected: "provider_unavailable" },
-    { variant: "consumed-generation", expected: "none" },
-  ] as const)("rejects $variant with a byte-identical authority-state snapshot",
+    { variant: "consumed-generation", expected: "needs_reconciliation" },
+  ] as const)("rejects $variant without activating a partial harness pair",
     ({ variant, expected }) => {
       const path = database();
       const reviewId = `activation-negative-${variant}`;
@@ -492,7 +506,19 @@ describe("authority-v3 recovered review admission", () => {
       const activate = prepared.reviews.activateDeferred.bind(prepared.reviews) as unknown as
         (activation: Record<string, unknown>) => Record<string, unknown>;
       expect(activate(input)).toEqual({ status: expected, lanes: [] });
-      expect(activationSnapshot(path, reviewId)).toEqual(before);
+      if (variant === "consumed-generation") {
+        const after = activationSnapshot(path, reviewId);
+        expect((after.runtime_review_lane_attempts as unknown[]).length)
+          .toBe((before.runtime_review_lane_attempts as unknown[]).length);
+        const lifecycle = after.runtime_review_receipt_lifecycle as Array<{
+          receipt_id: string; state: string;
+        }>;
+        const pendingPair = lifecycle.filter(({ receipt_id }) => receipt_id.startsWith(`${reviewId}-`));
+        expect(pendingPair).toHaveLength(4);
+        expect(pendingPair.every(({ state }) => state === "orphaned")).toBe(true);
+      } else {
+        expect(activationSnapshot(path, reviewId)).toEqual(before);
+      }
       prepared.reviews.close(); prepared.health.close();
     },
   );
@@ -592,185 +618,131 @@ describe("authority-v3 recovered review admission", () => {
     db.close();
   });
 
-  it("creates recovery ordinal N+1 only from G2 and fences replay/ABA of G1 and stale tuples", () => {
+  it("creates pair recovery ordinal N+1 only from G2 and fences ABA and stale pair tuples", () => {
     const path = database();
     initializeCurrentExecutionSchema(path);
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
     const reviews = new RunGateUnitOfWork(path);
     createWithAdmission(path, reviews, { ...reviewInput, reviewId: "recovery-n", idempotencyKey: "recovery-n" });
-    const trim = new Database(path);
-    trim.prepare(`DELETE FROM runtime_review_lanes
-      WHERE review_id='recovery-n' AND agent<>'codex'
-        AND NOT (agent='claude' AND role='auditor')`).run();
+    const activate = reviews.activateDeferred.bind(reviews) as unknown as
+      (input: Record<string, unknown>) => { status: string; lanes: Array<Record<string, unknown>> };
 
     expect(health.acquireExplicitProbeAdmission("claude", 100)).toEqual({ runnable: true, claimedAt: 100 });
     health.recordSuccess("claude", 101, 100);
-    const g1 = trim.prepare(`SELECT MAX(generation) FROM runtime_provider_recovery_generations
-      WHERE agent='claude'`).pluck().get() as number;
-    for (const [kind, receiptId] of [["source", "g1-source"], ["readiness", "g1-ready"]] as const) {
-      appendPendingReceipt(trim, { receiptId, scope: `review/recovery-n/claude/auditor/${kind}`,
-        activationNonce: "g1-nonce", generation: g1,
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-          : { harnessReady: true, valid: true } });
-    }
-    trim.close();
-    const activate = reviews.activateDeferred.bind(reviews) as unknown as
-      (input: Record<string, unknown>) => { status: string; lanes: Array<Record<string, unknown>> };
+    const g1 = health.latestRecoveryGeneration("claude")!;
+    const g1Receipts = captureAdmissionReceiptSet(reviews, { reviewId: "recovery-n", generation: g1,
+      receiptPrefix: "g1", noncePrefix: "g1-nonce" });
     const first = activate({ reviewId: "recovery-n", agent: "claude", now: 102,
-      recoveryGeneration: g1, admissionReceipts: [{ role: "auditor", sourceReceiptId: "g1-source",
-        readinessReceiptId: "g1-ready", activationNonce: "g1-nonce" }] });
-    expect(first.lanes[0]).toMatchObject({ attemptOrdinal: 0, recoveryGeneration: g1 });
+      recoveryGeneration: g1, admissionReceipts: g1Receipts });
+    expect(first.lanes).toEqual([
+      expect.objectContaining({ role: "auditor", attemptOrdinal: 0, recoveryGeneration: g1 }),
+      expect.objectContaining({ role: "critic", attemptOrdinal: 0, recoveryGeneration: g1 }),
+    ]);
 
-    const attempt = first.lanes[0] as {
-      idempotencyKey: string;
-      attemptId: string;
-      model: "grok-4.6" | "glm-5.3" | "gpt-5.6-sol";
-      effort: "high" | "xhigh" | "max";
-      policyVersion: "routing-v5";
-      sessionId: string;
+    const failPair = (lanes: Array<Record<string, unknown>>, terminalAt: number, cycle: number) => {
+      const runs = new RunStore(path);
+      const errors: Record<string, Record<string, unknown>> = {};
+      for (let index = 0; index < lanes.length; index += 1) {
+        const claimed = runs.claimNext({ workerId: `recovery-${cycle}-${index}`, leaseMs: 10_000,
+          now: terminalAt - 1 })!;
+        const lane = lanes.find(({ idempotencyKey }) => idempotencyKey === claimed.idempotencyKey)!;
+        const role = String(lane.role) as "auditor" | "critic";
+        runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "claude" });
+        runs.markLaunched(claimed.id, claimed.leaseToken!, {
+          phase: "started", pid: 1200 + cycle * 10 + index, agent: "claude",
+          model: lane.model, effort: lane.effort, policyVersion: lane.policyVersion,
+          sessionId: lane.sessionId,
+        });
+        const error = { kind: "quota", agent: "claude", role };
+        errors[role] = error;
+        runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: error,
+          effect: { type: "review", reviewId: "recovery-n", attemptId: lane.attemptId,
+            role, agent: "claude", resultKind: "quota", terminalAt }, status: "completed" });
+        reviews.recordProviderUnavailable({ reviewId: "recovery-n", agent: "claude", role,
+          attemptId: String(lane.attemptId), error, terminalAt });
+      }
+      runs.close();
+      return errors;
     };
-    const runs = new RunStore(path);
-    const claimed = runs.claimNext({ workerId: "recovery-test", leaseMs: 10_000, now: 103 })!;
-    expect(claimed.idempotencyKey).toBe(attempt.idempotencyKey);
-    runs.markLaunchIntent(claimed.id, claimed.leaseToken!, { agent: "claude" });
-    runs.markLaunched(claimed.id, claimed.leaseToken!, {
-      phase: "started", pid: 1234, agent: "claude", model: attempt.model,
-      effort: attempt.effort, policyVersion: attempt.policyVersion, sessionId: attempt.sessionId,
-    });
-    const unavailable = { kind: "quota", agent: "claude" } as const;
-    runs.commitDomainEffect({ id: claimed.id, token: claimed.leaseToken!, providerResult: unavailable,
-      effect: { type: "review", reviewId: "recovery-n", attemptId: attempt.attemptId,
-        role: "auditor", agent: "claude", resultKind: "quota", terminalAt: 200 }, status: "completed" });
-    reviews.recordProviderUnavailable({ reviewId: "recovery-n", agent: "claude", role: "auditor",
-      attemptId: String(attempt.attemptId), error: unavailable, terminalAt: 200 });
-    runs.close();
-    health.recordFailoverFailure("claude", unavailable, 200);
+
+    const firstPolicies = Object.fromEntries(first.lanes.map((lane) => [String(lane.role), {
+      model: lane.model, effort: lane.effort, policyVersion: lane.policyVersion,
+    }]));
+    const g1Errors = failPair(first.lanes, 200, 1);
+    health.recordFailoverFailure("claude", { kind: "quota" }, 200);
     expect(health.acquireExplicitProbeAdmission("claude", 1_200)).toEqual({ runnable: true, claimedAt: 1_200 });
     health.recordSuccess("claude", 1_201, 1_200);
-
-    const db = new Database(path);
-    const g2 = db.prepare(`SELECT MAX(generation) FROM runtime_provider_recovery_generations
-      WHERE agent='claude'`).pluck().get() as number;
+    const g2 = health.latestRecoveryGeneration("claude")!;
     expect(g2).toBeGreaterThan(g1);
-    const laneRevision = db.prepare(`SELECT lane_revision FROM runtime_review_lanes
-      WHERE review_id='recovery-n' AND agent='claude' AND role='auditor'`).pluck().get() as number;
-    const evidenceHash = canonicalHash(unavailable);
-    const tuple = { laneRevision, latestOrdinal: 0, latestEvidenceHash: evidenceHash };
-    for (const [kind, receiptId] of [["source", "g2-source"], ["readiness", "g2-ready"]] as const) {
-      appendPendingReceipt(db, { receiptId, scope: `review/recovery-n/claude/auditor/${kind}`,
-        activationNonce: "g2-nonce", generation: g2, expectedTuple: tuple, scopeRevision: 2,
-        predecessorReceiptId: kind === "source" ? "g1-source" : "g1-ready",
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-          : { harnessReady: true, valid: true } });
+    const g2Tuples: Record<"auditor" | "critic", Record<string, unknown>> = {
+      auditor: reviews.admissionTuple("recovery-n", "claude", "auditor"),
+      critic: reviews.admissionTuple("recovery-n", "claude", "critic"),
+    };
+    const g2Receipts = captureAdmissionReceiptSet(reviews, { reviewId: "recovery-n", generation: g2,
+      receiptPrefix: "g2", noncePrefix: "g2-nonce", scopeRevision: 2,
+      expectedTuple: (role) => g2Tuples[role],
+      predecessorReceiptId: (role, kind) => `g1-${role}-${kind}`,
+    });
+    const mutable = new Database(path);
+    for (const role of ["auditor", "critic"] as const) {
+      mutable.prepare(`UPDATE runtime_review_lanes SET model='gpt-5.6-sol',effort='high',
+        reasons='["mutable-drift"]',session_id=?,idempotency_key=?
+        WHERE review_id='recovery-n' AND agent='claude' AND role=?`).run(
+          `mutable-${role}-session`, `mutable-${role}-idempotency`, role);
     }
-    db.prepare(`UPDATE runtime_review_lanes SET model='gpt-5.6-sol',effort='high',
-      reasons='["mutable-drift"]',session_id='mutable-lane-session',
-      idempotency_key='mutable-lane-idempotency'
-      WHERE review_id='recovery-n' AND agent='claude' AND role='auditor'`).run();
-    db.close();
+    mutable.close();
     const second = activate({ reviewId: "recovery-n", agent: "claude", now: 1_202,
-      recoveryGeneration: g2, admissionReceipts: [{ role: "auditor", sourceReceiptId: "g2-source",
-        readinessReceiptId: "g2-ready", activationNonce: "g2-nonce" }] });
-    expect(second.lanes[0]).toMatchObject({ attemptOrdinal: 1, recoveryGeneration: g2,
-      previousOrdinal: 0, previousEvidenceHash: evidenceHash,
-      model: attempt.model, effort: attempt.effort, policyVersion: attempt.policyVersion });
-    expect(second.lanes[0]!.sessionId).not.toBe("mutable-lane-session");
-    expect(second.lanes[0]!.idempotencyKey).not.toBe("mutable-lane-idempotency");
+      recoveryGeneration: g2, admissionReceipts: g2Receipts });
+    for (const lane of second.lanes) {
+      const role = String(lane.role) as "auditor" | "critic";
+      expect(lane).toMatchObject({ attemptOrdinal: 1, recoveryGeneration: g2,
+        previousOrdinal: 0, previousEvidenceHash: canonicalHash(g1Errors[role]),
+        ...firstPolicies[role] });
+      expect(lane.sessionId).not.toBe(`mutable-${role}-session`);
+      expect(lane.idempotencyKey).not.toBe(`mutable-${role}-idempotency`);
+    }
+
     const identityFactory = (reviewRuntime as unknown as Record<string, unknown>)
       .createReviewAttemptIdentity as ((input: Record<string, unknown>) => Record<string, unknown>);
-    expect(identityFactory).toBeTypeOf("function");
-    const expectedIdentity = identityFactory({ reviewId: "recovery-n",
-      barrierIdempotencyKey: "recovery-n", agent: "claude", role: "auditor", ordinal: 1 });
-    const persistedIdentity = new Database(path, { readonly: true });
-    expect(persistedIdentity.prepare(`SELECT attempt_id,session_id,idempotency_key
-      FROM runtime_review_lane_attempts WHERE review_id='recovery-n' AND agent='claude'
-        AND role='auditor' AND attempt_ordinal=1`).get()).toEqual({
-      attempt_id: expectedIdentity.attemptId,
-      session_id: expectedIdentity.sessionId,
-      idempotency_key: expectedIdentity.idempotencyKey,
-    });
-    persistedIdentity.close();
-
-    const secondAttempt = second.lanes[0] as typeof attempt;
-    const secondRuns = new RunStore(path);
-    const secondClaim = secondRuns.claimNext({ workerId: "recovery-test-2", leaseMs: 10_000,
-      now: 1_203 })!;
-    expect(secondClaim.idempotencyKey).toBe(secondAttempt.idempotencyKey);
-    secondRuns.markLaunchIntent(secondClaim.id, secondClaim.leaseToken!, { agent: "claude" });
-    secondRuns.markLaunched(secondClaim.id, secondClaim.leaseToken!, {
-      phase: "started", pid: 1235, agent: "claude", model: secondAttempt.model,
-      effort: secondAttempt.effort, policyVersion: secondAttempt.policyVersion,
-      sessionId: secondAttempt.sessionId,
-    });
-    const unavailable2 = { kind: "quota", agent: "claude", cycle: 2 } as const;
-    secondRuns.commitDomainEffect({ id: secondClaim.id, token: secondClaim.leaseToken!,
-      providerResult: unavailable2,
-      effect: { type: "review", reviewId: "recovery-n", attemptId: secondAttempt.attemptId,
-        role: "auditor", agent: "claude", resultKind: "quota", terminalAt: 1_300 },
-      status: "completed" });
-    reviews.recordProviderUnavailable({ reviewId: "recovery-n", agent: "claude", role: "auditor",
-      attemptId: secondAttempt.attemptId, error: unavailable2, terminalAt: 1_300 });
-    secondRuns.close();
-    health.recordFailoverFailure("claude", unavailable2, 1_300);
-    expect(health.acquireExplicitProbeAdmission("claude", 2_300))
-      .toEqual({ runnable: true, claimedAt: 2_300 });
-    health.recordSuccess("claude", 2_301, 2_300);
-    const g3db = new Database(path);
-    const g3 = g3db.prepare(`SELECT MAX(generation) FROM runtime_provider_recovery_generations
-      WHERE agent='claude'`).pluck().get() as number;
-    expect(g3).toBeGreaterThan(g2);
-    const laneRevision2 = g3db.prepare(`SELECT lane_revision FROM runtime_review_lanes
-      WHERE review_id='recovery-n' AND agent='claude' AND role='auditor'`).pluck().get() as number;
-    const evidenceHash2 = canonicalHash(unavailable2);
-    const tuple2 = { laneRevision: laneRevision2, latestOrdinal: 1, latestEvidenceHash: evidenceHash2 };
-    for (const [kind, receiptId] of [["source", "g3-source"], ["readiness", "g3-ready"]] as const) {
-      appendPendingReceipt(g3db, { receiptId,
-        scope: `review/recovery-n/claude/auditor/${kind}`, activationNonce: "g3-nonce",
-        generation: g3, expectedTuple: tuple2, scopeRevision: 3,
-        predecessorReceiptId: kind === "source" ? "g2-source" : "g2-ready",
-        observation: kind === "source" ? { sourceFingerprint: "source-v1", valid: true }
-          : { harnessReady: true, valid: true } });
+    for (const role of ["auditor", "critic"] as const) {
+      const expected = identityFactory({ reviewId: "recovery-n", barrierIdempotencyKey: "recovery-n",
+        agent: "claude", role, ordinal: 1 });
+      const persisted = new Database(path, { readonly: true });
+      expect(persisted.prepare(`SELECT attempt_id,session_id,idempotency_key
+        FROM runtime_review_lane_attempts WHERE review_id='recovery-n' AND agent='claude'
+          AND role=? AND attempt_ordinal=1`).get(role)).toEqual({
+        attempt_id: expected.attemptId, session_id: expected.sessionId,
+        idempotency_key: expected.idempotencyKey,
+      });
+      persisted.close();
     }
-    g3db.close();
-    const third = activate({ reviewId: "recovery-n", agent: "claude", now: 2_302,
-      recoveryGeneration: g3, admissionReceipts: [{ role: "auditor", sourceReceiptId: "g3-source",
-        readinessReceiptId: "g3-ready", activationNonce: "g3-nonce" }] });
-    expect(third.lanes[0]).toMatchObject({ attemptOrdinal: 2, recoveryGeneration: g3,
-      previousOrdinal: 1, previousEvidenceHash: evidenceHash2,
-      model: attempt.model, effort: attempt.effort, policyVersion: attempt.policyVersion });
 
-    expect(activate({ reviewId: "recovery-n", agent: "claude", now: 1_203,
-      recoveryGeneration: g1, admissionReceipts: [{ role: "auditor", sourceReceiptId: "g1-source",
-        readinessReceiptId: "g1-ready", activationNonce: "g1-nonce" }] })).toMatchObject({
-      status: "none", lanes: [],
+    failPair(second.lanes, 1_300, 2);
+    health.recordFailoverFailure("claude", { kind: "quota" }, 1_300);
+    expect(health.acquireExplicitProbeAdmission("claude", 2_300)).toEqual({ runnable: true, claimedAt: 2_300 });
+    health.recordSuccess("claude", 2_301, 2_300);
+    const g3 = health.latestRecoveryGeneration("claude")!;
+    const staleReceipts = captureAdmissionReceiptSet(reviews, { reviewId: "recovery-n", generation: g3,
+      receiptPrefix: "g3-stale", noncePrefix: "g3-stale-nonce", scopeRevision: 3,
+      expectedTuple: (role) => g2Tuples[role],
+      predecessorReceiptId: (role, kind) => `g2-${role}-${kind}`,
     });
-    expect(reviews.attempts("recovery-n", "claude", "auditor").map(({ attemptOrdinal }) => attemptOrdinal))
-      .toEqual([0, 1, 2]);
-    const corrupt = new Database(path);
-    const countsBeforeCorruption = {
-      attempts: corrupt.prepare(`SELECT COUNT(*) FROM runtime_review_lane_attempts
-        WHERE review_id='recovery-n'`).pluck().get(),
-      generations: corrupt.prepare(`SELECT COUNT(*) FROM runtime_review_generation_consumptions
-        WHERE review_id='recovery-n'`).pluck().get(),
-    };
-    corrupt.exec(`DROP TRIGGER runtime_review_attempt_update_immutable;
-      PRAGMA ignore_check_constraints=ON;`);
-    corrupt.prepare(`UPDATE runtime_review_lane_attempts SET base_policy_id='historical-corruption'
-      WHERE review_id='recovery-n' AND agent='claude' AND role='auditor' AND attempt_ordinal=0`).run();
-    corrupt.close();
-    expect(reviews.attempts("recovery-n", "claude", "auditor").at(-1)?.status)
-      .toBe("needs_reconciliation");
-    expect(reviews.barrier("recovery-n").satisfied).toBe(false);
+    expect(activate({ reviewId: "recovery-n", agent: "claude", now: 2_302,
+      recoveryGeneration: g3, admissionReceipts: staleReceipts }))
+      .toEqual({ status: "none", lanes: [] });
+    expect(activate({ reviewId: "recovery-n", agent: "claude", now: 2_303,
+      recoveryGeneration: g1, admissionReceipts: g1Receipts }))
+      .toEqual({ status: "needs_reconciliation", lanes: [] });
+    for (const role of ["auditor", "critic"] as const) {
+      expect(reviews.attempts("recovery-n", "claude", role).map(({ attemptOrdinal }) => attemptOrdinal))
+        .toEqual([0, 1]);
+    }
     const proof = new Database(path, { readonly: true });
-    expect({
-      attempts: proof.prepare(`SELECT COUNT(*) FROM runtime_review_lane_attempts
-        WHERE review_id='recovery-n'`).pluck().get(),
-      generations: proof.prepare(`SELECT COUNT(*) FROM runtime_review_generation_consumptions
-        WHERE review_id='recovery-n'`).pluck().get(),
-    }).toEqual(countsBeforeCorruption);
-    expect(proof.prepare(`SELECT DISTINCT status FROM runs WHERE id IN (
-      SELECT run_id FROM runtime_review_lane_attempts WHERE review_id='recovery-n')`)
-      .pluck().all()).toContain("needs_reconciliation");
+    expect(proof.prepare(`SELECT COUNT(*) FROM runtime_review_generation_consumptions
+      WHERE generation=? AND review_id='recovery-n'`).pluck().get(g3)).toBe(0);
+    expect(proof.prepare(`SELECT state FROM runtime_review_receipt_lifecycle
+      WHERE receipt_id LIKE 'g3-stale-%' ORDER BY receipt_id`).pluck().all())
+      .toEqual(["orphaned", "orphaned", "orphaned", "orphaned"]);
     proof.close();
     reviews.close();
     health.close();
@@ -787,11 +759,19 @@ describe("authority-v3 recovered review admission", () => {
     const db = new Database(path);
     const generation = db.prepare(`SELECT MAX(generation) FROM runtime_provider_recovery_generations
       WHERE agent='claude'`).pluck().get() as number;
-    for (const [kind, id] of [["source", "drift-source"], ["readiness", "drift-ready"]] as const) {
-      appendPendingReceipt(db, { receiptId: id,
-        scope: `review/source-drift/claude/auditor/${kind}`, activationNonce: "drift-nonce", generation,
-        observation: kind === "source" ? { sourceFingerprint: "source-v2", valid: true }
-          : { harnessReady: true, valid: true } });
+    const driftReceipts: Array<Record<string, unknown>> = [];
+    for (const role of ["auditor", "critic"] as const) {
+      const activationNonce = `drift-nonce-${role}`;
+      const pair: Record<string, unknown> = { agent: "claude", role, activationNonce };
+      for (const kind of ["source", "readiness"] as const) {
+        const id = `drift-${role}-${kind}`;
+        appendPendingReceipt(db, { receiptId: id,
+          scope: `review/source-drift/claude/${role}/${kind}`, activationNonce, generation,
+          observation: kind === "source" ? { sourceFingerprint: "source-v2", valid: true }
+            : { harnessReady: true, valid: true } });
+        pair[`${kind}ReceiptId`] = id;
+      }
+      driftReceipts.push(pair);
     }
     const before = db.prepare(`SELECT COUNT(*) attempts FROM runtime_review_lane_attempts
       WHERE review_id='source-drift'`).get();
@@ -799,9 +779,8 @@ describe("authority-v3 recovered review admission", () => {
     const activate = reviews.activateDeferred.bind(reviews) as unknown as
       (input: Record<string, unknown>) => Record<string, unknown>;
     expect(activate({ reviewId: "source-drift", agent: "claude", now: 12,
-      recoveryGeneration: generation, admissionReceipts: [{ role: "auditor",
-        sourceReceiptId: "drift-source", readinessReceiptId: "drift-ready",
-        activationNonce: "drift-nonce" }] })).toMatchObject({ status: "stale_artifact", lanes: [] });
+      recoveryGeneration: generation, admissionReceipts: driftReceipts }))
+      .toMatchObject({ status: "stale_artifact", lanes: [] });
     reviews.close();
     health.close();
     const reopened = new Database(path, { readonly: true });

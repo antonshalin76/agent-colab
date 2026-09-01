@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { lstatSync, realpathSync } from "node:fs";
 import Database from "better-sqlite3";
+import { openStateStoreAccess, type StateStoreInput } from "../store/state-database-fence.js";
 
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
 import {
@@ -338,18 +339,22 @@ export interface EvidenceClaimReconciliation {
 /** @internal */
 export class FlowEvidenceLedger {
   private readonly db: Database.Database;
+  private readonly closeAccess: () => void;
   private readonly backend: CanonicalEvidenceExecutionBackend;
   private readonly currentControlFingerprint: () => string;
   private readonly now: () => number;
   private readonly claimLeaseMs: number;
 
-  constructor(databasePath: string, options?: {
+  constructor(databasePath: StateStoreInput, options?: {
     backend?: CanonicalEvidenceExecutionBackend;
     controlFingerprint?: () => string;
     now?: () => number;
     claimLeaseMs?: number;
   }) {
-    this.db = new Database(databasePath);
+    const opened = openStateStoreAccess(databasePath);
+    this.db = opened.access.database;
+    this.closeAccess = opened.close;
+    try {
     this.backend = options?.backend ?? processBackend;
     this.currentControlFingerprint = options?.controlFingerprint ??
       (() => captureWorkspaceFingerprint(CONTROL_ROOT).fingerprint);
@@ -402,6 +407,10 @@ export class FlowEvidenceLedger {
       receipt_json TEXT NOT NULL,
       recorded_at INTEGER NOT NULL
     )`);
+    } catch (error) {
+      opened.close();
+      throw error;
+    }
   }
 
   private get(id: string): EvidenceReceipt | null {
@@ -901,6 +910,6 @@ export class FlowEvidenceLedger {
   }
 
   close(): void {
-    this.db.close();
+    this.closeAccess();
   }
 }

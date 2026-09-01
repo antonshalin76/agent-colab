@@ -140,7 +140,7 @@ function closeLearning(
   input: ReturnType<typeof learningBytes>,
   authority = input.authority,
 ) {
-  const control = new ConfiguredMapControlPlane(authority.databasePath, {
+  const control = new ConfiguredMapControlPlane(authority.database.borrow(), {
     controlRoot: root,
     ...(authority.controlFingerprint ? { controlFingerprint: authority.controlFingerprint } : {}),
     ...(authority.promotionCheckpoint ? { promotionCheckpoint: authority.promotionCheckpoint } : {}),

@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { openStateStoreAccess, type StateStoreInput } from "../store/state-database-fence.js";
 import { classifyOutcome, type ProviderOutcome } from "../domain/outcomes.js";
 import {
   REVIEW_PROVIDER_IDS,
@@ -80,10 +81,11 @@ const toState = (row: ProviderHealthRow): ProviderHealthState => ({
 
 export class ProviderHealthStore {
   private readonly db: Database.Database;
+  private readonly closeAccess: () => void;
   private readonly cooldownMs: number;
   private readonly attemptLeaseMs: number;
 
-  constructor(path: string, options: ProviderHealthOptions) {
+  constructor(path: StateStoreInput, options: ProviderHealthOptions) {
     if (!Number.isSafeInteger(options.cooldownMs) || options.cooldownMs <= 0) {
       throw new Error("cooldownMs must be a positive integer");
     }
@@ -92,38 +94,35 @@ export class ProviderHealthStore {
     if (!Number.isSafeInteger(this.attemptLeaseMs) || this.attemptLeaseMs <= 0) {
       throw new Error("attemptLeaseMs must be a positive integer");
     }
-    this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    const existing = this.db.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_provider_health'",
-    ).get();
-    if (existing !== undefined) {
-      try {
-        assertFreshV3Schema(this.db);
-      } catch (error) {
-        this.db.close();
-        throw error;
-      }
-    }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS runtime_provider_health (
-        agent TEXT PRIMARY KEY CHECK (agent IN ('grok', 'claude', 'codex')),
-        health TEXT NOT NULL CHECK (health IN ('healthy', 'unavailable', 'probing', 'disabled')),
-        retry_at INTEGER,
-        failure_count INTEGER NOT NULL DEFAULT 0,
-        attempt_claimed INTEGER NOT NULL DEFAULT 0 CHECK (attempt_claimed IN (0, 1)),
-        capability_verified INTEGER NOT NULL DEFAULT 0 CHECK (capability_verified IN (0, 1)),
-        updated_at INTEGER NOT NULL
-      )
-    `);
+    const opened = openStateStoreAccess(path);
     try {
+      this.db = opened.access.database;
+      this.closeAccess = opened.close;
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("busy_timeout = 5000");
+      const existing = this.db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_provider_health'",
+      ).get();
+      if (existing !== undefined) {
+        assertFreshV3Schema(this.db);
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS runtime_provider_health (
+          agent TEXT PRIMARY KEY CHECK (agent IN ('grok', 'claude', 'codex')),
+          health TEXT NOT NULL CHECK (health IN ('healthy', 'unavailable', 'probing', 'disabled')),
+          retry_at INTEGER,
+          failure_count INTEGER NOT NULL DEFAULT 0,
+          attempt_claimed INTEGER NOT NULL DEFAULT 0 CHECK (attempt_claimed IN (0, 1)),
+          capability_verified INTEGER NOT NULL DEFAULT 0 CHECK (capability_verified IN (0, 1)),
+          updated_at INTEGER NOT NULL
+        )
+      `);
       assertFreshV3Schema(this.db);
+      this.initialize(options.enabled ?? { grok: true, claude: true, codex: true });
     } catch (error) {
-      this.db.close();
+      opened.close();
       throw error;
     }
-    this.initialize(options.enabled ?? { grok: true, claude: true, codex: true });
   }
 
   private initialize(enabled: Record<ReviewProviderId, boolean>): void {
@@ -357,6 +356,6 @@ export class ProviderHealthStore {
   }
 
   close(): void {
-    this.db.close();
+    this.closeAccess();
   }
 }

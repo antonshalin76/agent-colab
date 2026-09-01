@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import { openStateStoreAccess, type StateStoreInput } from "../store/state-database-fence.js";
 import type { AgentId } from "../domain/routing.js";
 
 const assertFreshV3Schema = (db: Database.Database): void => {
@@ -66,48 +67,46 @@ const toLease = (row: LeaseRow): WorktreeLease => ({
 
 export class WorktreeLeaseStore {
   private readonly db: Database.Database;
+  private readonly closeAccess: () => void;
 
-  constructor(path: string) {
-    this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    const existing = this.db.prepare(`
-      SELECT 1 FROM sqlite_master
-       WHERE type = 'table' AND name IN ('worktree_leases', 'worktree_handoffs')
-       LIMIT 1
-    `).get();
-    if (existing !== undefined) {
-      try {
-        assertFreshV3Schema(this.db);
-      } catch (error) {
-        this.db.close();
-        throw error;
-      }
-    }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS worktree_leases (
-        worktree_path TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL,
-        lease_id TEXT NOT NULL,
-        holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
-        fencing_token INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        authority_policy TEXT NOT NULL DEFAULT 'routing-v5'
-          CHECK (authority_policy = 'routing-v5')
-      );
-      CREATE TABLE IF NOT EXISTS worktree_handoffs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id TEXT NOT NULL,
-        recorded_at INTEGER NOT NULL,
-        payload TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_worktree_handoffs_task
-        ON worktree_handoffs(task_id, id);
-    `);
+  constructor(path: StateStoreInput) {
+    const opened = openStateStoreAccess(path);
     try {
+      this.db = opened.access.database;
+      this.closeAccess = opened.close;
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("busy_timeout = 5000");
+      const existing = this.db.prepare(`
+        SELECT 1 FROM sqlite_master
+         WHERE type = 'table' AND name IN ('worktree_leases', 'worktree_handoffs')
+         LIMIT 1
+      `).get();
+      if (existing !== undefined) {
+        assertFreshV3Schema(this.db);
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS worktree_leases (
+          worktree_path TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          lease_id TEXT NOT NULL,
+          holder TEXT NOT NULL CHECK (holder IN ('grok', 'codex')),
+          fencing_token INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          authority_policy TEXT NOT NULL DEFAULT 'routing-v5'
+            CHECK (authority_policy = 'routing-v5')
+        );
+        CREATE TABLE IF NOT EXISTS worktree_handoffs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id TEXT NOT NULL,
+          recorded_at INTEGER NOT NULL,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_worktree_handoffs_task
+          ON worktree_handoffs(task_id, id);
+      `);
       assertFreshV3Schema(this.db);
     } catch (error) {
-      this.db.close();
+      opened.close();
       throw error;
     }
   }
@@ -254,6 +253,6 @@ export class WorktreeLeaseStore {
   }
 
   close(): void {
-    this.db.close();
+    this.closeAccess();
   }
 }

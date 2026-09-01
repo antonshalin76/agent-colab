@@ -1,5 +1,18 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+import { canonicalJson } from "../workflow/flow-contract.js";
 import { writeJournalAtomically } from "./journal-writer.js";
 
 export type OperationalVersion = "v1" | "v2";
@@ -468,5 +481,164 @@ export class OperationalRestore {
 
   private read(): OperationalReceipt {
     const current = this.tryRead(); if (!current) throw new Error("restore journal is missing or malformed"); return current;
+  }
+}
+
+export type StateV4GuardEvent =
+  | "backup_created"
+  | "service_reopened"
+  | "mutable_write_admitted"
+  | "restore_consumed";
+
+export interface StateV4GuardRecord {
+  schemaVersion: "state-v4-restore-guard-record/v1";
+  event: StateV4GuardEvent;
+  sequence: number;
+  previousRecordSha256: string | null;
+  databaseIdentity: string;
+  backupSha256: string;
+  tableDigestManifestSha256: string;
+  writeEpoch: string;
+  recordedAt: number;
+  recordSha256: string;
+}
+
+export type StateV4GuardFaultPoint =
+  | "after_guard_temp_write"
+  | "after_guard_file_fsync"
+  | "after_guard_rename"
+  | "after_guard_directory_fsync";
+
+const sha256Text = (value: string): string =>
+  createHash("sha256").update(value).digest("hex");
+
+const fsyncFile = (path: string): void => {
+  const descriptor = openSync(path, "r");
+  try { fsyncSync(descriptor); }
+  finally { closeSync(descriptor); }
+};
+
+const assertSha256 = (value: string, label: string): void => {
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new Error(`${label} must be a SHA-256 digest`);
+};
+
+export class StateV4RestoreGuard {
+  private readonly journalPath: string;
+
+  constructor(private readonly input: {
+    journalPath: string;
+    databaseIdentity: string;
+    backupSha256: string;
+    tableDigestManifestSha256: string;
+    writeEpoch: string;
+    faultInjector?: (point: StateV4GuardFaultPoint) => void;
+  }) {
+    this.journalPath = resolve(input.journalPath);
+    assertSha256(input.databaseIdentity, "databaseIdentity");
+    assertSha256(input.backupSha256, "backupSha256");
+    assertSha256(input.tableDigestManifestSha256, "tableDigestManifestSha256");
+    assertSha256(input.writeEpoch, "writeEpoch");
+    const parent = dirname(this.journalPath);
+    if (!existsSync(parent) || !lstatSync(parent).isDirectory() || lstatSync(parent).isSymbolicLink()) {
+      throw new Error("restore-guard directory must already exist and must not be a symlink");
+    }
+    chmodSync(parent, 0o700);
+    if (existsSync(this.journalPath) && (!lstatSync(this.journalPath).isFile() || lstatSync(this.journalPath).isSymbolicLink())) {
+      throw new Error("restore-guard journal must be a regular file");
+    }
+  }
+
+  createBackupRecord(recordedAt: number): StateV4GuardRecord {
+    if (existsSync(this.journalPath)) throw new Error("restore-guard journal already exists");
+    const record = this.makeRecord("backup_created", 1, null, recordedAt);
+    this.writeChain([record]);
+    return record;
+  }
+
+  append(event: Exclude<StateV4GuardEvent, "backup_created">, recordedAt: number): StateV4GuardRecord {
+    const records = this.readAndVerify();
+    if (records.some((record) => record.event === "restore_consumed")) {
+      throw new Error("restore-guard chain is already consumed");
+    }
+    const previous = records.at(-1)!;
+    const record = this.makeRecord(event, previous.sequence + 1, previous.recordSha256, recordedAt);
+    this.writeChain([...records, record]);
+    return record;
+  }
+
+  readAndVerify(): StateV4GuardRecord[] {
+    if (existsSync(`${this.journalPath}.pending`) || existsSync(`${this.journalPath}.tmp`)) {
+      throw new Error("restore-guard journal has an interrupted durable write");
+    }
+    if (!existsSync(this.journalPath)) throw new Error("restore-guard journal is missing");
+    const bytes = readFileSync(this.journalPath, "utf8");
+    if (!bytes.endsWith("\n")) throw new Error("restore-guard journal is truncated");
+    const lines = bytes.slice(0, -1).split("\n");
+    if (lines.length === 0 || lines.some((line) => line.length === 0)) {
+      throw new Error("restore-guard journal is malformed");
+    }
+    const records = lines.map((line) => JSON.parse(line) as StateV4GuardRecord);
+    let previous: string | null = null;
+    for (const [offset, record] of records.entries()) {
+      if (record.schemaVersion !== "state-v4-restore-guard-record/v1" ||
+          record.sequence !== offset + 1 || record.previousRecordSha256 !== previous ||
+          record.databaseIdentity !== this.input.databaseIdentity ||
+          record.backupSha256 !== this.input.backupSha256 ||
+          record.tableDigestManifestSha256 !== this.input.tableDigestManifestSha256 ||
+          record.writeEpoch !== this.input.writeEpoch || !Number.isSafeInteger(record.recordedAt) ||
+          (offset === 0 ? record.event !== "backup_created" : record.event === "backup_created")) {
+        throw new Error("restore-guard chain identity or order mismatch");
+      }
+      const digestInput = { ...record };
+      delete (digestInput as Partial<StateV4GuardRecord>).recordSha256;
+      if (record.recordSha256 !== sha256Text(canonicalJson(digestInput))) {
+        throw new Error("restore-guard record hash mismatch");
+      }
+      if (canonicalJson(record) !== lines[offset]) {
+        throw new Error("restore-guard record bytes are not canonical");
+      }
+      previous = record.recordSha256;
+    }
+    return records;
+  }
+
+  private makeRecord(
+    event: StateV4GuardEvent,
+    sequence: number,
+    previousRecordSha256: string | null,
+    recordedAt: number,
+  ): StateV4GuardRecord {
+    if (!Number.isSafeInteger(recordedAt) || recordedAt < 0) throw new Error("restore-guard timestamp is invalid");
+    const base = {
+      schemaVersion: "state-v4-restore-guard-record/v1" as const,
+      event,
+      sequence,
+      previousRecordSha256,
+      databaseIdentity: this.input.databaseIdentity,
+      backupSha256: this.input.backupSha256,
+      tableDigestManifestSha256: this.input.tableDigestManifestSha256,
+      writeEpoch: this.input.writeEpoch,
+      recordedAt,
+    };
+    return { ...base, recordSha256: sha256Text(canonicalJson(base)) };
+  }
+
+  private writeChain(records: readonly StateV4GuardRecord[]): void {
+    const temporary = `${this.journalPath}.tmp`;
+    const pending = `${this.journalPath}.pending`;
+    const bytes = `${records.map((record) => canonicalJson(record)).join("\n")}\n`;
+    writeFileSync(pending, `${records.at(-1)!.recordSha256}\n`, { mode: 0o600, flag: "wx" });
+    fsyncFile(pending);
+    fsyncFile(dirname(this.journalPath));
+    writeFileSync(temporary, bytes, { mode: 0o600, flag: "wx" });
+    this.input.faultInjector?.("after_guard_temp_write");
+    fsyncFile(temporary);
+    this.input.faultInjector?.("after_guard_file_fsync");
+    renameSync(temporary, this.journalPath);
+    this.input.faultInjector?.("after_guard_rename");
+    fsyncFile(dirname(this.journalPath));
+    this.input.faultInjector?.("after_guard_directory_fsync");
+    rmSync(pending);
+    fsyncFile(dirname(this.journalPath));
   }
 }

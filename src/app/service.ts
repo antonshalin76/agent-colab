@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import { openStateDatabaseLease, type StateDatabaseAccess } from "../store/state-database-fence.js";
 import { HistoryIndex } from "../history/index.js";
 import { buildHistoryContext } from "../history/context.js";
 import { HistoryVisibilityPolicy } from "../history/visibility-policy.js";
@@ -146,6 +147,7 @@ export const grokWorkspaceMemoryDirectory = (project: string, userRoot = homedir
 };
 
 export class LocalCollabService implements CollabService {
+  readonly stateDatabase: string;
   readonly runs: RunStore; readonly history: HistoryIndex; readonly approvals: ApprovalLedger;
   readonly providers: ProviderHealthStore; readonly reviews: RunGateUnitOfWork;
   readonly runtime: CollaborationRuntime;
@@ -154,15 +156,21 @@ export class LocalCollabService implements CollabService {
   private readonly sharedSkillsRoot = join(homedir(), ".agents", "skills");
   private readonly agentSkillRoots: Readonly<Record<"grok" | "claude" | "codex", string>>;
   private readonly evidenceCapture: ReviewEvidenceCapture;
-  constructor(readonly stateDatabase: string, options?: { allowedRoots?: string[]; historyDatabase?: string;
+  private readonly stateLease: StateDatabaseAccess;
+  constructor(stateDatabase: string | StateDatabaseAccess, options?: { allowedRoots?: string[]; historyDatabase?: string;
     agentSkillRoots?: Readonly<Record<"grok" | "claude" | "codex", string>>;
     evidenceCapture?: ReviewEvidenceCapture }) {
     const rawOptions = options as Record<string, unknown> | undefined;
     if (rawOptions && ("harnessReady" in rawOptions || "sourceFingerprint" in rawOptions)) {
       throw new Error("legacy raw review evidence options are unsupported; use typed evidence capture");
     }
-    const schema = new Database(stateDatabase, { readonly: true });
-    try { assertReviewV3SchemaSignature(schema); } finally { schema.close(); }
+    this.stateLease = typeof stateDatabase === "string"
+      ? openStateDatabaseLease(stateDatabase, "mutating_service")
+      : stateDatabase;
+    const rollback: Array<() => void> = [() => this.stateLease.close()];
+    try {
+    this.stateDatabase = this.stateLease.canonicalPath;
+    assertReviewV3SchemaSignature(this.stateLease.database);
     this.agentSkillRoots = options?.agentSkillRoots ?? {
       grok: join(homedir(), ".grok", "skills"),
       claude: join(homedir(), ".claude", "skills"),
@@ -182,16 +190,29 @@ export class LocalCollabService implements CollabService {
           : { harnessReady: false, state: "provider_unavailable", valid: false };
       },
     });
-    this.runs = new RunStore(stateDatabase);
-    const historyDatabase = options?.historyDatabase ?? join(dirname(stateDatabase), "history.db");
+    this.runs = new RunStore(this.stateLease.borrow());
+    rollback.push(() => this.runs.close());
+    const historyDatabase = options?.historyDatabase ?? join(dirname(this.stateDatabase), "history.db");
     this.history = new HistoryIndex(historyDatabase, { visibilityPolicy: new HistoryVisibilityPolicy() });
+    rollback.push(() => this.history.close());
     if (historyDatabase !== ":memory:") chmodSync(historyDatabase, 0o600);
-    this.approvals = new ApprovalLedger(stateDatabase);
-    this.providers = new ProviderHealthStore(stateDatabase, { cooldownMs: 60_000 });
-    this.reviews = new RunGateUnitOfWork(stateDatabase);
-    this.mapControl = new MapControlPlane(stateDatabase);
-    this.runtime = new CollaborationRuntime(stateDatabase);
+    this.approvals = new ApprovalLedger(this.stateLease.borrow());
+    rollback.push(() => this.approvals.close());
+    this.providers = new ProviderHealthStore(this.stateLease.borrow(), { cooldownMs: 60_000 });
+    rollback.push(() => this.providers.close());
+    this.reviews = new RunGateUnitOfWork(this.stateLease.borrow());
+    rollback.push(() => this.reviews.close());
+    this.mapControl = new MapControlPlane(this.stateLease.borrow());
+    rollback.push(() => this.mapControl.close());
+    this.runtime = new CollaborationRuntime(this.stateLease.borrow());
+    rollback.push(() => this.runtime.close());
     this.projects = new ProjectPolicy(options?.allowedRoots ?? defaultAllowedProjectRoots());
+    } catch (error) {
+      for (const close of rollback.reverse()) {
+        try { close(); } catch { /* preserve the construction error */ }
+      }
+      throw error;
+    }
   }
   async status() {
     const runs = this.runs.list();
@@ -586,5 +607,8 @@ export class LocalCollabService implements CollabService {
     this.history.reconcileSources({ agent: "codex", project, presentPaths: [...codexThreads, ...nativeMemoryPaths.codex] });
     return { indexed, warnings, memorySources };
   }
-  close(): void { this.history.close(); this.runs.close(); this.approvals.close(); this.providers.close(); this.reviews.close(); this.mapControl.close(); this.runtime.close(); }
+  close(): void {
+    this.history.close(); this.runs.close(); this.approvals.close(); this.providers.close();
+    this.reviews.close(); this.mapControl.close(); this.runtime.close(); this.stateLease.close();
+  }
 }

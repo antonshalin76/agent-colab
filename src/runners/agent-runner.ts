@@ -30,6 +30,7 @@ import {
 } from "../flow/map-admin.js";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
+import { openStateDatabaseLease } from "../store/state-database-fence.js";
 import { CollaborationRunStore } from "../store/collaboration-run-store.js";
 import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
 import { ExecutionAdmission } from "../runtime/execution-admission.js";
@@ -302,10 +303,11 @@ function taskPayload(
       throw new Error("workflow run lacks trusted durable execution identity");
     }
     const binding = ExecutionSnapshotBindingSchema.parse(payload.executionSnapshot);
-    const db = new Database(trustedDatabasePath);
-    const workflows = new CollaborationRunStore(db);
-    const reviews = new RunGateUnitOfWork(db);
-    const approvals = new ApprovalLedger(db);
+    const lease = openStateDatabaseLease(trustedDatabasePath, "mutating_service");
+    const db = lease.database;
+    const workflows = new CollaborationRunStore(lease.borrow());
+    const reviews = new RunGateUnitOfWork(lease.borrow());
+    const approvals = new ApprovalLedger(lease.borrow());
     try {
       const identity = parseDispatchIdentity(payload.workflowDispatchIdentity);
       new ExecutionAdmission(db, workflows, reviews, approvals, verifyMapProfile)
@@ -318,7 +320,7 @@ function taskPayload(
           sourceFingerprint: payload.sourceFingerprint, approvalScope: scope,
           ...(authorizationConsumerKey ? { authorizationConsumerKey } : {}), binding });
     } finally {
-      approvals.close(); reviews.close(); workflows.close(); db.close();
+      approvals.close(); reviews.close(); workflows.close(); lease.close();
     }
   } else {
     if (payload.executionSnapshot !== undefined || authorizationConsumerKey !== undefined) {

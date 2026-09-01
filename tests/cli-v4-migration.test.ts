@@ -1,9 +1,11 @@
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import { dropGraphV4Schema } from "./helpers/graph-schema.js";
 
 const launcher = resolve("scripts/agent-collab-launcher.mjs");
 const roots: string[] = [];
@@ -21,7 +23,10 @@ const fixture = () => {
   const run = (command: string) => spawnSync(process.execPath, [launcher, command], {
     cwd: resolve("."), encoding: "utf8", env, timeout: 30_000,
   });
-  return { state, systemctl, run };
+  const start = (command: string) => spawn(process.execPath, [launcher, command], {
+    cwd: resolve("."), env, stdio: ["ignore", "pipe", "pipe"],
+  });
+  return { state, systemctl, run, start };
 };
 
 const statePath = (root: string) => join(root, "collaboration.db");
@@ -69,6 +74,7 @@ const removeAuthorityExtension = (path: string): void => {
 
 const downgradeEmptyFixtureToV3 = (path: string): void => {
   removeAuthorityExtension(path);
+  dropGraphV4Schema(path);
   const db = new Database(path);
   try {
     db.exec(`
@@ -163,8 +169,41 @@ describe("CLI v4 startup and offline authority extension", () => {
 
     const migrated = fx.run("migrate-v4");
     expect(migrated.status, migrated.stderr).toBe(0);
-    expect(JSON.parse(migrated.stdout)).toEqual({ status: "migrated", fromVersion: 3, toVersion: 4 });
+    expect(JSON.parse(migrated.stdout)).toMatchObject({
+      status: "migrated", fromVersion: 3, toVersion: 4, importedProgressEvents: 3,
+    });
     expect(version(statePath(fx.state))).toBe(4);
     expect(fx.run("status").status).toBe(0);
   });
+
+  it("fsyncs service_reopened before the compatibility runtime reports itself started", async () => {
+    const fx = fixture();
+    expect(fx.run("status").status).toBe(0);
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    expect(fx.run("migrate-v4").status).toBe(0);
+    const guardPath = join(fx.state, "migration-guard",
+      readdirSync(join(fx.state, "migration-guard")).find((name) => name.endsWith(".jsonl"))!);
+    expect(readFileSync(guardPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event))
+      .toEqual(["backup_created"]);
+
+    const child = fx.start("compatibility-runtime");
+    let stdout = "";
+    await new Promise<void>((resolveReady, reject) => {
+      const timeout = setTimeout(() => reject(new Error("compatibility runtime did not start")), 10_000);
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+        if (!stdout.includes("compatibility-runtime-process-observation/v1")) return;
+        clearTimeout(timeout);
+        resolveReady();
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timeout);
+        reject(new Error(`compatibility runtime exited before observation: ${String(code)}`));
+      });
+    });
+    expect(readFileSync(guardPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event))
+      .toEqual(["backup_created", "service_reopened"]);
+    child.kill("SIGTERM");
+    await once(child, "exit");
+  }, 15_000);
 });

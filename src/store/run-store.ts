@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
 import { sanitizeResult } from "../security/redaction.js";
+import { openStateStoreAccess, type StateStoreInput } from "./state-database-fence.js";
 
 export type RunStatus = "queued" | "claimed" | "completed" | "failed" | "cancelled" | "needs_reconciliation";
 export interface RunRecord {
@@ -33,20 +34,25 @@ const parse = (value: unknown) => value == null ? undefined : JSON.parse(String(
 
 export class RunStore {
   protected readonly db: Database.Database;
-  private readonly ownsDatabase: boolean;
-  constructor(pathOrDatabase: string | Database.Database) {
-    this.ownsDatabase = typeof pathOrDatabase === "string";
-    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    const columns = new Set((this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((column) => column.name));
-    const index = this.db.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type='index' AND name='runs_due'",
-    ).get();
-    if (["payload", "attempt_count", "depends_on_run_id", "launch_info", "launched"]
-      .some((required) => !columns.has(required)) || index === undefined) {
-      if (this.ownsDatabase) this.db.close();
-      throw new Error("runs table requires current migration-owned schema");
+  private readonly closeAccess: () => void;
+  constructor(pathOrDatabase: StateStoreInput) {
+    const opened = openStateStoreAccess(pathOrDatabase);
+    try {
+      this.db = opened.access.database;
+      this.closeAccess = opened.close;
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("busy_timeout = 5000");
+      const columns = new Set((this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((column) => column.name));
+      const index = this.db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='runs_due'",
+      ).get();
+      if (["payload", "attempt_count", "depends_on_run_id", "launch_info", "launched"]
+        .some((required) => !columns.has(required)) || index === undefined) {
+        throw new Error("runs table requires current migration-owned schema");
+      }
+    } catch (error) {
+      opened.close();
+      throw error;
     }
   }
   private record(row?: DbRow): RunRecord | undefined {
@@ -466,5 +472,5 @@ export class RunStore {
       return linked + before + after;
     })();
   }
-  close(): void { if (this.ownsDatabase) this.db.close(); }
+  close(): void { this.closeAccess(); }
 }

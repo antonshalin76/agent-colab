@@ -16,6 +16,7 @@ import {
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 import { RunStore } from "../src/store/run-store.js";
+import { openStateDatabaseLease, type StateDatabaseAccess } from "../src/store/state-database-fence.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
 
 const encoder = new TextEncoder();
@@ -103,7 +104,7 @@ function closedFinding(input: {
   };
 }
 
-function seedReviewEvidence(databasePath: string, input: {
+function seedReviewEvidence(database: StateDatabaseAccess, input: {
   reviewId: string;
   projectRoot: string;
   taskPacketBytes: Uint8Array;
@@ -113,8 +114,7 @@ function seedReviewEvidence(databasePath: string, input: {
     "changes_requested" | "failed" | "needs_reconciliation";
   adverseAgent: "grok" | "claude";
 }): ReturnType<RunGateUnitOfWork["get"]> {
-  initializeCurrentExecutionSchema(databasePath);
-  const reviews = new RunGateUnitOfWork(databasePath);
+  const reviews = new RunGateUnitOfWork(database.borrow());
   const health = {
     codex: "healthy" as const,
     grok: input.optionalReviewState === "missing" || input.optionalReviewState === "grok_missing"
@@ -161,7 +161,7 @@ function seedReviewEvidence(databasePath: string, input: {
     changedFiles: 1,
     admissionReceipts,
   });
-  const providerHealth = new ProviderHealthStore(databasePath, { cooldownMs: 1_000 });
+  const providerHealth = new ProviderHealthStore(database.borrow(), { cooldownMs: 1_000 });
   for (const agent of ["codex", "grok", "claude"] as const) providerHealth.recordSuccess(agent, 101);
   providerHealth.close();
   if (!reviews.barrier(review.reviewId).satisfied) {
@@ -205,7 +205,7 @@ function seedReviewEvidence(databasePath: string, input: {
                   findings: [],
                 },
               };
-      const runs = new RunStore(databasePath);
+      const runs = new RunStore(database.borrow());
       const queued = runs.getByIdempotencyKey(attempt.idempotencyKey)!;
       const claimed = runs.claimNext({ workerId: "map-learning-fixture", leaseMs: 1_000,
         now: Date.now() + 1_000 })!;
@@ -282,6 +282,7 @@ export interface PreparedLearningFixture {
 
 export function prepareLearningFixture(input: {
   projectRoot: string;
+  database?: StateDatabaseAccess;
   candidate: MapLearningCandidate;
   mapVersion: string;
   mapManifestSha256: string;
@@ -321,7 +322,9 @@ export function prepareLearningFixture(input: {
     "node_modules/.agent-collab-test-state/collaboration.db",
   );
   mkdirSync(dirname(evidenceDatabasePath), { recursive: true });
-  const evidence = new FlowEvidenceLedger(evidenceDatabasePath, {
+  if (!input.database) initializeCurrentExecutionSchema(evidenceDatabasePath);
+  const database = input.database ?? openStateDatabaseLease(evidenceDatabasePath, "mutating_service");
+  const evidence = new FlowEvidenceLedger(database.borrow(), {
     backend: {
       execute: ({ command }) => ({
         exitCode: command.some((argument) => argument.endsWith("run-old-code-mutation.mjs")) ? 42 : 0,
@@ -354,7 +357,7 @@ export function prepareLearningFixture(input: {
     evidenceReceipts,
     findingLifecycles,
   });
-  const review = seedReviewEvidence(evidenceDatabasePath, {
+  const review = seedReviewEvidence(database, {
     reviewId,
     projectRoot: input.projectRoot,
     taskPacketBytes,
@@ -410,7 +413,7 @@ export function prepareLearningFixture(input: {
     handoffBytes,
     candidateBytes,
     authority: {
-      databasePath: evidenceDatabasePath,
+      database,
       ...(input.controlFingerprint ? { controlFingerprint: input.controlFingerprint } : {}),
     },
   };

@@ -32,6 +32,7 @@ import {
   formatMapLearningLaunchBindingContext,
 } from "../src/flow/map-admin.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
 
 const roots: string[] = [];
 
@@ -537,6 +538,7 @@ describe("MAP-004C durable v5 authority", () => {
   it("rejects legacy Grok lease bytes and denies every Grok writer path", async () => {
     const root = makeRoot("lease-v5");
     const database = join(root, "state.db");
+    createEmptyStateDatabase(database);
     const schema = new WorktreeLeaseStore(database);
     schema.close();
     const sqlite = new Database(database);

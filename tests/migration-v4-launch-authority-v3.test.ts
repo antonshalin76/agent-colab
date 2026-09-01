@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
 import { RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
+import { installGraphV4Schema } from "./helpers/graph-schema.js";
 
 const roots: string[] = [];
 
@@ -117,6 +118,7 @@ function buildPopulatedPreCapabilityV4(path: string): void {
     PRAGMA user_version=4;
   `);
   db.close();
+  installGraphV4Schema(path);
 }
 
 const LEGACY_TABLES = [
@@ -414,8 +416,8 @@ describe("v4 capability-gated launch authority v3", () => {
     const reviews = new RunGateUnitOfWork(path);
     expect(reviews.attempts("legacy-v1", "codex", "auditor")).toHaveLength(2);
     expect(reviews.attempts("legacy-v2", "codex", "auditor")).toHaveLength(1);
-    expect(reviews.barrier("legacy-v1")).toMatchObject({ requiredCount: 1 });
-    expect(reviews.barrier("legacy-v2")).toMatchObject({ requiredCount: 1 });
+    expect(() => reviews.barrier("legacy-v1")).toThrow(/exact .*auditor\/critic topology/i);
+    expect(() => reviews.barrier("legacy-v2")).toThrow(/exact .*auditor\/critic topology/i);
     reviews.close();
     const proof = new Database(path, { readonly: true });
     for (const table of ["runtime_review_attempt_authorities", "runtime_review_receipts",

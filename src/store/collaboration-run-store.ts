@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { isDeepStrictEqual } from "node:util";
 import { sanitizeResult } from "../security/redaction.js";
+import { openStateStoreAccess, type StateStoreInput } from "./state-database-fence.js";
 import {
   restoreCollaborationRun,
   serializeCollaborationRun,
@@ -40,39 +41,43 @@ const immutableWorkflowInput = (run: CollaborationRun) => sanitizeResult({
 
 export class CollaborationRunStore {
   private readonly db: Database.Database;
-  private readonly ownsDatabase: boolean;
+  private readonly closeAccess: () => void;
 
-  constructor(pathOrDatabase: string | Database.Database) {
-    this.ownsDatabase = typeof pathOrDatabase === "string";
-    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    this.db.pragma("foreign_keys = ON");
-    const outboxColumns = new Set(
-      (this.db.prepare("PRAGMA table_info(collaboration_dispatch_outbox)").all() as Array<{ name: string }>)
-        .map((column) => column.name),
-    );
-    const runColumns = new Set(
-      (this.db.prepare("PRAGMA table_info(collaboration_runs)").all() as Array<{ name: string }>)
-        .map((column) => column.name),
-    );
-    const index = this.db.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type='index' AND name='collaboration_outbox_pending'",
-    ).get();
-    if (!["workflow_id", "state_json", "version", "updated_at"].every((column) => runColumns.has(column)) ||
-        !["dispatch_id", "workflow_id", "payload_json", "published_at", "terminal_reason"]
-          .every((column) => outboxColumns.has(column)) || index === undefined) {
-      if (this.ownsDatabase) this.db.close();
-      throw new Error("collaboration store requires current migration-owned schema");
-    }
-    const legacy = this.db.prepare("SELECT state_json FROM collaboration_runs ORDER BY workflow_id")
-      .all() as Array<{ state_json: string }>;
-    if (legacy.some(({ state_json }) => {
-      const state = JSON.parse(state_json) as { policyVersion?: unknown };
-      return state.policyVersion !== "routing-v5";
-    })) {
-      if (this.ownsDatabase) this.db.close();
-      throw new Error("collaboration runs require offline routing-v5 migration");
+  constructor(pathOrDatabase: StateStoreInput) {
+    const opened = openStateStoreAccess(pathOrDatabase);
+    try {
+      this.db = opened.access.database;
+      this.closeAccess = opened.close;
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("busy_timeout = 5000");
+      this.db.pragma("foreign_keys = ON");
+      const outboxColumns = new Set(
+        (this.db.prepare("PRAGMA table_info(collaboration_dispatch_outbox)").all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      const runColumns = new Set(
+        (this.db.prepare("PRAGMA table_info(collaboration_runs)").all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      const index = this.db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='collaboration_outbox_pending'",
+      ).get();
+      if (!["workflow_id", "state_json", "version", "updated_at"].every((column) => runColumns.has(column)) ||
+          !["dispatch_id", "workflow_id", "payload_json", "published_at", "terminal_reason"]
+            .every((column) => outboxColumns.has(column)) || index === undefined) {
+        throw new Error("collaboration store requires current migration-owned schema");
+      }
+      const legacy = this.db.prepare("SELECT state_json FROM collaboration_runs ORDER BY workflow_id")
+        .all() as Array<{ state_json: string }>;
+      if (legacy.some(({ state_json }) => {
+        const state = JSON.parse(state_json) as { policyVersion?: unknown };
+        return state.policyVersion !== "routing-v5";
+      })) {
+        throw new Error("collaboration runs require offline routing-v5 migration");
+      }
+    } catch (error) {
+      opened.close();
+      throw error;
     }
   }
 
@@ -225,5 +230,5 @@ export class CollaborationRunStore {
     }).immediate();
   }
 
-  close(): void { if (this.ownsDatabase) this.db.close(); }
+  close(): void { this.closeAccess(); }
 }

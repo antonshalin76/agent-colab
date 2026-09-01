@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
+import { openStateStoreAccess, type StateDatabaseAccess, type StateStoreInput } from "../store/state-database-fence.js";
 import canonicalize from "canonicalize";
 import {
+  assertExactReviewTopology,
   createReviewPlan,
+  hasExactReviewTopology,
   REVIEW_BARRIER_POLICY,
+  REVIEW_ROLES,
   reviewDecisionFor,
   type ReviewRole,
 } from "../domain/review.js";
@@ -436,21 +440,24 @@ const laneSnapshot = (row: LaneRow, attempts: ReviewAttemptSnapshot[] = []): Rev
 export class RunGateUnitOfWork {
   private readonly db: Database.Database;
   private readonly runs: RunStore;
-  private readonly ownsDatabase: boolean;
+  private readonly access: StateDatabaseAccess;
+  private readonly closeAccess: () => void;
   private readonly hasLaunchAuthorityVersion: boolean;
 
-  constructor(pathOrDatabase: string | Database.Database) {
-    this.ownsDatabase = typeof pathOrDatabase === "string";
-    this.db = this.ownsDatabase ? new Database(pathOrDatabase as string) : pathOrDatabase as Database.Database;
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    this.db.pragma("foreign_keys = ON");
-    const existing = this.db.prepare(`
-      SELECT 1 FROM sqlite_master
-       WHERE type = 'table' AND name IN ('runtime_review_barriers', 'runtime_review_lanes')
-       LIMIT 1
-    `).get();
+  constructor(pathOrDatabase: StateStoreInput) {
+    const opened = openStateStoreAccess(pathOrDatabase);
     try {
+      this.access = opened.access;
+      this.closeAccess = opened.close;
+      this.db = this.access.database;
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("busy_timeout = 5000");
+      this.db.pragma("foreign_keys = ON");
+      const existing = this.db.prepare(`
+        SELECT 1 FROM sqlite_master
+         WHERE type = 'table' AND name IN ('runtime_review_barriers', 'runtime_review_lanes')
+         LIMIT 1
+      `).get();
       if (existing === undefined) throw new Error("review gate requires migration-owned schema");
       assertDatabaseIntegrity(this.db);
       assertFreshV5Schema(this.db);
@@ -461,9 +468,9 @@ export class RunGateUnitOfWork {
       this.hasLaunchAuthorityVersion = tableSchema(this.db, "runtime_review_barriers")
         .includes("launch_authority_version");
       assertDatabaseIntegrity(this.db);
-      this.runs = new RunStore(this.db);
+      this.runs = new RunStore(this.access.borrow());
     } catch (error) {
-      if (this.ownsDatabase) this.db.close();
+      opened.close();
       throw error;
     }
   }
@@ -815,6 +822,7 @@ export class RunGateUnitOfWork {
       const existing = this.reviewRow(input.reviewId);
       if (existing !== undefined) {
         const snapshot = this.snapshot(existing);
+        assertExactReviewTopology(snapshot.lanes);
         const promptsMatch = snapshot.lanes.every(
           (lane) => lane.prompt === input.prompts[lane.role],
         );
@@ -1197,11 +1205,10 @@ export class RunGateUnitOfWork {
   barrier(reviewId: string): { satisfied: boolean; terminalCount: number; requiredCount: number } {
     if (this.reviewRow(reviewId) === undefined) throw new Error(`Unknown review: ${reviewId}`);
     const lanes = this.laneRows(reviewId);
+    assertExactReviewTopology(lanes);
     const review = this.reviewRow(reviewId)!;
     const required = lanes.filter((lane) => lane.agent === REVIEW_BARRIER_POLICY.requiredAgent);
-    const requiredCount = review.launch_authority_version === 3
-      ? REVIEW_BARRIER_POLICY.requiredRoles.length
-      : required.length;
+    const requiredCount = REVIEW_BARRIER_POLICY.requiredRoles.length;
     const requiredPass = required.length === requiredCount && required.every((lane) =>
       isSemanticPass(lane) && this.hasExactRunnerEvidence(review, laneSnapshot(
         lane,
@@ -1270,7 +1277,7 @@ export class RunGateUnitOfWork {
       review.requester !== input.requester ||
       review.sourceFingerprint !== input.sourceFingerprint ||
       review.changedFiles !== input.changedFiles ||
-      review.lanes.length !== 6 ||
+      !hasExactReviewTopology(review.lanes) ||
       review.lanes.some((lane) => lane.prompt !== input.prompts[lane.role]) ||
       this.barrier(input.reviewId).satisfied !== true
     ) {
@@ -1413,7 +1420,9 @@ export class RunGateUnitOfWork {
   admissionTuple(reviewId: string, agent: ReviewProviderId, role: ReviewRole): {
     laneRevision: number; latestOrdinal: number | null; latestEvidenceHash: string | null;
   } {
-    const lane = this.laneRows(reviewId).find((candidate) =>
+    const lanes = this.laneRows(reviewId);
+    assertExactReviewTopology(lanes);
+    const lane = lanes.find((candidate) =>
       candidate.agent === agent && candidate.role === role);
     if (!lane) throw new Error("Unknown review lane");
     const attempts = this.attemptsFor(reviewId, agent, role);
@@ -1498,6 +1507,25 @@ export class RunGateUnitOfWork {
         WHERE review_id=? AND agent=? AND generation=? ORDER BY role`).all(
           input.reviewId, input.agent, input.recoveryGeneration,
         ) as Array<{ role: ReviewRole; authority_id: string }>;
+      const orphanPendingAdmissionReceipts = (): void => {
+        for (const pair of input.admissionReceipts) {
+          for (const receiptId of [pair.sourceReceiptId, pair.readinessReceiptId]) {
+            const pending = this.db.prepare(`SELECT r.* FROM runtime_review_receipts r
+              LEFT JOIN runtime_review_receipt_lifecycle l ON l.receipt_id=r.receipt_id
+              WHERE r.receipt_id=? AND l.receipt_id IS NULL`).get(receiptId) as Record<string, unknown> | undefined;
+            if (!pending) continue;
+            this.db.prepare(`INSERT INTO runtime_review_receipt_lifecycle
+              (receipt_id,state,scope_revision,activation_nonce,expected_tuple_json,
+               recovery_generation,predecessor_receipt_id,recorded_at)
+              VALUES (?,?,?,?,?,?,?,?)`).run(
+                pending.receipt_id, "orphaned", pending.scope_revision, pending.activation_nonce,
+                pending.expected_tuple_json, pending.recovery_generation,
+                pending.predecessor_receipt_id, input.now);
+            this.db.prepare(`DELETE FROM runtime_review_receipt_heads
+              WHERE scope=? AND receipt_id=?`).run(pending.scope, pending.receipt_id);
+          }
+        }
+      };
       if (existingConsumptions.length > 0 && existingConsumptions.every(({ role, authority_id }) => {
         if (typeof authority_id !== "string") return false;
         const authorityOrdinal = this.db.prepare(`SELECT attempt_ordinal
@@ -1506,25 +1534,9 @@ export class RunGateUnitOfWork {
           FROM runtime_review_lane_attempts WHERE review_id=? AND agent=? AND role=?`)
           .pluck().get(input.reviewId, input.agent, role);
         return authorityOrdinal !== undefined && authorityOrdinal === latestOrdinal;
-      })) {
-        for (const pair of input.admissionReceipts) {
-          for (const receiptId of [pair.sourceReceiptId, pair.readinessReceiptId]) {
-            const pending = this.db.prepare(`SELECT r.* FROM runtime_review_receipts r
-              LEFT JOIN runtime_review_receipt_lifecycle l ON l.receipt_id=r.receipt_id
-              WHERE r.receipt_id=? AND l.receipt_id IS NULL`).get(receiptId) as Record<string, unknown> | undefined;
-            if (pending) {
-              this.db.prepare(`INSERT INTO runtime_review_receipt_lifecycle
-                (receipt_id,state,scope_revision,activation_nonce,expected_tuple_json,
-                 recovery_generation,predecessor_receipt_id,recorded_at)
-                VALUES (?,?,?,?,?,?,?,?)`).run(
-                  pending.receipt_id, "orphaned", pending.scope_revision, pending.activation_nonce,
-                  pending.expected_tuple_json, pending.recovery_generation,
-                  pending.predecessor_receipt_id, input.now);
-              this.db.prepare(`DELETE FROM runtime_review_receipt_heads
-                WHERE scope=? AND receipt_id=?`).run(pending.scope, pending.receipt_id);
-            }
-          }
-        }
+      }) && existingConsumptions.length === REVIEW_ROLES.length &&
+          REVIEW_ROLES.every((role) => existingConsumptions.some((row) => row.role === role))) {
+        orphanPendingAdmissionReceipts();
         const lanes = existingConsumptions.map(({ role }) => {
           const lane = this.snapshot(review).lanes.find((candidate) =>
             candidate.agent === input.agent && candidate.role === role)!;
@@ -1552,7 +1564,23 @@ export class RunGateUnitOfWork {
         });
         return { status: "activated" as const, lanes };
       }
-      if (existingConsumptions.length > 0) return { status: "none" as const, lanes: [] };
+      if (existingConsumptions.length > 0) {
+        orphanPendingAdmissionReceipts();
+        return { status: "needs_reconciliation" as const, lanes: [] };
+      }
+
+      const receiptRoles = input.admissionReceipts.map(({ role }) => role).sort();
+      const deferredRoles = this.laneRows(input.reviewId)
+        .filter((lane) => lane.agent === input.agent && lane.status === "deferred")
+        .map(({ role }) => role).sort();
+      const exactPair = input.admissionReceipts.length === REVIEW_ROLES.length &&
+        input.admissionReceipts.every((pair) => pair.agent === undefined || pair.agent === input.agent) &&
+        REVIEW_ROLES.every((role, index) => receiptRoles[index] === role) &&
+        REVIEW_ROLES.every((role, index) => deferredRoles[index] === role);
+      if (!exactPair) {
+        orphanPendingAdmissionReceipts();
+        return { status: "none" as const, lanes: [] };
+      }
 
       type ReceiptRow = Record<string, unknown>;
       const prepared: Array<{
@@ -1599,12 +1627,18 @@ export class RunGateUnitOfWork {
         }
         prepared.push({ lane, pair, source: source!, readiness: readiness!, tuple });
       }
-      if (prepared.length === 0) return { status: "none" as const, lanes: [] };
+      if (prepared.length !== REVIEW_ROLES.length ||
+          !REVIEW_ROLES.every((role) => prepared.some(({ lane }) => lane.role === role))) {
+        orphanPendingAdmissionReceipts();
+        return { status: "none" as const, lanes: [] };
+      }
 
       const descriptors: LaneEnqueueDescriptor[] = [];
       for (const { lane, pair, source, readiness, tuple } of prepared) {
         const latest = this.attemptsFor(input.reviewId, input.agent, lane.role).at(-1);
-        if (latest && latest.status !== "provider_unavailable") continue;
+        if (latest && latest.status !== "provider_unavailable") {
+          throw new Error("review provider pair has a non-rejoinable lane attempt");
+        }
         const ordinal = latest ? latest.attemptOrdinal + 1 : 0;
         const authorityKind = latest ? "recovery" : "first_admission";
         const policy = this.db.prepare(`SELECT * FROM runtime_review_attempt_base_policies
@@ -1637,7 +1671,7 @@ export class RunGateUnitOfWork {
             identity.sessionId, identity.idempotencyKey, input.reviewId, input.agent, lane.role,
             tuple.laneRevision,
           ).changes;
-        if (claimed !== 1) continue;
+        if (claimed !== 1) throw new Error("review provider pair activation CAS lost");
         input.faultInjector?.("after_lane_cas");
         this.db.prepare(`INSERT INTO runtime_review_generation_consumptions
           (generation,review_id,agent,role,authority_id) VALUES (?,?,?,?,?)`).run(
@@ -1705,9 +1739,10 @@ export class RunGateUnitOfWork {
         descriptors.push(descriptor);
       }
       input.faultInjector?.("before_activation_commit");
-      return descriptors.length === 0
-        ? { status: "none" as const, lanes: [] }
-        : { status: "activated" as const, lanes: descriptors };
+      if (descriptors.length !== REVIEW_ROLES.length) {
+        throw new Error("review provider pair activation was not atomic");
+      }
+      return { status: "activated" as const, lanes: descriptors };
     });
     const result = activate.immediate();
     input.faultInjector?.("after_activation_commit_before_response");
@@ -1779,6 +1814,8 @@ export class RunGateUnitOfWork {
         (lane) => lane.agent === input.agent && lane.status === "deferred" &&
           this.attemptsFor(input.reviewId, lane.agent, lane.role).length === 0,
       );
+      if (deferred.length !== REVIEW_ROLES.length ||
+          !REVIEW_ROLES.every((role) => deferred.some((lane) => lane.role === role))) return [];
       const descriptors: LaneEnqueueDescriptor[] = [];
       for (const lane of deferred) {
         const claimed = this.db.prepare(`UPDATE runtime_review_lanes
@@ -1786,7 +1823,7 @@ export class RunGateUnitOfWork {
           WHERE review_id=? AND agent=? AND role=? AND status='deferred'`).run(
             input.reviewId, lane.agent, lane.role,
           ).changes;
-        if (claimed !== 1) continue;
+        if (claimed !== 1) throw new Error("review provider pair activation CAS lost");
         const descriptor: LaneEnqueueDescriptor = {
           reviewId: review.review_id,
           stageId: review.stage_id,
@@ -1816,6 +1853,9 @@ export class RunGateUnitOfWork {
             input.reviewId, lane.agent, lane.role, 0, run.id, input.now,
           );
         descriptors.push(descriptor);
+      }
+      if (descriptors.length !== REVIEW_ROLES.length) {
+        throw new Error("review provider pair activation was not atomic");
       }
       return descriptors;
     });
@@ -2051,6 +2091,6 @@ export class RunGateUnitOfWork {
 
   close(): void {
     this.runs.close();
-    if (this.ownsDatabase) this.db.close();
+    this.closeAccess();
   }
 }

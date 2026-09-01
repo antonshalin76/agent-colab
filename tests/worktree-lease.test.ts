@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorktreeLeaseStore } from "../src/worktree/lease-store.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
 
 const roots: string[] = [];
 const makeDb = () => {
   const root = mkdtempSync(join(tmpdir(), "agent-collab-lease-"));
   roots.push(root);
-  return join(root, "leases.db");
+  const path = join(root, "leases.db");
+  return createEmptyStateDatabase(path);
 };
 
 afterEach(() => {

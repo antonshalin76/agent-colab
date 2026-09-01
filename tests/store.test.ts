@@ -9,6 +9,7 @@ import {
   type ReviewAdmissionReceiptPair,
 } from "../src/runtime/run-gate-unit-of-work.js";
 import { CollaborationRunStore } from "../src/store/collaboration-run-store.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
 import Database from "better-sqlite3";
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 
@@ -196,6 +197,7 @@ describe("durable run store", () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-ddl-owner-"));
     roots.push(root);
     const path = join(root, "state.db");
+    createEmptyStateDatabase(path);
     expect(() => open(path)).toThrow(/migration-owned schema|current migration-owned schema/i);
     const db = new Database(path, { readonly: true });
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()).toEqual([]);

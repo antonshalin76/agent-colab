@@ -1,4 +1,3 @@
-import Database from "better-sqlite3";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +8,7 @@ import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprin
 import { ApprovalLedger } from "../src/security/approval-ledger.js";
 import { CollaborationRunStore } from "../src/store/collaboration-run-store.js";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+import { openStateDatabaseLease } from "../src/store/state-database-fence.js";
 import { createCollaborationRun, type CollaborationRun, type StageDefinition } from "../src/workflow/workflow.js";
 import {
   createCurrentMapLearningLaunchBinding,
@@ -26,10 +26,11 @@ const fixture = () => {
   roots.push(root);
   const project = join(root, "project"); mkdirSync(project);
   const database = join(root, "state.db"); initializeCurrentExecutionSchema(database);
-  const db = new Database(database);
-  const workflows = new CollaborationRunStore(db);
-  const reviews = new RunGateUnitOfWork(db);
-  const approvals = new ApprovalLedger(db);
+  const databaseLease = openStateDatabaseLease(database, "mutating_service");
+  const db = databaseLease.database;
+  const workflows = new CollaborationRunStore(databaseLease.borrow());
+  const reviews = new RunGateUnitOfWork(databaseLease.borrow());
+  const approvals = new ApprovalLedger(databaseLease.borrow());
   const workspace = captureWorkspaceFingerprint(project);
   const mapLearning = createCurrentMapLearningLaunchBinding("codex");
   const stage: StageDefinition = {
@@ -43,11 +44,11 @@ const fixture = () => {
   const run = createCollaborationRun({ taskId: "task", origin: "codex",
     health: { grok: "healthy", codex: "healthy" }, stages: [stage] });
   approvals.issue({ reference: "approval", project, scope: "workspace-write", expiresAt: Date.now() + 60_000 });
-  return { root, project, db, workflows, reviews, approvals, run };
+  return { root, project, db, databaseLease, workflows, reviews, approvals, run };
 };
 
 const close = (input: ReturnType<typeof fixture>) => {
-  input.approvals.close(); input.reviews.close(); input.workflows.close(); input.db.close();
+  input.approvals.close(); input.reviews.close(); input.workflows.close(); input.databaseLease.close();
 };
 
 const acceptingReviews = { assertExactSemanticPass: () => undefined } as unknown as RunGateUnitOfWork;

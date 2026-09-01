@@ -3,7 +3,7 @@ import { accessSync, constants, mkdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import Database from "better-sqlite3";
 import { execa } from "execa";
@@ -17,7 +17,8 @@ import {
   type ProviderHealthSnapshot,
   type ReviewProviderId,
 } from "./domain/routing.js";
-import { doctorV1, initializeCurrentExecutionSchema, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle, verifyCompatibilityRuntime } from "./migration/coordinator.js";
+import { doctorV1, doctorV1Databases, initializeCurrentExecutionSchemaDatabase, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle, verifyCompatibilityRuntime } from "./migration/coordinator.js";
+import { openStateDatabaseLease, type StateDatabaseAdmissionMode, type StateDatabaseLease } from "./store/state-database-fence.js";
 import { assertReviewV3SchemaSignature } from "./migration/review-v3-schema.js";
 import { startStdioCollabServer } from "./mcp/server.js";
 import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
@@ -36,7 +37,7 @@ import { ReviewEvidenceCapture } from "./runtime/review-evidence-capture.js";
 import { matchesExactPrelaunchCliMissing } from "./runtime/prelaunch-evidence.js";
 import { defaultAllowedProjectRoots, ProjectPolicy } from "./security/project-policy.js";
 import { runCapabilityProbes, type CapabilityProbeRunner } from "./probes/capability-probe.js";
-import { ensureStateLayout, GRAPH_EXECUTION_MODE, openExistingStateLayout } from "./store/state-layout.js";
+import { acquireStateRootLease, ensureStateLayout, GRAPH_EXECUTION_MODE, openExistingStateLayout } from "./store/state-layout.js";
 import { RunStore, type RunRecord } from "./store/run-store.js";
 import { DurableWorker } from "./worker/durable-worker.js";
 import { WorktreeLeaseStore, type WorktreeLease } from "./worktree/lease-store.js";
@@ -53,19 +54,48 @@ import {
 } from "./worker/domain-effect.js";
 
 const command = process.argv[2] ?? "status";
+type CliStateAdmissionMode = StateDatabaseAdmissionMode | "exclusive_migration";
+const CLI_STATE_ADMISSION = {
+  "compatibility-status": "offline_observation",
+  "compatibility-runtime": "service_runtime",
+  "doctor-v1": "offline_observation",
+  "verify-bundle": "offline_observation",
+  "restore-v1": "exclusive_migration",
+  "migrate-v2": "exclusive_migration",
+  "migrate-v3": "exclusive_migration",
+  "migrate-v4": "exclusive_migration",
+  "extend-review-v3-schema": "exclusive_migration",
+  "map-learn-close": "mutating_service",
+  "map-evidence-record": "mutating_service",
+  "reconcile-run": "mutating_service",
+  mcp: "mutating_service",
+  worker: "mutating_service",
+  index: "mutating_service",
+  probe: "mutating_service",
+  approve: "mutating_service",
+  status: "mutating_service",
+  doctor: "mutating_service",
+} as const satisfies Record<string, CliStateAdmissionMode>;
+const commandAdmission = CLI_STATE_ADMISSION[command as keyof typeof CLI_STATE_ADMISSION];
+if (!commandAdmission) throw new Error(`unknown command: ${command}`);
+if (command === "verify-bundle") {
+  console.log(JSON.stringify(verifyBundle(resolve(process.argv[3] ?? "")), null, 2));
+  process.exit(0);
+}
 const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local", "share", "agent-collab");
 if (command === "mcp" || command === "worker") {
   assertProductionRuntimeReleased();
 }
 const compatibilityOnly = command === "compatibility-status" || command === "compatibility-runtime";
-const layout = compatibilityOnly ? openExistingStateLayout(stateRoot) : ensureStateLayout(stateRoot);
+const existingStateOnly = compatibilityOnly || command === "doctor-v1" || command === "restore-v1";
+const layout = existingStateOnly ? openExistingStateLayout(stateRoot) : ensureStateLayout(stateRoot);
 
 if (compatibilityOnly) {
-  const compatibility = verifyCompatibilityRuntime({
-    stateDatabase: layout.database,
-    historyDatabase: layout.historyDatabase,
-  });
+  const lease = openStateDatabaseLease(layout.database,
+    commandAdmission as StateDatabaseAdmissionMode, { readonly: true });
+  const compatibility = verifyCompatibilityRuntime({ stateDatabase: layout.database, historyDatabase: layout.historyDatabase });
   if (command === "compatibility-status") {
+    lease.close();
     console.log(JSON.stringify(compatibility, null, 2));
     process.exit(0);
   }
@@ -90,6 +120,7 @@ if (compatibilityOnly) {
     await stopped;
   } finally {
     clearInterval(keepAlive);
+    lease.close();
   }
   process.exit(0);
 }
@@ -153,35 +184,36 @@ const capabilityProbeProviders = (enabledAgent?: ReviewProviderId) => {
 const isReviewProviderId = (value: unknown): value is ReviewProviderId =>
   typeof value === "string" && REVIEW_PROVIDERS.some((agent) => agent === value);
 
-const tableExists = (database: string, table: string): boolean => {
+const historyTableExists = (database: string, table: string): boolean => {
   const db = new Database(database, { readonly: true });
   try { return db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== undefined; }
   finally { db.close(); }
 };
 
-const schemaVersion = (database: string): number => {
+const historySchemaVersion = (database: string): number => {
   const db = new Database(database, { readonly: true });
   try { return Number(db.pragma("user_version", { simple: true })); }
   finally { db.close(); }
 };
 
-const assertCurrentAuthoritySchema = (database: string): void => {
-  const db = new Database(database, { readonly: true });
-  try { assertReviewV3SchemaSignature(db); } finally { db.close(); }
-};
+const assertCurrentAuthoritySchema = (db: Database.Database): void => assertReviewV3SchemaSignature(db);
 
 const markFreshHistoryV2 = (database: string): void => {
   const db = new Database(database);
   try { db.pragma("user_version = 2"); } finally { db.close(); }
 };
 
-const prepareDatabases = (): void => {
-  const hasState = tableExists(layout.database, "runtime_provider_health");
-  const hasHistory = tableExists(layout.historyDatabase, "sources");
+const prepareDatabases = (mode: StateDatabaseAdmissionMode = "mutating_service"): StateDatabaseLease => {
+  const lease = openStateDatabaseLease(layout.database, mode);
+  const state = lease.database;
+  try {
+  const hasState = state.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+    .get("runtime_provider_health") !== undefined;
+  const hasHistory = historyTableExists(layout.historyDatabase, "sources");
   if (hasState !== hasHistory) throw new Error("state/history schema pair is incomplete; refusing automatic repair");
   if (hasState) {
-    const stateVersion = schemaVersion(layout.database);
-    const historyVersion = schemaVersion(layout.historyDatabase);
+    const stateVersion = Number(state.pragma("user_version", { simple: true }));
+    const historyVersion = historySchemaVersion(layout.historyDatabase);
     if (stateVersion === 2 && historyVersion === 2) {
       throw new Error("offline migration required: state=2, history=2; run migrate-v3 while the service is stopped");
     }
@@ -193,19 +225,24 @@ const prepareDatabases = (): void => {
       historyDatabase: layout.historyDatabase,
     });
     if (compatibility.stateVersion === 4) {
-      assertCurrentAuthoritySchema(layout.database);
-      return;
+      assertCurrentAuthoritySchema(state);
+      return lease;
     }
     throw new Error(`offline migration required: state=${compatibility.stateVersion}, history=${compatibility.historyVersion}; run migrate-v4 while the service is stopped`);
   }
-  initializeCurrentExecutionSchema(layout.database);
-  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  initializeCurrentExecutionSchemaDatabase(state);
+  const service = new LocalCollabService(lease.borrow(), { historyDatabase: layout.historyDatabase });
   service.close();
   markFreshHistoryV2(layout.historyDatabase);
-  if (schemaVersion(layout.database) !== 4 || schemaVersion(layout.historyDatabase) !== 2) {
+  if (Number(state.pragma("user_version", { simple: true })) !== 4 || historySchemaVersion(layout.historyDatabase) !== 2) {
     throw new Error("fresh database initialization did not produce the required state=4, history=2 schema pair");
   }
-  assertCurrentAuthoritySchema(layout.database);
+  assertCurrentAuthoritySchema(state);
+  return lease;
+  } catch (error) {
+    lease.close();
+    throw error;
+  }
 };
 
 if (command === "map-learn-close") {
@@ -215,8 +252,8 @@ if (command === "map-learn-close") {
   if (!process.argv[3] || !process.argv[4] || !process.argv[5] || process.argv.length > 6) {
     throw new Error("Usage: agent-collab map-learn-close <task-packet> <handoff> <candidate>");
   }
-  prepareDatabases();
-  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  const lease = prepareDatabases();
+  const service = new LocalCollabService(lease, { historyDatabase: layout.historyDatabase });
   try {
     console.log(JSON.stringify(service.closeMapLearning({
       taskPacketBytes: readFileSync(taskPacketPath),
@@ -241,8 +278,8 @@ if (command === "map-evidence-record") {
   ].includes(purpose)) {
     throw new Error("Usage: agent-collab map-evidence-record <finding-lifecycle.json> <code_or_artifact_fix|old_code_sensitive_regression|sibling_surface_scan> <evidence-id> <candidate-sha256>");
   }
-  prepareDatabases();
-  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  const lease = prepareDatabases();
+  const service = new LocalCollabService(lease, { historyDatabase: layout.historyDatabase });
   try {
     const receipt = service.recordMapLearningEvidence({
       purpose: purpose as "code_or_artifact_fix" | "old_code_sensitive_regression" | "sibling_surface_scan",
@@ -272,16 +309,25 @@ if (command === "doctor-v1") {
   process.exit(0);
 }
 
-if (command === "verify-bundle") {
-  console.log(JSON.stringify(verifyBundle(resolve(process.argv[3] ?? "")), null, 2));
-  process.exit(0);
-}
-
 if (command === "restore-v1") {
   assertServiceInactive();
-  const restored = restoreV1Bundle({ bundleDirectory: resolve(process.argv[3] ?? ""),
-    stateDatabase: layout.database, historyDatabase: layout.historyDatabase });
-  const doctor = doctorV1({ stateDatabase: layout.database, historyDatabase: layout.historyDatabase });
+  const rootLease = acquireStateRootLease(layout.root, "exclusive");
+  let restored: ReturnType<typeof restoreV1Bundle>;
+  let doctor: ReturnType<typeof doctorV1Databases>;
+  try {
+    rootLease.assertCurrent();
+    const stateDatabase = join(rootLease.pinnedRoot, basename(layout.database));
+    const historyDatabase = join(rootLease.pinnedRoot, basename(layout.historyDatabase));
+    restored = restoreV1Bundle({ bundleDirectory: resolve(process.argv[3] ?? ""),
+      stateDatabase, historyDatabase });
+    const state = new Database(stateDatabase, { readonly: true });
+    const history = new Database(historyDatabase, { readonly: true });
+    try { doctor = doctorV1Databases(state, history); }
+    finally { state.close(); history.close(); }
+    rootLease.assertCurrent();
+  } finally {
+    rootLease.release();
+  }
   if (!doctor.readyForMigration) throw new Error(`restored v1 bundle failed doctor: ${doctor.blockers.join(", ")}`);
   console.log(JSON.stringify({ ...restored, doctor }, null, 2));
   process.exit(0);
@@ -318,22 +364,11 @@ if (command === "migrate-v3") {
 
 if (command === "migrate-v4") {
   assertServiceInactive();
-  verifyCompatibilityRuntime({
-    stateDatabase: layout.database,
-    historyDatabase: layout.historyDatabase,
-  });
   const coordinator = new MigrationCoordinator({
     stateDatabase: layout.database,
     historyDatabase: layout.historyDatabase,
   });
-  const stateVersion = schemaVersion(layout.database);
-  const historyVersion = schemaVersion(layout.historyDatabase);
-  if (stateVersion === 4 && historyVersion !== 2) {
-    throw new Error(`v4 migration requires history=2; found state=${stateVersion}, history=${historyVersion}`);
-  }
-  const result = stateVersion === 4
-    ? { status: "already_current" as const, fromVersion: 4, toVersion: 4 }
-    : coordinator.migrateToV4();
+  const result = coordinator.migrateToV4();
   coordinator.extendReviewV3SchemaOffline();
   console.log(JSON.stringify(result, null, 2));
   process.exit(0);
@@ -341,11 +376,6 @@ if (command === "migrate-v4") {
 
 if (command === "extend-review-v3-schema") {
   assertServiceInactive();
-  const stateVersion = schemaVersion(layout.database);
-  const historyVersion = schemaVersion(layout.historyDatabase);
-  if (stateVersion !== 4 || historyVersion !== 2) {
-    throw new Error(`review-v3 schema extension requires state=4, history=2; found state=${stateVersion}, history=${historyVersion}`);
-  }
   new MigrationCoordinator({
     stateDatabase: layout.database,
     historyDatabase: layout.historyDatabase,
@@ -354,7 +384,11 @@ if (command === "extend-review-v3-schema") {
   process.exit(0);
 }
 
-prepareDatabases();
+if (commandAdmission === "exclusive_migration" || commandAdmission === "offline_observation") {
+  throw new Error(`command ${command} did not terminate in its exclusive/offline branch`);
+}
+const runtimeAdmissionMode: StateDatabaseAdmissionMode = commandAdmission;
+const runtimeLease = prepareDatabases(runtimeAdmissionMode);
 
 const requireUserApproval = (reference: string, project: string, scope: string): void => {
   const expected = `APPROVE ${reference}`;
@@ -405,7 +439,7 @@ if (command === "reconcile-run") {
   if (resolution !== "completed" && resolution !== "failed") {
     throw new Error("reconcile-run requires <run-id> <completed|failed>");
   }
-  const store = new RunStore(layout.database);
+  const store = new RunStore(runtimeLease.borrow());
   const run = store.get(runId);
   if (!run || run.status !== "needs_reconciliation") throw new Error("run is not awaiting reconciliation");
   const decision = asObject(run.payload?.decision);
@@ -449,16 +483,16 @@ if (command === "reconcile-run") {
 }
 
 if (command === "mcp") {
-  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  const service = new LocalCollabService(runtimeLease, { historyDatabase: layout.historyDatabase });
   await startStdioCollabServer(service);
 } else if (command === "worker") {
-  const recovery = new RunStore(layout.database);
+  const recovery = new RunStore(runtimeLease.borrow());
   recovery.recoverExpired(); recovery.close();
-  const health = new ProviderHealthStore(layout.database, { cooldownMs: 60_000 });
-  const reviews = new RunGateUnitOfWork(layout.database);
-  const collaborationRuntime = new CollaborationRuntime(layout.database);
+  const health = new ProviderHealthStore(runtimeLease.borrow(), { cooldownMs: 60_000 });
+  const reviews = new RunGateUnitOfWork(runtimeLease.borrow());
+  const collaborationRuntime = new CollaborationRuntime(runtimeLease.borrow());
   const markStartupReconciliation = (at: number): void => {
-    const store = new RunStore(layout.database);
+    const store = new RunStore(runtimeLease.borrow());
     for (const run of store.needsReconciliation()) {
       const decision = asObject(run.payload?.decision);
       const agent = decision?.agent;
@@ -478,8 +512,8 @@ if (command === "mcp") {
     store.close();
   };
   markStartupReconciliation(Date.now());
-  const worktreeLeases = new WorktreeLeaseStore(layout.database);
-  const startupOutbox = new RunStore(layout.database);
+  const worktreeLeases = new WorktreeLeaseStore(runtimeLease.borrow());
+  const startupOutbox = new RunStore(runtimeLease.borrow());
   collaborationRuntime.drainDispatchOutbox(startupOutbox); startupOutbox.close();
 
   const runner = new AgentRunner({ binaries: {
@@ -488,7 +522,7 @@ if (command === "mcp") {
     codex: codexBinary,
   },
     timeoutMs: 30 * 60_000, authorizationDatabasePath: layout.database });
-  const effectStore = new RunStore(layout.database);
+  const effectStore = new RunStore(runtimeLease.borrow());
   const domainReplayOwner = `domain-replay:${process.pid}:${randomUUID()}`;
   class PersistedDomainEffectError extends Error {}
   function poison(message: string): never { throw new PersistedDomainEffectError(message); }
@@ -549,7 +583,7 @@ if (command === "mcp") {
           throw error;
         }
       }
-      const queue = new RunStore(layout.database);
+      const queue = new RunStore(runtimeLease.borrow());
       collaborationRuntime.drainDispatchOutbox(queue); queue.close();
       await releaseRecordedLease(effect.lease);
       return;
@@ -650,7 +684,7 @@ if (command === "mcp") {
   };
   await replayPendingDomainEffects();
   const workers = Array.from({ length: 4 }, (_unused, index) => new DurableWorker({
-    store: new RunStore(layout.database), workerId: `worker:${process.pid}:${index}`,
+    store: new RunStore(runtimeLease.borrow()), workerId: `worker:${process.pid}:${index}`,
     runner: async (
       run,
       onLaunch,
@@ -683,7 +717,7 @@ if (command === "mcp") {
           collaborationRuntime.recordProviderHealth(workflowId, "grok", available.grok, now);
           collaborationRuntime.recordProviderHealth(workflowId, "codex", available.codex, now);
           collaborationRuntime.retryBlockedStage(workflowId, now);
-          const queue = new RunStore(layout.database);
+          const queue = new RunStore(runtimeLease.borrow());
           collaborationRuntime.drainDispatchOutbox(queue, now); queue.close();
         }
         const disposition = collaborationRuntime.dispatchDisposition(workflowId, workflowStageId, queuedAssignment);
@@ -845,12 +879,12 @@ if (command === "mcp") {
   while (!stopping) {
     const now = Date.now();
     if (now - lastRecovery >= 30_000) {
-      const store = new RunStore(layout.database);
+      const store = new RunStore(runtimeLease.borrow());
       store.recoverExpired(now); store.close();
       await replayPendingDomainEffects();
       markStartupReconciliation(now);
       await replayPendingDomainEffects();
-      const outboxQueue = new RunStore(layout.database);
+      const outboxQueue = new RunStore(runtimeLease.borrow());
       collaborationRuntime.drainDispatchOutbox(outboxQueue, now); outboxQueue.close();
       const available = routingHealth(health, now);
       for (const recoverable of collaborationRuntime.workflows.recoverable()) {
@@ -861,7 +895,7 @@ if (command === "mcp") {
           collaborationRuntime.retryBlockedStage(recoverable.workflowId, now);
         }
       }
-      const recoveredQueue = new RunStore(layout.database);
+      const recoveredQueue = new RunStore(runtimeLease.borrow());
       collaborationRuntime.drainDispatchOutbox(recoveredQueue, now); recoveredQueue.close();
       await runAutomaticProviderRecovery({ now, reviews, health,
         evidenceCapture: reviewEvidenceCapture,
@@ -886,8 +920,9 @@ if (command === "mcp") {
   await Promise.all(workerLoops);
   for (const worker of workers) worker.close();
   health.close(); reviews.close(); collaborationRuntime.close(); worktreeLeases.close(); effectStore.close();
+  runtimeLease.close();
 } else {
-  const service = new LocalCollabService(layout.database, { historyDatabase: layout.historyDatabase });
+  const service = new LocalCollabService(runtimeLease, { historyDatabase: layout.historyDatabase });
   if (command === "index") {
     console.log(JSON.stringify(await service.indexNow({ project: resolve(process.argv[3] ?? process.cwd()) })));
   } else if (command === "probe") {

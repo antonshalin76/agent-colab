@@ -39,6 +39,7 @@ import {
   type MapProfileExpectation,
   type MapProfileReceipt,
 } from "./map-profile.js";
+import { openStateStoreAccess, type StateDatabaseAccess, type StateStoreInput } from "../store/state-database-fence.js";
 
 const PROFILE_LOCK_PATH = "docs/evidence-gated-flow-v1/map-profile-lock.json";
 const MAP_MANIFEST_PATH = ".map/mapify.lock.json";
@@ -469,7 +470,7 @@ function closeMapLearningFromBytes(
   };
   const registry = new MapLearningAdministration({
     controlRoot: root,
-    databasePath: authority.databasePath,
+    database: authority.database,
     ...(authority.controlFingerprint ? { controlFingerprint: authority.controlFingerprint } : {}),
     ...(authority.promotionCheckpoint ? { promotionCheckpoint: authority.promotionCheckpoint } : {}),
   });
@@ -494,19 +495,24 @@ export function projectMapLearning(
   const root = canonicalProjectRoot(projectRoot);
   const profile = verifyCanonicalProfile(root);
   const recordsRoot = ensureContainedDirectory(root, LEARNING_RECORDS_PATH);
-  const registry = new MapLearningAdministration({
-    controlRoot: root,
-    databasePath: ":memory:",
-  });
-  if (registry.recordsRoot !== recordsRoot) {
-    throw new Error("MAP learning registry path does not match the contained administration path");
+  const opened = openStateStoreAccess(":memory:");
+  try {
+    const registry = new MapLearningAdministration({
+      controlRoot: root,
+      database: opened.access,
+    });
+    if (registry.recordsRoot !== recordsRoot) {
+      throw new Error("MAP learning registry path does not match the contained administration path");
+    }
+    const projection = registry.projection(consumer, {
+      mapVersion: profile.version,
+      mapManifestSha256: profile.mapManifestSha256,
+    });
+    ensureContainedDirectory(root, LEARNING_RECORDS_PATH);
+    return { profile, projection };
+  } finally {
+    opened.close();
   }
-  const projection = registry.projection(consumer, {
-    mapVersion: profile.version,
-    mapManifestSha256: profile.mapManifestSha256,
-  });
-  ensureContainedDirectory(root, LEARNING_RECORDS_PATH);
-  return { profile, projection };
 }
 
 function parseMapLearningLaunchBinding(input: unknown): MapLearningLaunchBinding {
@@ -631,21 +637,39 @@ export function formatMapLearningContext(
 /** @internal */
 export class ConfiguredMapControlPlane {
   private readonly evidence: FlowEvidenceLedger;
+  private readonly database: StateDatabaseAccess;
+  private readonly closeDatabase: () => void;
   private readonly controlRoot: string;
   private readonly authority: MapLearningRuntimeAuthority;
 
-  constructor(databasePath: string, options?: {
+  constructor(databasePath: StateStoreInput, options?: {
     controlRoot?: string;
     controlFingerprint?: () => string;
     promotionCheckpoint?: (phase: "before_publish" | "after_publish") => void;
   }) {
-    this.controlRoot = canonicalProjectRoot(options?.controlRoot ?? MAP_CONTROL_ROOT);
-    this.authority = {
-      databasePath,
-      ...(options?.controlFingerprint ? { controlFingerprint: options.controlFingerprint } : {}),
-      ...(options?.promotionCheckpoint ? { promotionCheckpoint: options.promotionCheckpoint } : {}),
-    };
-    this.evidence = new FlowEvidenceLedger(databasePath);
+    const opened = openStateStoreAccess(databasePath);
+    let authorityDatabase: StateDatabaseAccess | undefined;
+    let evidence: FlowEvidenceLedger | undefined;
+    try {
+      const controlRoot = canonicalProjectRoot(options?.controlRoot ?? MAP_CONTROL_ROOT);
+      authorityDatabase = opened.access.borrow();
+      const authority: MapLearningRuntimeAuthority = {
+        database: authorityDatabase,
+        ...(options?.controlFingerprint ? { controlFingerprint: options.controlFingerprint } : {}),
+        ...(options?.promotionCheckpoint ? { promotionCheckpoint: options.promotionCheckpoint } : {}),
+      };
+      evidence = new FlowEvidenceLedger(opened.access.borrow());
+      this.database = opened.access;
+      this.closeDatabase = opened.close;
+      this.controlRoot = controlRoot;
+      this.authority = authority;
+      this.evidence = evidence;
+    } catch (error) {
+      evidence?.close();
+      authorityDatabase?.close();
+      opened.close();
+      throw error;
+    }
   }
 
   closeLearning(input: MapLearningBytesInput): MapLearningCloseReceipt {
@@ -674,13 +698,15 @@ export class ConfiguredMapControlPlane {
 
   close(): void {
     this.evidence.close();
+    this.authority.database.close();
+    this.closeDatabase();
   }
 }
 
 export class MapControlPlane {
   private readonly configured: ConfiguredMapControlPlane;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: StateStoreInput) {
     this.configured = new ConfiguredMapControlPlane(databasePath);
   }
 

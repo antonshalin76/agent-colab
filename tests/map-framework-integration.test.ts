@@ -21,6 +21,7 @@ import type {
 } from "../src/flow/map-learning.js";
 import { MapLearningAdministration } from "../src/flow/map-learning.js";
 import { prepareLearningFixture } from "./map-learning-fixture.js";
+import { openStateDatabaseLease } from "../src/store/state-database-fence.js";
 
 const MAP_VERSION = "3.28.1";
 const MAP_SOURCE_REVISION = "1ba52a77b8228a509f3ef08c4fb1f89465699a73";
@@ -87,6 +88,7 @@ const learningAuthorities = new Map<string, MapLearningRuntimeAuthority>();
 const encoder = new TextEncoder();
 
 afterEach(() => {
+  for (const authority of learningAuthorities.values()) authority.database.close();
   learningAuthorities.clear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -432,31 +434,36 @@ const learningCandidate: MapLearningCandidate = {
   revision: 1,
 };
 
+function prepareLearningForRoot(
+  root: string,
+  candidate: MapLearningCandidate = learningCandidate,
+) {
+  const existing = learningAuthorities.get(root);
+  const prepared = prepareLearningFixture({ projectRoot: root, candidate,
+    mapVersion: MAP_VERSION, mapManifestSha256: MAP_MANIFEST_SHA256,
+    ...(existing ? { database: existing.database } : {}) });
+  if (!existing) learningAuthorities.set(root, prepared.authority);
+  return prepared;
+}
+
 function learningHandoffBytes(
   root: string,
   overrides: Record<string, unknown> = {},
   candidate: MapLearningCandidate = learningCandidate,
 ): Uint8Array {
-  const prepared = prepareLearningFixture({ projectRoot: root, candidate,
-    mapVersion: MAP_VERSION, mapManifestSha256: MAP_MANIFEST_SHA256 });
+  const prepared = prepareLearningForRoot(root, candidate);
   const handoff = JSON.parse(new TextDecoder().decode(prepared.handoffBytes));
   return encoder.encode(`${JSON.stringify({ ...handoff, ...overrides })}\n`);
 }
 
 function learningCloseInput(root: string, handoffBytes?: Uint8Array): MapLearningCloseInput {
-  const prepared = prepareLearningFixture({ projectRoot: root, candidate: learningCandidate,
-    mapVersion: MAP_VERSION, mapManifestSha256: MAP_MANIFEST_SHA256 });
-  const existing = learningAuthorities.get(root);
-  if (!existing) learningAuthorities.set(root, prepared.authority);
+  const prepared = prepareLearningForRoot(root);
   const input = prepared.input;
   return handoffBytes === undefined ? input : { ...input, handoffBytes };
 }
 
 function learningCloseInputForCandidate(root: string, candidate: MapLearningCandidate): MapLearningCloseInput {
-  const prepared = prepareLearningFixture({ projectRoot: root, candidate,
-    mapVersion: MAP_VERSION, mapManifestSha256: MAP_MANIFEST_SHA256 });
-  const existing = learningAuthorities.get(root);
-  if (!existing) learningAuthorities.set(root, prepared.authority);
+  const prepared = prepareLearningForRoot(root, candidate);
   return prepared.input;
 }
 
@@ -471,7 +478,7 @@ function learningRegistry(
 ): MapLearningAdministration {
   return new MapLearningAdministration({
     controlRoot: root,
-    databasePath: authority.databasePath,
+    database: authority.database,
     ...(authority.controlFingerprint ? { controlFingerprint: authority.controlFingerprint } : {}),
     ...(authority.promotionCheckpoint ? { promotionCheckpoint: authority.promotionCheckpoint } : {}),
   });
@@ -522,14 +529,16 @@ if (isConcurrentCloseWorker) {
         payload.registryRoot,
         "node_modules/.agent-collab-test-state/collaboration.db",
       );
+      const database = openStateDatabaseLease(databasePath, "mutating_service");
       const record = await Promise.resolve(new MapLearningAdministration({
         controlRoot: payload.registryRoot,
-        databasePath,
+        database,
       }).close({
         ...input,
         handoffBytes: Buffer.from(handoffBytesBase64, "base64"),
         taskPacketBytes: Buffer.from(taskPacketBytesBase64, "base64"),
       }));
+      database.close();
       writeFileSync(payload.resultPath, `${JSON.stringify({ pid: process.pid, record })}\n`);
     }, 20_000);
   });
@@ -545,9 +554,10 @@ if (isCrashCloseWorker) {
         payload.registryRoot,
         "node_modules/.agent-collab-test-state/collaboration.db",
       );
+      const database = openStateDatabaseLease(databasePath, "mutating_service");
       new MapLearningAdministration({
         controlRoot: payload.registryRoot,
-        databasePath,
+        database,
         promotionCheckpoint: (phase) => {
           if (phase === "after_publish") {
             writeFileSync(payload.killedPidPath, `${process.pid}\n`);
@@ -797,7 +807,8 @@ mainDescribe("provider-neutral MAP learning registry", { timeout: 30_000 }, () =
       mapVersion: MAP_VERSION,
       mapManifestSha256,
     })}\n`);
-    const registry = new MapLearningAdministration({ controlRoot: root, databasePath: ":memory:" });
+    const database = openStateDatabaseLease(":memory:", "mutating_service");
+    const registry = new MapLearningAdministration({ controlRoot: root, database });
     const profile = { mapVersion: MAP_VERSION, mapManifestSha256 };
     const codex = JSON.parse(Buffer.from(registry.projection("codex", profile).bytes).toString("utf8"));
     const grok = JSON.parse(Buffer.from(registry.projection("grok", profile).bytes).toString("utf8"));
@@ -807,6 +818,7 @@ mainDescribe("provider-neutral MAP learning registry", { timeout: 30_000 }, () =
     expect(claude.records).toEqual([]);
     expect(readFileSync(join(root, `.map/agent-collab-admin/learning/records/${recordId}.json`), "utf8"))
       .toBe(`${JSON.stringify(record)}\n`);
+    database.close();
   });
 
   it("MAP-003B rejects stale, conflicting, and skipped learning revisions", async () => {

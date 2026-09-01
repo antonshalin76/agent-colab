@@ -1,10 +1,41 @@
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  closeSync,
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
 import { redactSensitive } from "../security/redaction.js";
-import { GRAPH_EXECUTION_MODE } from "../store/state-layout.js";
+import {
+  acquireStateRootLease,
+  ensureStateV4MigrationLayout,
+  GRAPH_EXECUTION_MODE,
+  type StateRootLease,
+} from "../store/state-layout.js";
+import {
+  assertCanonicalStateDatabaseIdentity,
+  canonicalStateDatabaseIdentity,
+  openStateDatabaseLease,
+  type CanonicalStateDatabaseIdentity,
+} from "../store/state-database-fence.js";
+import { canonicalJson } from "../workflow/flow-contract.js";
 import {
   assertReviewV3SchemaSignature,
   extendReviewV3SchemaOffline,
@@ -15,6 +46,24 @@ import {
   prepareRollbackBundle,
   restoreV1Bundle,
 } from "./rollback-bundle.js";
+import { StateV4RestoreGuard, type StateV4GuardFaultPoint } from "./operational-restore.js";
+import {
+  GRAPH_V4_REQUIRED_INDEXES,
+  GRAPH_V4_TABLES,
+  assertGraphV4PersistenceSchema,
+  graphV4SchemaState as graphSchemaState,
+} from "./graph-v4-schema.js";
+import {
+  activeStateV4GuardDescriptor,
+  assertNoInterruptedRetirement,
+  assertPhysicalRestoreAllowed,
+  inspectStateV4OpenAdmission,
+  readActiveStateV4GuardDescriptor,
+  requireStateV4RestoreAuthority,
+  retireConsumedStateV4Descriptor,
+  retiredStateV4Descriptors,
+  writeActiveStateV4GuardDescriptor,
+} from "./state-v4-restore-authority.js";
 
 export {
   prepareRollbackBundle,
@@ -110,6 +159,26 @@ export type MigrationFaultPoint =
   | "after_state_commit"
   | "after_history_commit"
   | "before_v3_commit"
+  | "after_v4_backup"
+  | "before_v4_descriptor"
+  | "after_v4_orphan_adoption"
+  | "after_v4_guard"
+  | "before_v4_terminal_artifact_reread"
+  | "after_v4_progress_verify"
+  | "after_v4_ddl"
+  | "during_v4_progress_import"
+  | "before_v4_commit"
+  | "after_v4_restore_staged"
+  | "after_v4_restore_consumed"
+  | "after_v4_restore_renamed"
+  | "after_v4_restore_root_fsync"
+  | "after_v4_retired_descriptor_rename"
+  | "after_v4_retired_directory_fsync"
+  | "after_v4_active_descriptor_removed"
+  | "after_v4_active_descriptor_directory_fsync"
+  | "after_v4_retirement_marker_removed"
+  | "after_v4_retirement_marker_directory_fsync"
+  | StateV4GuardFaultPoint
   | ReviewV3FaultPoint;
 
 export interface MigrationCoordinatorOptions {
@@ -117,6 +186,23 @@ export interface MigrationCoordinatorOptions {
   historyDatabase: string;
   faultInjector?: (point: MigrationFaultPoint) => void;
   backupDirectory?: string;
+  repositoryRoot?: string;
+  progressPackagePath?: string;
+}
+
+export interface V4MigrationReceipt {
+  status: "migrated";
+  fromVersion: 3 | 4;
+  toVersion: 4;
+  backupPath: string;
+  backupSha256: string;
+  guardPath: string;
+  databaseIdentity: string;
+  tableDigestManifestSha256: string;
+  tableDigestManifestPath: string;
+  writeEpoch: string;
+  importedProgressEvents: number;
+  lastProgressEventSha256: string;
 }
 
 export type MigrationResult =
@@ -124,7 +210,7 @@ export type MigrationResult =
   | { status: "already_current"; fromVersion: 2; toVersion: 2 }
   | { status: "migrated"; fromVersion: 2; toVersion: 3 }
   | { status: "already_current"; fromVersion: 3; toVersion: 3 }
-  | { status: "migrated"; fromVersion: 3; toVersion: 4 }
+  | V4MigrationReceipt
   | { status: "already_current"; fromVersion: 4; toVersion: 4 };
 
 export interface V1DoctorResult {
@@ -163,23 +249,7 @@ export interface CompatibilityRuntimeObservation {
   integrity: { state: "ok"; history: "ok"; foreignKeys: "ok" };
 }
 
-const GRAPH_V4_TABLES = [
-  "agent_attempt_usage", "agent_event_archive_members", "agent_event_archives",
-  "agent_event_payloads", "agent_events", "agent_sessions", "agent_usage_coverage",
-  "flow_mcp_idempotency", "graph_budget_reservations", "graph_budget_settlements",
-  "graph_edge_evaluations", "graph_edges", "graph_flows", "graph_node_admission_intents",
-  "graph_node_admissions", "graph_node_attempts", "graph_node_input_bindings",
-  "graph_node_results", "graph_nodes", "plan_progress_events", "plan_progress_outbox",
-  "session_memory_revisions",
-] as const;
-const GRAPH_V4_REQUIRED_INDEXES = [
-  "agent_events_cursor", "agent_sessions_parent", "agent_usage_attempt", "archive_flow_range",
-  "flow_mcp_idempotency_status", "graph_attempts_latest", "graph_budget_flow",
-  "graph_edges_source", "graph_edges_target", "graph_intents_pending", "graph_nodes_ready",
-  "plan_progress_outbox_pending",
-] as const;
-const GRAPH_V4_TABLE_SCHEMA_SHA256 = "2b3a0f52fdbfe2e6a9ac4d2ace77423888c3d6c50787950bdaf834f978357751";
-const GRAPH_V4_REQUIRED_INDEX_SHA256 = "1c38876a1730a8fc9b00d756bc81158d5bdd894099ef3b67d9470030b1539ba5";
+const GRAPH_V4_DDL_SHA256 = "43ae43d139ac44f25d2132439600a5405c1082a8278aca60cffeab5e479ead8b";
 const LEGACY_STATE_PROFILE_SHA256 = {
   v3_routing_v5: [
     "7a29baaff38b71f25e6670429398944b34b708f9f661ea4512eddacfa2b5d585",
@@ -205,15 +275,40 @@ const EXECUTION_TABLES = [
   "worktree_handoffs",
 ] as const;
 
-export function initializeCurrentExecutionSchema(
-  path: string,
+const V3_LEGACY_TABLES = new Set([
+  "approval_consumptions", "approval_grants", "collaboration_dispatch_outbox",
+  "collaboration_runs", "runs", "runtime_provider_health", "runtime_review_barriers",
+  "runtime_review_lane_attempts", "runtime_review_lanes", "worktree_handoffs", "worktree_leases",
+]);
+const V3_FLOW_EVIDENCE_TABLES = new Set([
+  "flow_evidence_executions_v9", "flow_evidence_receipts_v9", "flow_evidence_requests_v9",
+]);
+
+const assertKnownV3LegacyObjects = (db: Database.Database): void => {
+  const rows = normalizedSchemaRows(db).filter((row) => row.type === "table" || row.type === "trigger" || row.type === "view");
+  const unexpectedKinds = rows.filter((row) => row.type !== "table");
+  if (unexpectedKinds.length > 0) throw new Error("unexpected trigger or view in v3 legacy schema");
+  const tables = new Set(rows.map(({ name }) => name));
+  const missing = [...V3_LEGACY_TABLES].filter((name) => !tables.has(name));
+  const extras = [...tables].filter((name) => !V3_LEGACY_TABLES.has(name));
+  const exactEvidenceSet = extras.length === V3_FLOW_EVIDENCE_TABLES.size &&
+    extras.every((name) => V3_FLOW_EVIDENCE_TABLES.has(name));
+  if (missing.length > 0 || (extras.length > 0 && !exactEvidenceSet)) {
+    throw new Error(`unknown or incomplete v3 legacy object set: missing=${missing.join(",")}; extra=${extras.join(",")}`);
+  }
+};
+
+export function initializeCurrentExecutionSchemaDatabase(
+  db: Database.Database,
   options: { faultInjector?: (point: string) => void } = {},
 ): void {
-  const db = new Database(path);
   db.pragma("foreign_keys = ON");
-  try {
+  {
     const existing = EXECUTION_TABLES.filter((table) => tableExists(db, table));
     if (existing.length === EXECUTION_TABLES.length) {
+      if (userVersion(db) === V4 && graphSchemaState(db) !== "complete_disabled") {
+        throw new Error("state v4 graph schema is absent; stopped-service migrate-v4 is required");
+      }
       if (tableExists(db, "runtime_schema_capabilities")) {
         assertReviewV3SchemaSignature(db);
       } else {
@@ -347,13 +442,46 @@ export function initializeCurrentExecutionSchema(
       );
       CREATE INDEX idx_worktree_handoffs_task
         ON worktree_handoffs(task_id, id);
+      ${loadGraphV4Ddl(process.cwd())}
       PRAGMA user_version = 4;
       `);
     });
     initialize.immediate();
     extendReviewV3SchemaOffline(db, options.faultInjector);
-  } finally {
-    db.close();
+  }
+}
+
+export function initializeCurrentExecutionSchema(
+  path: string,
+  options: { faultInjector?: (point: string) => void } = {},
+): void {
+  const canonicalPath = resolve(path);
+  const root = dirname(canonicalPath);
+  if (!existsSync(root) || !lstatSync(root).isDirectory() || lstatSync(root).isSymbolicLink() ||
+      realpathSync(root) !== root) {
+    throw new Error("fresh state schema requires one canonical existing root");
+  }
+  const rootLease = acquireStateRootLease(root, "exclusive");
+  let db: Database.Database | undefined;
+  try {
+    options.faultInjector?.("after_state_root_fence");
+    const pinnedPath = join(rootLease.pinnedRoot, basename(canonicalPath));
+    if (!existsSync(pinnedPath)) closeSync(openSync(pinnedPath, "wx", 0o600));
+    rootLease.assertCurrent();
+    const identity = canonicalStateDatabaseIdentity(canonicalPath);
+    assertCanonicalStateDatabaseIdentity(identity);
+    const pinnedIdentity = statSync(pinnedPath);
+    if (pinnedIdentity.dev !== identity.databaseIdentity.dev || pinnedIdentity.ino !== identity.databaseIdentity.ino) {
+      throw new Error("fresh state database changed below its pinned root");
+    }
+    db = new Database(pinnedPath);
+    assertCanonicalStateDatabaseIdentity(identity);
+    initializeCurrentExecutionSchemaDatabase(db, options);
+    rootLease.assertCurrent();
+  }
+  finally {
+    db?.close();
+    rootLease.release();
   }
 }
 
@@ -389,6 +517,425 @@ function acquireExclusiveOwnership(db: Database.Database): void {
 function createConsistentBackup(db: Database.Database, destination: string): void {
   db.pragma("wal_checkpoint(TRUNCATE)");
   db.exec(`VACUUM INTO ${quoteSqlString(destination)}`);
+}
+
+const sha256Bytes = (value: string | Buffer): string =>
+  createHash("sha256").update(value).digest("hex");
+
+const fsyncPath = (path: string): void => {
+  const descriptor = openSync(path, "r");
+  try { fsyncSync(descriptor); }
+  finally { closeSync(descriptor); }
+};
+
+const withStateV4ArtifactLeases = <T>(paths: readonly string[], operation: () => T): T => {
+  const descriptors: number[] = [];
+  try {
+    for (const path of paths) {
+      const before = lstatSync(path);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+        throw new Error("state-v4 signed artifact must be one regular file");
+      }
+      const descriptor = openSync(path, "r");
+      const locked = spawnSync("/usr/bin/flock", ["-w", "5", "-x", "3"], {
+        encoding: "utf8", stdio: ["ignore", "ignore", "pipe", descriptor],
+      });
+      if (locked.error || locked.status !== 0) {
+        closeSync(descriptor);
+        throw new Error(`state-v4 artifact lease busy: ${locked.error?.message ?? locked.stderr ?? "flock denied"}`);
+      }
+      const after = statSync(path);
+      const opened = fstatSync(descriptor);
+      if (opened.dev !== before.dev || opened.ino !== before.ino ||
+          after.dev !== before.dev || after.ino !== before.ino || after.nlink !== 1) {
+        closeSync(descriptor);
+        throw new Error("state-v4 signed artifact identity changed during lease acquisition");
+      }
+      descriptors.push(descriptor);
+    }
+    return operation();
+  } finally {
+    for (const descriptor of descriptors.reverse()) closeSync(descriptor);
+  }
+};
+
+const loadGraphV4Ddl = (repositoryRoot: string): string => {
+  const path = resolve(repositoryRoot, "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql");
+  const bytes = readFileSync(path, "utf8");
+  if (sha256Bytes(bytes) !== GRAPH_V4_DDL_SHA256) {
+    throw new Error("STATE_V4_SCHEMA.sql hash does not match the immutable contract");
+  }
+  return bytes;
+};
+
+const sqliteValue = (value: unknown): unknown => {
+  if (value === null || typeof value === "string") return { type: value === null ? "null" : "text", value };
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) throw new Error("legacy table contains an unsafe SQLite integer");
+    return { type: "integer", value: value.toString() };
+  }
+  if (typeof value === "bigint") return { type: "integer", value: value.toString() };
+  if (Buffer.isBuffer(value)) return { type: "blob", value: value.toString("base64") };
+  throw new Error(`unsupported SQLite value in legacy manifest: ${typeof value}`);
+};
+
+interface LegacyTableManifest {
+  schemaVersion: "legacy-table-digest-manifest/v1";
+  tables: Array<{ name: string; columns: string[]; rowCount: number; rowsSha256: string }>;
+}
+
+const legacyTableManifest = (
+  db: Database.Database,
+  expected?: LegacyTableManifest,
+): LegacyTableManifest => {
+  const graphTables = new Set<string>(GRAPH_V4_TABLES);
+  const tables = expected?.tables.map(({ name }) => name) ??
+    (db.prepare(`SELECT name FROM sqlite_schema
+      WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).pluck().all() as string[])
+      .filter((name) => !graphTables.has(name));
+  return {
+    schemaVersion: "legacy-table-digest-manifest/v1",
+    tables: tables.map((name) => {
+      const escaped = name.replaceAll('"', '""');
+      const actualColumns = (db.pragma(`table_info('${name.replaceAll("'", "''")}')`) as Array<{ name: string }>)
+        .map(({ name: column }) => column);
+      const columns = expected?.tables.find((table) => table.name === name)?.columns ?? actualColumns;
+      if (columns.some((column) => !actualColumns.includes(column))) {
+        throw new Error(`legacy manifest column disappeared: ${name}`);
+      }
+      const digest = createHash("sha256");
+      let rowCount = 0;
+      for (const row of db.prepare(`SELECT * FROM "${escaped}" ORDER BY rowid`).iterate() as Iterable<Record<string, unknown>>) {
+        digest.update(canonicalJson(columns.map((column) => sqliteValue(row[column]))));
+        digest.update("\n");
+        rowCount += 1;
+      }
+      return { name, columns, rowCount, rowsSha256: digest.digest("hex") };
+    }),
+  };
+};
+
+const manifestSha256 = (manifest: LegacyTableManifest): string =>
+  sha256Bytes(canonicalJson(manifest));
+
+const databaseIdentity = (path: string): string => {
+  const canonical = realpathSync(path);
+  const stat = statSync(canonical);
+  return sha256Bytes(canonicalJson({ path: canonical, device: stat.dev, inode: stat.ino }));
+};
+
+const reusableActiveMigrationArtifacts = (input: {
+  layout: ReturnType<typeof ensureStateV4MigrationLayout>;
+  backupRoot: string;
+  databaseIdentity: string;
+  tableDigestManifestSha256: string;
+  writeEpoch: string;
+}): { backupPath: string; tableDigestManifestPath: string; backupSha256: string;
+  guardPath: string; guardExists: boolean } | undefined => {
+  const { layout } = input;
+  const descriptor = readActiveStateV4GuardDescriptor(layout.root);
+  if (descriptor === undefined) return undefined;
+  if (descriptor.databaseIdentity !== input.databaseIdentity ||
+      descriptor.tableDigestManifestSha256 !== input.tableDigestManifestSha256 ||
+      descriptor.writeEpoch !== input.writeEpoch) {
+    throw new Error("active state-v4 migration artifacts do not match the current write epoch");
+  }
+  const assertOwnedArtifact = (root: string, path: string, label: string): string => {
+    const target = resolve(path);
+    const rel = relative(resolve(root), target);
+    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new Error(`active state-v4 ${label} path escapes its artifact root`);
+    }
+    return target;
+  };
+  const backupPath = assertOwnedArtifact(input.backupRoot, descriptor.backupPath, "backup");
+  const tableDigestManifestPath = assertOwnedArtifact(
+    input.backupRoot, descriptor.tableDigestManifestPath, "manifest",
+  );
+  const guardPath = assertOwnedArtifact(layout.guardDirectory, descriptor.guardPath, "guard");
+  if (tableDigestManifestPath !== `${backupPath}.manifest.json` ||
+      guardPath !== resolve(layout.guardDirectory, `state-v4-${descriptor.backupSha256}.jsonl`)) {
+    throw new Error("active state-v4 artifact paths do not match their canonical identities");
+  }
+  const guardExists = existsSync(guardPath);
+  if (guardExists) {
+    const guard = new StateV4RestoreGuard({
+      journalPath: guardPath,
+      databaseIdentity: descriptor.databaseIdentity,
+      backupSha256: descriptor.backupSha256,
+      tableDigestManifestSha256: descriptor.tableDigestManifestSha256,
+      writeEpoch: descriptor.writeEpoch,
+    });
+    const records = guard.readAndVerify();
+    if (records.length !== 1 || records[0]?.event !== "backup_created") {
+      throw new Error("state-v4 migration cannot reuse a restore guard after reopen, write, or restore");
+    }
+  } else if (existsSync(`${guardPath}.pending`) || existsSync(`${guardPath}.tmp`)) {
+    throw new Error("state-v4 restore guard has an interrupted durable write");
+  }
+  if (!existsSync(backupPath) || !lstatSync(backupPath).isFile() || lstatSync(backupPath).isSymbolicLink() ||
+      sha256Bytes(readFileSync(backupPath)) !== descriptor.backupSha256) {
+    throw new Error("active state-v4 backup is missing or does not match its descriptor");
+  }
+  if (!existsSync(tableDigestManifestPath)) throw new Error("active state-v4 backup manifest is missing");
+  const manifestBytes = readFileSync(tableDigestManifestPath, "utf8");
+  const manifest = JSON.parse(manifestBytes) as LegacyTableManifest;
+  if (`${canonicalJson(manifest)}\n` !== manifestBytes ||
+      manifestSha256(manifest) !== input.tableDigestManifestSha256) {
+    throw new Error("active state-v4 backup manifest does not match the write epoch");
+  }
+  return { backupPath, tableDigestManifestPath, backupSha256: descriptor.backupSha256,
+    guardPath, guardExists };
+};
+
+const adoptablePreDescriptorArtifacts = (input: {
+  backupRoot: string;
+  tableDigestManifestSha256: string;
+  stateSchemaSha256: string;
+}): { backupPath: string; tableDigestManifestPath: string } | undefined => {
+  const matches = readdirSync(input.backupRoot).filter((name) => name.endsWith(".db")).sort()
+    .map((name) => resolve(input.backupRoot, name))
+    .filter((backupPath) => {
+      const manifestPath = `${backupPath}.manifest.json`;
+      if (!lstatSync(backupPath).isFile() || lstatSync(backupPath).isSymbolicLink() || !existsSync(manifestPath) ||
+          !lstatSync(manifestPath).isFile() || lstatSync(manifestPath).isSymbolicLink()) return false;
+      const bytes = readFileSync(manifestPath, "utf8");
+      let candidate: Database.Database | undefined;
+      try {
+        const manifest = JSON.parse(bytes) as LegacyTableManifest;
+        if (`${canonicalJson(manifest)}\n` !== bytes ||
+            manifestSha256(manifest) !== input.tableDigestManifestSha256) return false;
+        candidate = new Database(backupPath, { readonly: true, fileMustExist: true });
+        candidate.pragma("query_only = ON");
+        return schemaSha256(candidate) === input.stateSchemaSha256;
+      } catch {
+        return false;
+      } finally {
+        candidate?.close();
+      }
+    });
+  if (matches.length > 1) throw new Error("multiple pre-descriptor state-v4 backups require operator reconciliation");
+  const backupPath = matches[0];
+  return backupPath ? { backupPath, tableDigestManifestPath: `${backupPath}.manifest.json` } : undefined;
+};
+
+interface VerifiedProgressEvent {
+  planId: string;
+  sequence: number;
+  eventId: string;
+  startSha256: string;
+  previousEventSha256: string;
+  effectivePlanSha256: string;
+  eventSha256: string;
+  recordedAt: string;
+  eventJson: string;
+}
+
+interface VerifiedProgressBundle {
+  events: VerifiedProgressEvent[];
+  lastEventSha256: string;
+}
+
+interface ProgressVerificationSummary {
+  startSha256: string;
+  progressEventCount: number;
+  lastEventSha256: string;
+  events: Array<{ stageId: string; terminalResult: string; eventSha256: string }>;
+}
+
+export function bindRereadProgressEvents(
+  verification: ProgressVerificationSummary,
+  eventPayloads: readonly string[],
+): VerifiedProgressBundle {
+  if (eventPayloads.length !== verification.progressEventCount) {
+    throw new Error("pre-v4 progress inventory changed after verification");
+  }
+  let previousEventSha256 = verification.startSha256;
+  const events = eventPayloads.map((payload, offset) => {
+    const event = JSON.parse(payload) as VerifiedProgressEvent;
+    const digestInput = { ...event } as Record<string, unknown>;
+    delete digestInput.eventSha256;
+    const rereadDigest = sha256Bytes(canonicalJson(digestInput));
+    if (event.sequence !== offset + 1 || event.previousEventSha256 !== previousEventSha256 ||
+        event.eventSha256 !== rereadDigest || rereadDigest !== verification.events[offset]?.eventSha256) {
+      throw new Error("pre-v4 progress bytes changed after verification");
+    }
+    previousEventSha256 = rereadDigest;
+    return { ...event, eventJson: canonicalJson(event) };
+  });
+  if (previousEventSha256 !== verification.lastEventSha256 ||
+      events.at(-1)?.eventSha256 !== verification.lastEventSha256) {
+    throw new Error("pre-v4 progress terminal hash changed after verification");
+  }
+  return { events, lastEventSha256: verification.lastEventSha256 };
+}
+
+const loadVerifiedProgressBundle = (
+  repositoryRoot: string,
+  progressPackagePath: string,
+  faultInjector?: (point: MigrationFaultPoint) => void,
+): VerifiedProgressBundle => {
+  const packageRoot = resolve(repositoryRoot, progressPackagePath);
+  const packageArgument = relative(repositoryRoot, packageRoot);
+  if (packageArgument.startsWith("..")) throw new Error("progress package is outside repository root");
+  const verification = JSON.parse(execFileSync(process.execPath, [
+    resolve(repositoryRoot, "scripts/verify-implementation-progress.mjs"),
+    "--root", repositoryRoot,
+    "--git-root", repositoryRoot,
+    "--package", packageArgument,
+  ], { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })) as ProgressVerificationSummary & {
+    status: string;
+  };
+  if (verification.status !== "verified" || verification.progressEventCount < 3 ||
+      verification.events.at(-1)?.stageId !== "STG-02" ||
+      verification.events.at(-1)?.terminalResult !== "PASS") {
+    throw new Error("verified pre-v4 progress chain must end at STG-02 PASS");
+  }
+  faultInjector?.("after_v4_progress_verify");
+  const progressRoot = resolve(packageRoot, "stage-close/pre-v4");
+  const files = readdirSync(progressRoot).filter((name) => name.endsWith(".json")).sort();
+  return bindRereadProgressEvents(
+    verification,
+    files.map((name) => readFileSync(resolve(progressRoot, name), "utf8")),
+  );
+};
+
+export function restoreStateV4Backup(input: {
+  stateDatabase: string;
+  receipt: Pick<V4MigrationReceipt,
+    "backupPath" | "backupSha256" | "guardPath" | "databaseIdentity" |
+    "tableDigestManifestSha256" | "tableDigestManifestPath" | "writeEpoch">;
+  faultInjector?: (point: MigrationFaultPoint) => void;
+}): { status: "restored" | "recovered"; stateDatabase: string; backupSha256: string } {
+  const stateIdentity = canonicalStateDatabaseIdentity(input.stateDatabase);
+  const rootLease = acquireStateRootLease(stateIdentity.root, "exclusive");
+  const operationRoot = rootLease.pinnedRoot;
+  const stateDatabase = join(operationRoot, basename(stateIdentity.path));
+  const stateRoot = stateIdentity.root;
+  const pinRootPath = (path: string): string => {
+    const rel = relative(stateIdentity.root, resolve(path));
+    return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+      ? join(operationRoot, rel)
+      : path;
+  };
+  try {
+  rootLease.assertCurrent();
+  return (() => {
+  requireStateV4RestoreAuthority(stateRoot, input.receipt, operationRoot);
+  const receipt = { ...input.receipt, backupPath: pinRootPath(input.receipt.backupPath),
+    tableDigestManifestPath: pinRootPath(input.receipt.tableDigestManifestPath),
+    guardPath: pinRootPath(input.receipt.guardPath) };
+  for (const [path, label] of [[stateDatabase, "state"], [receipt.backupPath, "backup"],
+    [receipt.tableDigestManifestPath, "manifest"]] as const) {
+    if (!existsSync(path) || !lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) {
+      throw new Error(`state-v4 ${label} must be an existing regular file`);
+    }
+  }
+  if (sha256Bytes(readFileSync(receipt.backupPath)) !== receipt.backupSha256) {
+    throw new Error("state-v4 backup hash mismatch");
+  }
+  const manifestBytes = readFileSync(receipt.tableDigestManifestPath, "utf8");
+  if (!manifestBytes.endsWith("\n")) throw new Error("state-v4 manifest is truncated");
+  const expectedManifest = JSON.parse(manifestBytes) as LegacyTableManifest;
+  if (`${canonicalJson(expectedManifest)}\n` !== manifestBytes ||
+      manifestSha256(expectedManifest) !== receipt.tableDigestManifestSha256) {
+    throw new Error("state-v4 manifest hash or canonical bytes mismatch");
+  }
+  const guard = new StateV4RestoreGuard({
+    journalPath: receipt.guardPath,
+    databaseIdentity: receipt.databaseIdentity,
+    backupSha256: receipt.backupSha256,
+    tableDigestManifestSha256: receipt.tableDigestManifestSha256,
+    writeEpoch: receipt.writeEpoch,
+  });
+  const records = guard.readAndVerify();
+  const staged = `${stateDatabase}.restore-${receipt.backupSha256}.staged`;
+  const finishConsumedRestore = (status: "restored" | "recovered") => {
+    rootLease.assertCurrent();
+    rmSync(`${stateDatabase}-wal`, { force: true });
+    rmSync(`${stateDatabase}-shm`, { force: true });
+    rmSync(`${stateDatabase}-journal`, { force: true });
+    rmSync(staged, { force: true });
+    fsyncPath(dirname(stateDatabase));
+    input.faultInjector?.("after_v4_restore_root_fsync");
+    requireStateV4RestoreAuthority(stateRoot, input.receipt, operationRoot);
+    const active = readActiveStateV4GuardDescriptor(stateRoot, operationRoot);
+    const retirementPending = existsSync(resolve(operationRoot, "migration-v4/retirement.pending"));
+    if (active) {
+      retireConsumedStateV4Descriptor(stateRoot, input.faultInjector, operationRoot);
+    } else if (retirementPending) {
+      retireConsumedStateV4Descriptor(stateRoot, input.faultInjector, operationRoot);
+    } else if (!retiredStateV4Descriptors(stateRoot, operationRoot).some((retired) =>
+      retired.backupSha256 === input.receipt.backupSha256 && retired.guardPath === input.receipt.guardPath)) {
+      throw new Error("consumed state-v4 authority is missing after physical recovery");
+    }
+    rootLease.assertCurrent();
+    return { status, stateDatabase: stateIdentity.path, backupSha256: receipt.backupSha256 };
+  };
+  if (records.at(-1)?.event === "restore_consumed") {
+    if (sha256Bytes(readFileSync(stateDatabase)) === receipt.backupSha256) {
+      return finishConsumedRestore("recovered");
+    }
+    if (!existsSync(staged) || sha256Bytes(readFileSync(staged)) !== receipt.backupSha256) {
+      throw new Error("consumed state-v4 restore requires operator reconciliation");
+    }
+    rootLease.assertCurrent();
+    rmSync(`${stateDatabase}-wal`, { force: true });
+    rmSync(`${stateDatabase}-shm`, { force: true });
+    renameSync(staged, stateDatabase);
+    fsyncPath(dirname(stateDatabase));
+    return finishConsumedRestore("recovered");
+  }
+  const current = new Database(stateDatabase, { readonly: true, fileMustExist: true });
+  let currentManifest: LegacyTableManifest;
+  try {
+    current.pragma("query_only = ON");
+    if (String(current.pragma("integrity_check", { simple: true })) !== "ok" ||
+        (current.pragma("foreign_key_check") as unknown[]).length > 0) {
+      throw new Error("current state database fails restore integrity preflight");
+    }
+    currentManifest = legacyTableManifest(current, expectedManifest);
+  } finally {
+    current.close();
+  }
+  if (databaseIdentity(stateDatabase) !== receipt.databaseIdentity ||
+      manifestSha256(currentManifest) !== receipt.tableDigestManifestSha256 ||
+      sha256Bytes(canonicalJson({
+        databaseIdentity: receipt.databaseIdentity,
+        tableDigestManifestSha256: manifestSha256(currentManifest),
+      })) !== receipt.writeEpoch) {
+    throw new Error("state-v4 restore rejected because the write epoch or legacy rows changed");
+  }
+  assertPhysicalRestoreAllowed(receipt, records, {
+    writeEpoch: receipt.writeEpoch,
+    tableDigestManifestSha256: receipt.tableDigestManifestSha256,
+  });
+  if (existsSync(staged)) {
+    if (!lstatSync(staged).isFile() || lstatSync(staged).isSymbolicLink() ||
+        sha256Bytes(readFileSync(staged)) !== receipt.backupSha256) {
+      throw new Error("state-v4 staged restore is not recoverable");
+    }
+  } else {
+    rootLease.assertCurrent();
+    copyFileSync(receipt.backupPath, staged);
+    fsyncPath(staged);
+  }
+  if (sha256Bytes(readFileSync(staged)) !== receipt.backupSha256) {
+    throw new Error("staged state-v4 restore hash mismatch");
+  }
+  input.faultInjector?.("after_v4_restore_staged");
+  rootLease.assertCurrent();
+  guard.append("restore_consumed", Date.now());
+  input.faultInjector?.("after_v4_restore_consumed");
+  rmSync(`${stateDatabase}-wal`, { force: true });
+  rmSync(`${stateDatabase}-shm`, { force: true });
+  renameSync(staged, stateDatabase);
+  input.faultInjector?.("after_v4_restore_renamed");
+  return finishConsumedRestore("restored");
+  })();
+  } finally {
+    rootLease.release();
+  }
 }
 
 function blockingTables(db: Database.Database): string[] {
@@ -798,23 +1345,6 @@ function verifyHistoryV2Schema(history: Database.Database, exactProfile = false)
   }
 }
 
-function graphSchemaState(state: Database.Database): "absent" | "complete_disabled" {
-  const tables = normalizedSchemaRows(state, GRAPH_V4_TABLES);
-  const requiredIndexes = normalizedSchemaRows(state, GRAPH_V4_REQUIRED_INDEXES);
-  const graphTableSet = new Set<string>(GRAPH_V4_TABLES);
-  const graphNamedObjects = normalizedSchemaRows(state).filter((row) =>
-    row.name.startsWith("graph_") || graphTableSet.has(row.tblName));
-  if (tables.length === 0 && requiredIndexes.length === 0 && graphNamedObjects.length === 0) return "absent";
-  if (tables.length !== GRAPH_V4_TABLES.length ||
-      schemaRowsSha256(tables) !== GRAPH_V4_TABLE_SCHEMA_SHA256 ||
-      requiredIndexes.length !== GRAPH_V4_REQUIRED_INDEXES.length ||
-      schemaRowsSha256(requiredIndexes) !== GRAPH_V4_REQUIRED_INDEX_SHA256 ||
-      graphNamedObjects.some((row) => row.type === "trigger" || row.type === "view")) {
-    throw new Error("partial or altered graph v4 schema");
-  }
-  return "complete_disabled";
-}
-
 function verifyRoutingV5State(state: Database.Database, version: 3 | 4): void {
   if (userVersion(state) !== version) throw new Error(`v${version} state schema marker mismatch`);
 
@@ -872,8 +1402,7 @@ function verifyV3State(state: Database.Database): void {
   verifyRoutingV5State(state, V3);
 }
 
-function verifyV4State(state: Database.Database): void {
-  verifyRoutingV5State(state, V4);
+function verifyLaunchAuthorityV4(state: Database.Database): void {
   const barrierSql = schemaSql(state, "runtime_review_barriers");
   const authority = (state.prepare("PRAGMA table_info(runtime_review_barriers)").all() as Array<{
     name: string;
@@ -899,7 +1428,47 @@ function verifyV4State(state: Database.Database): void {
   }
 }
 
+function verifyV4State(state: Database.Database): void {
+  verifyRoutingV5State(state, V4);
+  if (tableExists(state, "runtime_schema_capabilities")) assertReviewV3SchemaSignature(state);
+  else verifyLaunchAuthorityV4(state);
+  if (graphSchemaState(state) !== "complete_disabled") {
+    throw new Error("v4 graph schema is not complete");
+  }
+}
+
 export function verifyCompatibilityRuntime(input: {
+  stateDatabase: string;
+  historyDatabase: string;
+  faultInjector?: (point: "after_snapshot") => void;
+}): CompatibilityRuntimeObservation {
+  const stateIdentity = canonicalStateDatabaseIdentity(input.stateDatabase);
+  const historyIdentity = canonicalStateDatabaseIdentity(input.historyDatabase);
+  if (stateIdentity.path === historyIdentity.path) throw new Error("state and history databases must be distinct");
+  if (stateIdentity.root !== historyIdentity.root ||
+      stateIdentity.rootIdentity.dev !== historyIdentity.rootIdentity.dev ||
+      stateIdentity.rootIdentity.ino !== historyIdentity.rootIdentity.ino) {
+    throw new Error("state and history databases must share one canonical fenced root");
+  }
+  const lease = acquireStateRootLease(stateIdentity.root, "shared");
+  try {
+    lease.assertCurrent();
+    assertCanonicalStateDatabaseIdentity(stateIdentity);
+    assertCanonicalStateDatabaseIdentity(historyIdentity);
+    if (inspectStateV4OpenAdmission(stateIdentity.root, lease.pinnedRoot) === "restore_consumed") {
+      throw new Error("compatibility observation is blocked by incomplete consumed restore");
+    }
+    const result = verifyCompatibilityRuntimeLocked({ ...input,
+      stateDatabase: join(lease.pinnedRoot, basename(stateIdentity.path)),
+      historyDatabase: join(lease.pinnedRoot, basename(historyIdentity.path)) });
+    lease.assertCurrent();
+    assertCanonicalStateDatabaseIdentity(stateIdentity);
+    assertCanonicalStateDatabaseIdentity(historyIdentity);
+    return result;
+  } finally { lease.release(); }
+}
+
+function verifyCompatibilityRuntimeLocked(input: {
   stateDatabase: string;
   historyDatabase: string;
   faultInjector?: (point: "after_snapshot") => void;
@@ -1117,40 +1686,148 @@ function migrateStateToV3(
 
 function migrateStateToV4(
   db: Database.Database,
-  faultInjector?: (point: MigrationFaultPoint) => void,
+  input: {
+    graphDdl: string;
+    expectedLegacyManifestSha256: string;
+    progress: VerifiedProgressBundle;
+    faultInjector?: (point: MigrationFaultPoint) => void;
+  },
 ): void {
   const migrate = db.transaction(() => {
-    if (userVersion(db) !== V3) {
-      throw new Error(`state schema changed before v4 migration: ${userVersion(db)}`);
+    const fromVersion = userVersion(db);
+    if (manifestSha256(legacyTableManifest(db)) !== input.expectedLegacyManifestSha256) {
+      throw new Error("legacy write epoch changed after backup");
     }
-    verifyV3State(db);
-    db.exec(`
-      ALTER TABLE runtime_review_barriers
-        ADD COLUMN launch_authority_version INTEGER NOT NULL DEFAULT 1
-          CHECK (launch_authority_version IN (1, 2));
-      ${V4_LAUNCH_AUTHORITY_TRIGGERS}
-      PRAGMA user_version = 4;
-    `);
+    if (fromVersion === V3) {
+      verifyV3State(db);
+      db.exec(`
+        ALTER TABLE runtime_review_barriers
+          ADD COLUMN launch_authority_version INTEGER NOT NULL DEFAULT 1
+            CHECK (launch_authority_version IN (1, 2));
+        ${V4_LAUNCH_AUTHORITY_TRIGGERS}
+      `);
+    } else if (fromVersion === V4 && graphSchemaState(db) === "absent") {
+      verifyRoutingV5State(db, V4);
+      if (tableExists(db, "runtime_schema_capabilities")) assertReviewV3SchemaSignature(db);
+      else verifyLaunchAuthorityV4(db);
+    } else {
+      throw new Error(`state schema changed before graph v4 migration: ${fromVersion}`);
+    }
+    db.exec(input.graphDdl);
+    input.faultInjector?.("after_v4_ddl");
+    db.pragma("user_version = 4");
+    const insertEvent = db.prepare(`INSERT INTO plan_progress_events
+      (plan_id,sequence_no,event_id,start_sha256,previous_event_sha256,
+       effective_plan_sha256,event_json,event_sha256,created_at)
+      VALUES (@planId,@sequence,@eventId,@startSha256,@previousEventSha256,
+       @effectivePlanSha256,@eventJson,@eventSha256,@createdAt)`);
+    const insertOutbox = db.prepare(`INSERT INTO plan_progress_outbox
+      (event_id,projection_payload_json,published_at,terminal_reason)
+      VALUES (?, ?, NULL, NULL)`);
+    for (const event of input.progress.events) {
+      const createdAt = Date.parse(event.recordedAt);
+      if (!Number.isSafeInteger(createdAt)) throw new Error("pre-v4 event timestamp is invalid");
+      insertEvent.run({ ...event, createdAt });
+      insertOutbox.run(event.eventId, event.eventJson);
+      input.faultInjector?.("during_v4_progress_import");
+    }
     verifyV4State(db);
-    faultInjector?.("before_v3_commit");
+    if ((db.prepare("SELECT COUNT(*) FROM plan_progress_events").pluck().get() as number) !==
+        input.progress.events.length) throw new Error("pre-v4 progress import count mismatch");
+    input.faultInjector?.("before_v4_commit");
   });
   migrate.exclusive();
 }
 
+const assertTerminalStateV4RecoveryGeneration = (
+  stateRoot: string,
+  stateDatabasePath: string,
+  state: Database.Database,
+): void => {
+  const descriptor = readActiveStateV4GuardDescriptor(stateRoot);
+  if (!descriptor) {
+    assertNoInterruptedRetirement(stateRoot);
+    if (existsSync(resolve(stateRoot, "migration-v4"))) {
+      throw new Error("current state-v4 migration has no active recovery authority");
+    }
+    return;
+  }
+  withStateV4ArtifactLeases([descriptor.backupPath, descriptor.tableDigestManifestPath], () => {
+    const currentDatabaseIdentity = databaseIdentity(stateDatabasePath);
+    if (currentDatabaseIdentity !== descriptor.databaseIdentity ||
+        sha256Bytes(canonicalJson({ databaseIdentity: currentDatabaseIdentity,
+          tableDigestManifestSha256: descriptor.tableDigestManifestSha256 })) !== descriptor.writeEpoch) {
+      throw new Error("terminal state-v4 database identity changed from its recovery generation");
+    }
+    if (sha256Bytes(readFileSync(descriptor.backupPath)) !== descriptor.backupSha256 ||
+        ["-wal", "-shm", "-journal"].some((suffix) => existsSync(`${descriptor.backupPath}${suffix}`))) {
+      throw new Error("terminal state-v4 backup bytes or sidecars changed");
+    }
+    const manifestBytes = readFileSync(descriptor.tableDigestManifestPath, "utf8");
+    const manifest = JSON.parse(manifestBytes) as LegacyTableManifest;
+    if (`${canonicalJson(manifest)}\n` !== manifestBytes ||
+        manifestSha256(manifest) !== descriptor.tableDigestManifestSha256 ||
+        manifestSha256(legacyTableManifest(state, manifest)) !== descriptor.tableDigestManifestSha256) {
+      throw new Error("terminal state-v4 manifest bytes or preserved rows changed");
+    }
+    const records = new StateV4RestoreGuard({ journalPath: descriptor.guardPath,
+      databaseIdentity: descriptor.databaseIdentity, backupSha256: descriptor.backupSha256,
+      tableDigestManifestSha256: descriptor.tableDigestManifestSha256,
+      writeEpoch: descriptor.writeEpoch }).readAndVerify();
+    if (records.length !== 1 || records[0]?.event !== "backup_created") {
+      throw new Error("terminal state-v4 recovery guard is no longer pristine");
+    }
+  });
+};
+
 export class MigrationCoordinator {
   private readonly options: MigrationCoordinatorOptions;
+  private readonly stateIdentity: CanonicalStateDatabaseIdentity;
+  private readonly historyIdentity: CanonicalStateDatabaseIdentity;
 
   constructor(options: MigrationCoordinatorOptions) {
-    const stateDatabase = resolve(options.stateDatabase);
-    const historyDatabase = resolve(options.historyDatabase);
+    this.stateIdentity = canonicalStateDatabaseIdentity(options.stateDatabase);
+    this.historyIdentity = canonicalStateDatabaseIdentity(options.historyDatabase);
+    const stateDatabase = this.stateIdentity.path;
+    const historyDatabase = this.historyIdentity.path;
     if (stateDatabase === historyDatabase) throw new Error("state and history databases must be distinct");
+    if (this.stateIdentity.root !== this.historyIdentity.root ||
+        this.stateIdentity.rootIdentity.dev !== this.historyIdentity.rootIdentity.dev ||
+        this.stateIdentity.rootIdentity.ino !== this.historyIdentity.rootIdentity.ino) {
+      throw new Error("state and history databases must share one canonical fenced root");
+    }
     this.options = { stateDatabase, historyDatabase,
       ...(options.backupDirectory ? { backupDirectory: resolve(options.backupDirectory) } : {}),
-      ...(options.faultInjector ? { faultInjector: options.faultInjector } : {}) };
+      ...(options.faultInjector ? { faultInjector: options.faultInjector } : {}),
+      repositoryRoot: resolve(options.repositoryRoot ?? process.cwd()),
+      progressPackagePath: options.progressPackagePath ?? "docs/hybrid-flow-v1-r2",
+    };
+  }
+
+  private acquireExclusiveStateRoot(): StateRootLease {
+    assertCanonicalStateDatabaseIdentity(this.stateIdentity);
+    assertCanonicalStateDatabaseIdentity(this.historyIdentity);
+    const lease = acquireStateRootLease(this.stateIdentity.root, "exclusive");
+    try {
+      assertCanonicalStateDatabaseIdentity(this.stateIdentity);
+      assertCanonicalStateDatabaseIdentity(this.historyIdentity);
+      return lease;
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
   }
 
   extendReviewV3SchemaOffline(): void {
-    const state = new Database(this.options.stateDatabase);
+    const lease = this.acquireExclusiveStateRoot();
+    try {
+      this.extendReviewV3SchemaOfflineLocked(join(lease.pinnedRoot, basename(this.options.stateDatabase)));
+      lease.assertCurrent();
+    } finally { lease.release(); }
+  }
+
+  private extendReviewV3SchemaOfflineLocked(stateDatabase: string): void {
+    const state = new Database(stateDatabase);
     state.pragma("foreign_keys = ON");
     try {
       acquireExclusiveOwnership(state);
@@ -1161,9 +1838,21 @@ export class MigrationCoordinator {
   }
 
   migrateToV2(): MigrationResult {
+    const lease = this.acquireExclusiveStateRoot();
+    try {
+      const result = this.migrateToV2Locked(
+        join(lease.pinnedRoot, basename(this.options.stateDatabase)),
+        join(lease.pinnedRoot, basename(this.options.historyDatabase)),
+      );
+      lease.assertCurrent();
+      return result;
+    } finally { lease.release(); }
+  }
+
+  private migrateToV2Locked(stateDatabase: string, historyDatabase: string): MigrationResult {
     const temporaryBackup = this.options.backupDirectory === undefined;
     const backupRoot = this.options.backupDirectory ??
-      mkdtempSync(join(dirname(this.options.stateDatabase), "rollback-v1-"));
+      mkdtempSync(join(dirname(stateDatabase), "rollback-v1-"));
     if (!temporaryBackup) prepareRollbackBundle({ bundleDirectory: backupRoot });
     const stateBackup = join(backupRoot, "collaboration-v1.db");
     const historyBackup = join(backupRoot, "history-v1.db");
@@ -1172,8 +1861,8 @@ export class MigrationCoordinator {
     let backupsReady = false;
     let migrationSucceeded = false;
     try {
-      state = new Database(this.options.stateDatabase);
-      history = new Database(this.options.historyDatabase);
+      state = new Database(stateDatabase);
+      history = new Database(historyDatabase);
       state.pragma("foreign_keys = ON");
       history.pragma("foreign_keys = ON");
       acquireExclusiveOwnership(state);
@@ -1218,8 +1907,8 @@ export class MigrationCoordinator {
         try {
           restoreV1Bundle({
             bundleDirectory: backupRoot,
-            stateDatabase: this.options.stateDatabase,
-            historyDatabase: this.options.historyDatabase,
+            stateDatabase,
+            historyDatabase,
           });
         } catch (restoreError) {
           throw new AggregateError([error, restoreError], "v2 migration failed and compensating restore failed");
@@ -1234,8 +1923,20 @@ export class MigrationCoordinator {
   }
 
   migrateToV3(): MigrationResult {
-    const state = new Database(this.options.stateDatabase);
-    const history = new Database(this.options.historyDatabase, { readonly: true });
+    const lease = this.acquireExclusiveStateRoot();
+    try {
+      const result = this.migrateToV3Locked(
+        join(lease.pinnedRoot, basename(this.options.stateDatabase)),
+        join(lease.pinnedRoot, basename(this.options.historyDatabase)),
+      );
+      lease.assertCurrent();
+      return result;
+    } finally { lease.release(); }
+  }
+
+  private migrateToV3Locked(stateDatabase: string, historyDatabase: string): MigrationResult {
+    const state = new Database(stateDatabase);
+    const history = new Database(historyDatabase, { readonly: true });
     state.pragma("foreign_keys = ON");
     try {
       const stateVersion = userVersion(state);
@@ -1259,24 +1960,171 @@ export class MigrationCoordinator {
   }
 
   migrateToV4(): MigrationResult {
-    const state = new Database(this.options.stateDatabase);
-    const history = new Database(this.options.historyDatabase, { readonly: true });
+    const lease = this.acquireExclusiveStateRoot();
+    try {
+      const result = this.migrateToV4Locked(
+        join(lease.pinnedRoot, basename(this.options.stateDatabase)),
+        join(lease.pinnedRoot, basename(this.options.historyDatabase)),
+      );
+      lease.assertCurrent();
+      return result;
+    } finally {
+      lease.release();
+    }
+  }
+
+  private migrateToV4Locked(stateDatabase: string, historyDatabase: string): MigrationResult {
+    const repositoryRoot = this.options.repositoryRoot!;
+    const progressPackagePath = this.options.progressPackagePath!;
+    const graphDdl = loadGraphV4Ddl(repositoryRoot);
+    const progress = loadVerifiedProgressBundle(repositoryRoot, progressPackagePath, this.options.faultInjector);
+    const state = new Database(stateDatabase);
+    const history = new Database(historyDatabase, { readonly: true });
     state.pragma("foreign_keys = ON");
     try {
       const stateVersion = userVersion(state);
       const historyVersion = userVersion(history);
       if (stateVersion === V4 && historyVersion === V2) {
-        verifyV4State(state);
-        return { status: "already_current", fromVersion: 4, toVersion: 4 };
+        if (graphSchemaState(state) === "complete_disabled") {
+          verifyV4State(state);
+          assertTerminalStateV4RecoveryGeneration(realpathSync(dirname(stateDatabase)), stateDatabase, state);
+          return { status: "already_current", fromVersion: 4, toVersion: 4 };
+        }
+        verifyRoutingV5State(state, V4);
+        if (tableExists(state, "runtime_schema_capabilities")) assertReviewV3SchemaSignature(state);
+        else verifyLaunchAuthorityV4(state);
       }
-      if (stateVersion !== V3 || historyVersion !== V2) {
+      if ((stateVersion !== V3 && stateVersion !== V4) || historyVersion !== V2) {
         throw new Error(`unsupported or partial schema versions: state=${stateVersion}, history=${historyVersion}`);
       }
-
-      migrateStateToV4(state, this.options.faultInjector);
+      if (stateVersion === V3 && retiredStateV4Descriptors(realpathSync(dirname(stateDatabase))).length > 0) {
+        throw new Error("re-migration after consumed state-v4 recovery requires operator reconciliation");
+      }
+      verifyHistoryV2Schema(history, true);
+      if (stateVersion === V3) {
+        verifyV3State(state);
+        assertKnownV3LegacyObjects(state);
+      }
+      const legacyManifest = legacyTableManifest(state);
+      const tableDigestManifestSha256 = manifestSha256(legacyManifest);
+      const identity = databaseIdentity(stateDatabase);
+      const writeEpoch = sha256Bytes(canonicalJson({
+        databaseIdentity: identity,
+        tableDigestManifestSha256,
+      }));
+      const migrationLayout = ensureStateV4MigrationLayout(dirname(stateDatabase));
+      const backupRoot = this.options.backupDirectory ?? migrationLayout.backupDirectory;
+      mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+      const reusable = reusableActiveMigrationArtifacts({
+        layout: migrationLayout,
+        backupRoot,
+        databaseIdentity: identity,
+        tableDigestManifestSha256,
+        writeEpoch,
+      });
+      const stateSchemaSha256 = schemaSha256(state);
+      const adoptable = reusable ? undefined : adoptablePreDescriptorArtifacts({
+        backupRoot,
+        tableDigestManifestSha256,
+        stateSchemaSha256,
+      });
+      if (adoptable) this.options.faultInjector?.("after_v4_orphan_adoption");
+      const backupPath = reusable?.backupPath ?? adoptable?.backupPath ??
+        resolve(backupRoot, `collaboration-v${stateVersion}-${randomUUID()}.db`);
+      const tableDigestManifestPath = reusable?.tableDigestManifestPath ??
+        adoptable?.tableDigestManifestPath ?? `${backupPath}.manifest.json`;
+      if (!reusable && !adoptable) {
+        writeFileSync(tableDigestManifestPath, `${canonicalJson(legacyManifest)}\n`, { mode: 0o600, flag: "wx" });
+        fsyncPath(tableDigestManifestPath);
+        fsyncPath(dirname(tableDigestManifestPath));
+        createConsistentBackup(state, backupPath);
+        fsyncPath(backupPath);
+        fsyncPath(dirname(backupPath));
+      }
+      if (!reusable) this.options.faultInjector?.("before_v4_descriptor");
+      let backupSha256 = "";
+      let guardPath = "";
+      withStateV4ArtifactLeases([backupPath, tableDigestManifestPath], () => {
+        const sidecars = ["-wal", "-shm", "-journal"].filter((suffix) => existsSync(`${backupPath}${suffix}`));
+        if (sidecars.length > 0) throw new Error("state-v4 backup has unbound SQLite sidecar state");
+        const manifestBytes = readFileSync(tableDigestManifestPath, "utf8");
+        const signedManifest = JSON.parse(manifestBytes) as LegacyTableManifest;
+        if (`${canonicalJson(signedManifest)}\n` !== manifestBytes ||
+            manifestSha256(signedManifest) !== tableDigestManifestSha256) {
+          throw new Error("state-v4 manifest changed before descriptor publication");
+        }
+        const backupSha256BeforeVerification = sha256Bytes(readFileSync(backupPath));
+        const backup = new Database(backupPath, { readonly: true, fileMustExist: true });
+        try {
+          backup.pragma("query_only = ON");
+          if (String(backup.pragma("integrity_check", { simple: true })) !== "ok" ||
+              (backup.pragma("foreign_key_check") as unknown[]).length > 0 ||
+              userVersion(backup) !== stateVersion ||
+              manifestSha256(legacyTableManifest(backup)) !== tableDigestManifestSha256 ||
+              schemaSha256(backup) !== stateSchemaSha256) {
+            throw new Error("state-v4 backup verification failed");
+          }
+        } finally { backup.close(); }
+        const verifiedBackupSha256 = sha256Bytes(readFileSync(backupPath));
+        if (backupSha256BeforeVerification !== verifiedBackupSha256 ||
+            ["-wal", "-shm", "-journal"].some((suffix) => existsSync(`${backupPath}${suffix}`))) {
+          throw new Error("state-v4 backup bytes changed during verification");
+        }
+        backupSha256 = reusable?.backupSha256 ?? verifiedBackupSha256;
+        if (reusable && backupSha256 !== verifiedBackupSha256) {
+          throw new Error("active state-v4 backup hash changed before descriptor reuse");
+        }
+        guardPath = reusable?.guardPath ??
+          resolve(migrationLayout.guardDirectory, `state-v4-${backupSha256}.jsonl`);
+        if (!reusable) {
+          const descriptor = activeStateV4GuardDescriptor({ databaseIdentity: identity, backupSha256,
+            tableDigestManifestSha256, writeEpoch, backupPath, tableDigestManifestPath, guardPath });
+          writeActiveStateV4GuardDescriptor(migrationLayout.root, descriptor);
+          const published = readActiveStateV4GuardDescriptor(migrationLayout.root);
+          if (published?.descriptorSha256 !== descriptor.descriptorSha256 ||
+              sha256Bytes(readFileSync(backupPath)) !== backupSha256 ||
+              manifestSha256(JSON.parse(readFileSync(tableDigestManifestPath, "utf8"))) !== tableDigestManifestSha256) {
+            throw new Error("published state-v4 descriptor does not bind exact artifact bytes");
+          }
+          this.options.faultInjector?.("after_v4_backup");
+        }
+      });
+      if (!reusable?.guardExists) {
+        const guard = new StateV4RestoreGuard({
+          journalPath: guardPath,
+          databaseIdentity: identity,
+          backupSha256,
+          tableDigestManifestSha256,
+          writeEpoch,
+          ...(this.options.faultInjector ? { faultInjector: this.options.faultInjector } : {}),
+        });
+        guard.createBackupRecord(Date.now());
+        this.options.faultInjector?.("after_v4_guard");
+      }
+      migrateStateToV4(state, {
+        graphDdl,
+        expectedLegacyManifestSha256: tableDigestManifestSha256,
+        progress,
+        ...(this.options.faultInjector ? { faultInjector: this.options.faultInjector } : {}),
+      });
       verifyV4State(state);
       if (userVersion(history) !== V2) throw new Error("v4 migration changed the history schema marker");
-      return { status: "migrated", fromVersion: 3, toVersion: 4 };
+      this.options.faultInjector?.("before_v4_terminal_artifact_reread");
+      assertTerminalStateV4RecoveryGeneration(migrationLayout.root, stateDatabase, state);
+      return {
+        status: "migrated",
+        fromVersion: stateVersion,
+        toVersion: 4,
+        backupPath,
+        backupSha256,
+        guardPath,
+        databaseIdentity: identity,
+        tableDigestManifestSha256,
+        tableDigestManifestPath,
+        writeEpoch,
+        importedProgressEvents: progress.events.length,
+        lastProgressEventSha256: progress.lastEventSha256,
+      };
     } finally {
       state.close();
       history.close();
@@ -1284,10 +2132,10 @@ export class MigrationCoordinator {
   }
 }
 
-export function doctorV1(input: { stateDatabase: string; historyDatabase: string }): V1DoctorResult {
-  const state = new Database(resolve(input.stateDatabase), { readonly: true });
-  const history = new Database(resolve(input.historyDatabase), { readonly: true });
-  try {
+export function doctorV1Databases(
+  state: Database.Database,
+  history: Database.Database,
+): V1DoctorResult {
     const stateVersion = effectiveV1Version(state, "state");
     const historyVersion = effectiveV1Version(history, "history");
     const mutableCounts = Object.fromEntries(MUTABLE_RUNTIME_TABLES.map((table) => [
@@ -1307,8 +2155,17 @@ export function doctorV1(input: { stateDatabase: string; historyDatabase: string
       if (count > 0) blockers.push(`mutable:${table}:${count}`);
     }
     return { readyForMigration: blockers.length === 0, stateVersion, historyVersion, blockers, mutableCounts };
-  } finally {
-    state.close();
+}
+
+export function doctorV1(input: { stateDatabase: string; historyDatabase: string }): V1DoctorResult {
+  const stateLease = openStateDatabaseLease(resolve(input.stateDatabase), "offline_observation", {
+    readonly: true,
+    fileMustExist: true,
+  });
+  const history = new Database(resolve(input.historyDatabase), { readonly: true });
+  try { return doctorV1Databases(stateLease.database, history); }
+  finally {
     history.close();
+    stateLease.close();
   }
 }

@@ -5,6 +5,11 @@ import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 
 import { FlowEvidenceLedger } from "../src/flow/evidence-ledger.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
+
+const existingDatabase = (root: string): string => {
+  return createEmptyStateDatabase(join(root, "state.db"));
+};
 
 describe("canonical flow evidence ledger", () => {
   it("derives a non-review oracle and owns current executions plus a linked failing old-code mutation", () => {
@@ -13,6 +18,7 @@ describe("canonical flow evidence ledger", () => {
     mkdirSync(project);
     writeFileSync(join(project, "source.ts"), "export const value = 1;\n");
     const databasePath = join(root, "state.db");
+    createEmptyStateDatabase(databasePath);
     const execute = vi.fn((input: {
       command: readonly [string, ...string[]];
       cwd: string;
@@ -240,7 +246,7 @@ describe("canonical flow evidence ledger", () => {
       startedAt: "2026-08-27T00:00:00.000Z",
       finishedAt: "2026-08-27T00:00:01.000Z",
     }));
-    const ledger = new FlowEvidenceLedger(join(root, "state.db"), {
+    const ledger = new FlowEvidenceLedger(existingDatabase(root), {
       backend: { execute },
       controlFingerprint: () => "c".repeat(64),
     });
@@ -358,7 +364,8 @@ describe("canonical flow evidence ledger", () => {
       startedAt: "2026-08-27T00:00:00.000Z",
       finishedAt: "2026-08-27T00:00:01.000Z",
     }));
-    const contender = new FlowEvidenceLedger(join(root, "state.db"), {
+    const databasePath = existingDatabase(root);
+    const contender = new FlowEvidenceLedger(databasePath, {
       backend: { execute: contenderExecute },
       controlFingerprint: () => "c".repeat(64),
     });
@@ -374,7 +381,7 @@ describe("canonical flow evidence ledger", () => {
         finishedAt: "2026-08-27T00:00:01.000Z",
       };
     });
-    const primary = new FlowEvidenceLedger(join(root, "state.db"), {
+    const primary = new FlowEvidenceLedger(databasePath, {
       backend: { execute: primaryExecute },
       controlFingerprint: () => "c".repeat(64),
     });
@@ -447,6 +454,7 @@ describe("canonical flow evidence ledger", () => {
       };
     });
     const databasePath = join(root, "state.db");
+    createEmptyStateDatabase(databasePath);
     const ledger = new FlowEvidenceLedger(databasePath, {
       backend: { execute },
       controlFingerprint: () => "c".repeat(64),
@@ -546,7 +554,7 @@ describe("canonical flow evidence ledger", () => {
   it("rejects an unsupported evidence role before invoking the process backend", () => {
     const root = mkdtempSync(join(tmpdir(), "agent-collab-evidence-role-"));
     const execute = vi.fn();
-    const ledger = new FlowEvidenceLedger(join(root, "state.db"), { backend: { execute } });
+    const ledger = new FlowEvidenceLedger(existingDatabase(root), { backend: { execute } });
     try {
       expect(() => ledger.runCanonicalAndRecord({
         projectRoot: root,

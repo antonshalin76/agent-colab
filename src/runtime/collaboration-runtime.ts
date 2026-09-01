@@ -10,6 +10,7 @@ import type {
 } from "../domain/routing.js";
 import { sanitizeResult } from "../security/redaction.js";
 import { CollaborationRunStore } from "../store/collaboration-run-store.js";
+import { openStateStoreAccess, type StateDatabaseAccess, type StateStoreInput } from "../store/state-database-fence.js";
 import { RunStore, type RunRecord } from "../store/run-store.js";
 import type {
   ActiveStage,
@@ -85,23 +86,41 @@ export class CollaborationRuntime {
   private readonly approvals: ApprovalLedger;
   private readonly admission: ExecutionAdmission;
   private readonly db: Database.Database;
-  private readonly databasePath: string;
+  private readonly access: StateDatabaseAccess;
+  private readonly closeAccess: () => void;
 
-  constructor(path: string) {
-    this.databasePath = path;
-    this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("busy_timeout = 5000");
-    this.db.pragma("foreign_keys = ON");
-    this.workflowStore = new CollaborationRunStore(this.db);
-    this.workflows = Object.freeze({
-      get: (workflowId: string) => this.workflowStore.get(workflowId),
-      recoverable: () => this.workflowStore.recoverable(),
-      pendingDispatches: () => this.workflowStore.pendingDispatches(),
-    });
-    this.reviews = new RunGateUnitOfWork(this.db);
-    this.approvals = new ApprovalLedger(this.db);
-    this.admission = new ExecutionAdmission(this.db, this.workflowStore, this.reviews, this.approvals);
+  constructor(path: StateStoreInput) {
+    const opened = openStateStoreAccess(path);
+    let workflowStore: CollaborationRunStore | undefined;
+    let reviews: RunGateUnitOfWork | undefined;
+    let approvals: ApprovalLedger | undefined;
+    try {
+      const db = opened.access.database;
+      db.pragma("journal_mode = WAL");
+      db.pragma("busy_timeout = 5000");
+      db.pragma("foreign_keys = ON");
+      workflowStore = new CollaborationRunStore(opened.access.borrow());
+      reviews = new RunGateUnitOfWork(opened.access.borrow());
+      approvals = new ApprovalLedger(opened.access.borrow());
+      this.access = opened.access;
+      this.closeAccess = opened.close;
+      this.db = db;
+      this.workflowStore = workflowStore;
+      this.workflows = Object.freeze({
+        get: (workflowId: string) => workflowStore!.get(workflowId),
+        recoverable: () => workflowStore!.recoverable(),
+        pendingDispatches: () => workflowStore!.pendingDispatches(),
+      });
+      this.reviews = reviews;
+      this.approvals = approvals;
+      this.admission = new ExecutionAdmission(db, workflowStore, reviews, approvals);
+    } catch (error) {
+      approvals?.close();
+      reviews?.close();
+      workflowStore?.close();
+      opened.close();
+      throw error;
+    }
   }
 
   createAndStart(
@@ -258,7 +277,7 @@ export class CollaborationRuntime {
       invalidRunnerOutcomeEvidence("runner receipt does not match the active attempt identity");
     }
 
-    const runs = new RunStore(this.databasePath);
+    const runs = new RunStore(this.access.borrow());
     let run: RunRecord | undefined;
     try {
       run = runs.get(receipt.runId);
@@ -410,7 +429,7 @@ export class CollaborationRuntime {
         receipt.sessionId !== active.assignment.sessionId) {
       invalidRunnerOutcomeEvidence("prelaunch receipt does not match the active dispatch identity");
     }
-    const runs = new RunStore(this.databasePath);
+    const runs = new RunStore(this.access.borrow());
     let run: RunRecord | undefined;
     try { run = runs.get(receipt.runId); } finally { runs.close(); }
     const expectedStatus = isFailoverOutcome(receipt.resultKind) ? "completed" : "failed";
@@ -584,6 +603,6 @@ export class CollaborationRuntime {
     this.workflowStore.close();
     this.reviews.close();
     this.approvals.close();
-    this.db.close();
+    this.closeAccess();
   }
 }

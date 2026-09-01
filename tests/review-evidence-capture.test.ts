@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LocalCollabService } from "../src/app/service.js";
@@ -15,13 +16,15 @@ import {
   type ReviewEvidenceCaptureEntryPoint,
   type ReviewEvidenceCaptureOutcome,
 } from "../src/runtime/review-evidence-capture.js";
+import { createEmptyStateDatabase } from "./helpers/state-database.js";
 
 const roots: string[] = [];
 
 const database = (): string => {
   const root = mkdtempSync(join(tmpdir(), "agent-collab-evidence-capture-"));
   roots.push(root);
-  return join(root, "state.db");
+  const path = join(root, "state.db");
+  return createEmptyStateDatabase(path);
 };
 
 afterEach(() => {

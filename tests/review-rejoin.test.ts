@@ -40,12 +40,18 @@ describe("optional review rejoin scheduling", () => {
 
   it("skips an unreadable optional project and continues admitting current work", () => {
     const evidenceCapture = readyCapture("grok");
-    const activateDeferred = vi.fn(() => ({ status: "activated", lanes: [{}] }));
+    const activateDeferred = vi.fn(() => ({ status: "activated", lanes: [{}, {}] }));
     const reviews = {
       deferredReviewIds: () => ["bad-review", "good-review"],
       get: (reviewId: string) => reviewId === "bad-review"
-        ? { project: null, lanes: [{ agent: "grok", role: "auditor", status: "deferred" }] }
-        : { project: "/good", lanes: [{ agent: "grok", role: "auditor", status: "deferred" }] },
+        ? { project: null, lanes: [
+          { agent: "grok", role: "auditor", status: "deferred" },
+          { agent: "grok", role: "critic", status: "deferred" },
+        ] }
+        : { project: "/good", lanes: [
+          { agent: "grok", role: "auditor", status: "deferred" },
+          { agent: "grok", role: "critic", status: "deferred" },
+        ] },
       barrier: () => ({ satisfied: false, terminalCount: 0, requiredCount: 2 }),
       receiptPairCursor: () => ({ scopeRevision: 1,
         predecessorReceiptIds: { source: null, readiness: null } }),
@@ -55,9 +61,12 @@ describe("optional review rejoin scheduling", () => {
     } as unknown as RunGateUnitOfWork;
 
     expect(activateRecoveredReviewLanes({ agent: "grok", now: 101, reviews,
-      health: health(), evidenceCapture })).toMatchObject({ activated: 1,
+      health: health(), evidenceCapture })).toMatchObject({ activated: 2,
       skippedUnreadableProject: 1, skippedHarnessUnavailable: 0 });
     expect(activateDeferred).toHaveBeenCalledOnce();
+    const activationCall = activateDeferred.mock.lastCall as unknown as
+      [{ admissionReceipts: unknown[] }];
+    expect(activationCall[0].admissionReceipts).toHaveLength(2);
   });
 
   it("keeps deferred work dormant when typed evidence reports provider unavailable", () => {
@@ -70,14 +79,17 @@ describe("optional review rejoin scheduling", () => {
     const reviews = {
       deferredReviewIds: () => ["pending-review"],
       get: () => ({ project: "/pending",
-        lanes: [{ agent: "claude", role: "critic", status: "deferred" }] }),
+        lanes: [
+          { agent: "claude", role: "auditor", status: "deferred" },
+          { agent: "claude", role: "critic", status: "deferred" },
+        ] }),
       barrier: () => ({ satisfied: false, terminalCount: 0, requiredCount: 2 }),
       activateDeferred,
     } as unknown as RunGateUnitOfWork;
 
     expect(activateRecoveredReviewLanes({ agent: "claude", now: 101, reviews,
       health: health(), evidenceCapture })).toMatchObject({ activated: 0,
-      skippedHarnessUnavailable: 1 });
+      skippedHarnessUnavailable: 2 });
     expect(activateDeferred).not.toHaveBeenCalled();
   });
 

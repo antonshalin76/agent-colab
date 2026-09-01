@@ -10,11 +10,13 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   OperationalRestore,
+  StateV4RestoreGuard,
   type OperationalHost,
   type OperationalPermitAction,
   type OperationalTarget,
   type OperationalVerification,
 } from "../src/migration/operational-restore.js";
+import { assertPhysicalRestoreAllowed } from "../src/migration/state-v4-restore-authority.js";
 
 const roots: string[] = [];
 const managedServicePids = new Set<number>();
@@ -524,6 +526,79 @@ afterEach(() => {
   }
   managedServicePids.clear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe("state-v4 restore guard", () => {
+  const fixture = () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-collab-state-v4-guard-"));
+    roots.push(root);
+    const journalPath = join(root, "state-v4-backup.jsonl");
+    const create = (faultInjector?: ConstructorParameters<typeof StateV4RestoreGuard>[0]["faultInjector"]) =>
+      new StateV4RestoreGuard({
+        journalPath,
+        databaseIdentity: digest("a"),
+        backupSha256: digest("b"),
+        tableDigestManifestSha256: digest("c"),
+        writeEpoch: digest("d"),
+        ...(faultInjector ? { faultInjector } : {}),
+      });
+    return { root, journalPath, create };
+  };
+
+  it("persists a canonical hash chain and forbids restore after service reopen", () => {
+    const fx = fixture();
+    const guard = fx.create();
+    const backup = guard.createBackupRecord(1);
+    expect(backup.event).toBe("backup_created");
+    expect(assertPhysicalRestoreAllowed({ writeEpoch: digest("d"), tableDigestManifestSha256: digest("c") },
+      guard.readAndVerify(), {
+      writeEpoch: digest("d"),
+      tableDigestManifestSha256: digest("c"),
+    })).toEqual(backup);
+    const reopened = guard.append("service_reopened", 2);
+    expect(reopened.previousRecordSha256).toBe(backup.recordSha256);
+    expect(guard.readAndVerify().map(({ event }) => event)).toEqual([
+      "backup_created", "service_reopened",
+    ]);
+    expect(() => assertPhysicalRestoreAllowed({ writeEpoch: digest("d"),
+      tableDigestManifestSha256: digest("c") }, guard.readAndVerify())).toThrow(/forbidden after reopen/i);
+  });
+
+  it("durably consumes the only legal restore and rejects replay", () => {
+    const guard = fixture().create();
+    guard.createBackupRecord(1);
+    expect(guard.append("restore_consumed", 2).event).toBe("restore_consumed");
+    expect(() => guard.append("restore_consumed", 3)).toThrow(/already consumed/i);
+    expect(() => assertPhysicalRestoreAllowed({ writeEpoch: digest("d"),
+      tableDigestManifestSha256: digest("c") }, guard.readAndVerify())).toThrow(/prior restore/i);
+  });
+
+  it.each([
+    "after_guard_temp_write",
+    "after_guard_file_fsync",
+    "after_guard_rename",
+    "after_guard_directory_fsync",
+  ] as const)("fails closed at %s", (point) => {
+    const fx = fixture();
+    const guard = fx.create((actual) => {
+      if (actual === point) throw new Error(`fault:${point}`);
+    });
+    expect(() => guard.createBackupRecord(1)).toThrow(`fault:${point}`);
+    expect(() => assertPhysicalRestoreAllowed({ writeEpoch: digest("d"),
+      tableDigestManifestSha256: digest("c") }, fx.create().readAndVerify()))
+      .toThrow(/missing|truncated|malformed|interrupted/i);
+  });
+
+  it("rejects truncation, reordered identities, and noncanonical bytes", () => {
+    const fx = fixture();
+    const guard = fx.create();
+    guard.createBackupRecord(1);
+    const valid = readFileSync(fx.journalPath, "utf8");
+    writeFileSync(fx.journalPath, valid.slice(0, -1));
+    expect(() => guard.readAndVerify()).toThrow(/truncated/i);
+    writeFileSync(fx.journalPath, valid.replace("{", "{ "));
+    expect(() => guard.readAndVerify()).toThrow(/canonical|identity|hash/i);
+  });
 });
 
 const successOrder = [
