@@ -54,6 +54,13 @@ import {
   graphV4SchemaState as graphSchemaState,
 } from "./graph-v4-schema.js";
 import {
+  legacyTableManifest,
+  legacyTableManifestSha256,
+  parseLegacyTableManifest,
+  serializeLegacyTableManifest,
+  type LegacyTableManifest,
+} from "./state-v4-manifest.js";
+import {
   activeStateV4GuardDescriptor,
   assertNoInterruptedRetirement,
   assertPhysicalRestoreAllowed,
@@ -568,56 +575,6 @@ const loadGraphV4Ddl = (repositoryRoot: string): string => {
   return bytes;
 };
 
-const sqliteValue = (value: unknown): unknown => {
-  if (value === null || typeof value === "string") return { type: value === null ? "null" : "text", value };
-  if (typeof value === "number") {
-    if (!Number.isSafeInteger(value)) throw new Error("legacy table contains an unsafe SQLite integer");
-    return { type: "integer", value: value.toString() };
-  }
-  if (typeof value === "bigint") return { type: "integer", value: value.toString() };
-  if (Buffer.isBuffer(value)) return { type: "blob", value: value.toString("base64") };
-  throw new Error(`unsupported SQLite value in legacy manifest: ${typeof value}`);
-};
-
-interface LegacyTableManifest {
-  schemaVersion: "legacy-table-digest-manifest/v1";
-  tables: Array<{ name: string; columns: string[]; rowCount: number; rowsSha256: string }>;
-}
-
-const legacyTableManifest = (
-  db: Database.Database,
-  expected?: LegacyTableManifest,
-): LegacyTableManifest => {
-  const graphTables = new Set<string>(GRAPH_V4_TABLES);
-  const tables = expected?.tables.map(({ name }) => name) ??
-    (db.prepare(`SELECT name FROM sqlite_schema
-      WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).pluck().all() as string[])
-      .filter((name) => !graphTables.has(name));
-  return {
-    schemaVersion: "legacy-table-digest-manifest/v1",
-    tables: tables.map((name) => {
-      const escaped = name.replaceAll('"', '""');
-      const actualColumns = (db.pragma(`table_info('${name.replaceAll("'", "''")}')`) as Array<{ name: string }>)
-        .map(({ name: column }) => column);
-      const columns = expected?.tables.find((table) => table.name === name)?.columns ?? actualColumns;
-      if (columns.some((column) => !actualColumns.includes(column))) {
-        throw new Error(`legacy manifest column disappeared: ${name}`);
-      }
-      const digest = createHash("sha256");
-      let rowCount = 0;
-      for (const row of db.prepare(`SELECT * FROM "${escaped}" ORDER BY rowid`).iterate() as Iterable<Record<string, unknown>>) {
-        digest.update(canonicalJson(columns.map((column) => sqliteValue(row[column]))));
-        digest.update("\n");
-        rowCount += 1;
-      }
-      return { name, columns, rowCount, rowsSha256: digest.digest("hex") };
-    }),
-  };
-};
-
-const manifestSha256 = (manifest: LegacyTableManifest): string =>
-  sha256Bytes(canonicalJson(manifest));
-
 const databaseIdentity = (path: string): string => {
   const canonical = realpathSync(path);
   const stat = statSync(canonical);
@@ -679,9 +636,10 @@ const reusableActiveMigrationArtifacts = (input: {
   }
   if (!existsSync(tableDigestManifestPath)) throw new Error("active state-v4 backup manifest is missing");
   const manifestBytes = readFileSync(tableDigestManifestPath, "utf8");
-  const manifest = JSON.parse(manifestBytes) as LegacyTableManifest;
-  if (`${canonicalJson(manifest)}\n` !== manifestBytes ||
-      manifestSha256(manifest) !== input.tableDigestManifestSha256) {
+  let manifest: LegacyTableManifest;
+  try { manifest = parseLegacyTableManifest(manifestBytes); }
+  catch { throw new Error("active state-v4 backup manifest does not match the write epoch"); }
+  if (legacyTableManifestSha256(manifest) !== input.tableDigestManifestSha256) {
     throw new Error("active state-v4 backup manifest does not match the write epoch");
   }
   return { backupPath, tableDigestManifestPath, backupSha256: descriptor.backupSha256,
@@ -702,9 +660,8 @@ const adoptablePreDescriptorArtifacts = (input: {
       const bytes = readFileSync(manifestPath, "utf8");
       let candidate: Database.Database | undefined;
       try {
-        const manifest = JSON.parse(bytes) as LegacyTableManifest;
-        if (`${canonicalJson(manifest)}\n` !== bytes ||
-            manifestSha256(manifest) !== input.tableDigestManifestSha256) return false;
+        const manifest = parseLegacyTableManifest(bytes);
+        if (legacyTableManifestSha256(manifest) !== input.tableDigestManifestSha256) return false;
         candidate = new Database(backupPath, { readonly: true, fileMustExist: true });
         candidate.pragma("query_only = ON");
         return schemaSha256(candidate) === input.stateSchemaSha256;
@@ -741,7 +698,18 @@ interface ProgressVerificationSummary {
   progressEventCount: number;
   lastEventSha256: string;
   events: Array<{ stageId: string; terminalResult: string; eventSha256: string }>;
+  migrationSeedSha256?: string;
 }
+
+const STATE_V4_PROGRESS_SEED_FILE = "STATE_V4_PROGRESS_SEED.json";
+const STATE_V4_PROGRESS_SEED_SHA256 = "741d67139b3171d5e3d678e37de09385ccc7d0bd8058d9b8d8629a27a0b22cb7";
+const STATE_V4_REVIEWED_COMMIT = "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50";
+const STATE_V4_REVIEWED_TREE = "955260b898f2465b72ecaabcb43b1453a15e3ebc";
+const STATE_V4_PROGRESS_SEED_EVENTS = [
+  "000001-r2-stg-00-pass.json",
+  "000002-stg-01-pass.json",
+  "000003-stg-02-pass.json",
+] as const;
 
 export function bindRereadProgressEvents(
   verification: ProgressVerificationSummary,
@@ -778,25 +746,44 @@ const loadVerifiedProgressBundle = (
   const packageRoot = resolve(repositoryRoot, progressPackagePath);
   const packageArgument = relative(repositoryRoot, packageRoot);
   if (packageArgument.startsWith("..")) throw new Error("progress package is outside repository root");
-  const verification = JSON.parse(execFileSync(process.execPath, [
+  const migrationSeedPath = resolve(packageRoot, STATE_V4_PROGRESS_SEED_FILE);
+  const hasMigrationSeedManifest = existsSync(migrationSeedPath);
+  if (!hasMigrationSeedManifest) {
+    const sourceCommit = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const sourceTree = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    if (sourceCommit !== STATE_V4_REVIEWED_COMMIT || sourceTree !== STATE_V4_REVIEWED_TREE) {
+      throw new Error("state-v4 progress seed manifest is missing outside the exact reviewed source");
+    }
+  }
+  const verificationArgs = [
     resolve(repositoryRoot, "scripts/verify-implementation-progress.mjs"),
     "--root", repositoryRoot,
     "--git-root", repositoryRoot,
     "--package", packageArgument,
-  ], { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })) as ProgressVerificationSummary & {
+  ];
+  if (hasMigrationSeedManifest) {
+    verificationArgs.push("--migration-seed", relative(repositoryRoot, migrationSeedPath));
+  }
+  const verification = JSON.parse(execFileSync(process.execPath, verificationArgs, {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  })) as ProgressVerificationSummary & {
     status: string;
   };
-  if (verification.status !== "verified" || verification.progressEventCount < 3 ||
+  if (verification.status !== "verified" || verification.progressEventCount !== 3 ||
+      (hasMigrationSeedManifest
+        ? verification.migrationSeedSha256 !== STATE_V4_PROGRESS_SEED_SHA256
+        : verification.migrationSeedSha256 !== undefined) ||
       verification.events.at(-1)?.stageId !== "STG-02" ||
       verification.events.at(-1)?.terminalResult !== "PASS") {
     throw new Error("verified pre-v4 progress chain must end at STG-02 PASS");
   }
   faultInjector?.("after_v4_progress_verify");
   const progressRoot = resolve(packageRoot, "stage-close/pre-v4");
-  const files = readdirSync(progressRoot).filter((name) => name.endsWith(".json")).sort();
   return bindRereadProgressEvents(
     verification,
-    files.map((name) => readFileSync(resolve(progressRoot, name), "utf8")),
+    STATE_V4_PROGRESS_SEED_EVENTS.map((name) => readFileSync(resolve(progressRoot, name), "utf8")),
   );
 };
 
@@ -835,10 +822,10 @@ export function restoreStateV4Backup(input: {
     throw new Error("state-v4 backup hash mismatch");
   }
   const manifestBytes = readFileSync(receipt.tableDigestManifestPath, "utf8");
-  if (!manifestBytes.endsWith("\n")) throw new Error("state-v4 manifest is truncated");
-  const expectedManifest = JSON.parse(manifestBytes) as LegacyTableManifest;
-  if (`${canonicalJson(expectedManifest)}\n` !== manifestBytes ||
-      manifestSha256(expectedManifest) !== receipt.tableDigestManifestSha256) {
+  let expectedManifest: LegacyTableManifest;
+  try { expectedManifest = parseLegacyTableManifest(manifestBytes); }
+  catch { throw new Error("state-v4 manifest hash or canonical bytes mismatch"); }
+  if (legacyTableManifestSha256(expectedManifest) !== receipt.tableDigestManifestSha256) {
     throw new Error("state-v4 manifest hash or canonical bytes mismatch");
   }
   const guard = new StateV4RestoreGuard({
@@ -899,10 +886,10 @@ export function restoreStateV4Backup(input: {
     current.close();
   }
   if (databaseIdentity(stateDatabase) !== receipt.databaseIdentity ||
-      manifestSha256(currentManifest) !== receipt.tableDigestManifestSha256 ||
+      legacyTableManifestSha256(currentManifest) !== receipt.tableDigestManifestSha256 ||
       sha256Bytes(canonicalJson({
         databaseIdentity: receipt.databaseIdentity,
-        tableDigestManifestSha256: manifestSha256(currentManifest),
+        tableDigestManifestSha256: legacyTableManifestSha256(currentManifest),
       })) !== receipt.writeEpoch) {
     throw new Error("state-v4 restore rejected because the write epoch or legacy rows changed");
   }
@@ -1695,7 +1682,7 @@ function migrateStateToV4(
 ): void {
   const migrate = db.transaction(() => {
     const fromVersion = userVersion(db);
-    if (manifestSha256(legacyTableManifest(db)) !== input.expectedLegacyManifestSha256) {
+    if (legacyTableManifestSha256(legacyTableManifest(db)) !== input.expectedLegacyManifestSha256) {
       throw new Error("legacy write epoch changed after backup");
     }
     if (fromVersion === V3) {
@@ -1764,10 +1751,11 @@ const assertTerminalStateV4RecoveryGeneration = (
       throw new Error("terminal state-v4 backup bytes or sidecars changed");
     }
     const manifestBytes = readFileSync(descriptor.tableDigestManifestPath, "utf8");
-    const manifest = JSON.parse(manifestBytes) as LegacyTableManifest;
-    if (`${canonicalJson(manifest)}\n` !== manifestBytes ||
-        manifestSha256(manifest) !== descriptor.tableDigestManifestSha256 ||
-        manifestSha256(legacyTableManifest(state, manifest)) !== descriptor.tableDigestManifestSha256) {
+    let manifest: LegacyTableManifest;
+    try { manifest = parseLegacyTableManifest(manifestBytes); }
+    catch { throw new Error("terminal state-v4 manifest bytes or preserved rows changed"); }
+    if (legacyTableManifestSha256(manifest) !== descriptor.tableDigestManifestSha256 ||
+        legacyTableManifestSha256(legacyTableManifest(state, manifest)) !== descriptor.tableDigestManifestSha256) {
       throw new Error("terminal state-v4 manifest bytes or preserved rows changed");
     }
     const records = new StateV4RestoreGuard({ journalPath: descriptor.guardPath,
@@ -2006,7 +1994,7 @@ export class MigrationCoordinator {
         assertKnownV3LegacyObjects(state);
       }
       const legacyManifest = legacyTableManifest(state);
-      const tableDigestManifestSha256 = manifestSha256(legacyManifest);
+      const tableDigestManifestSha256 = legacyTableManifestSha256(legacyManifest);
       const identity = databaseIdentity(stateDatabase);
       const writeEpoch = sha256Bytes(canonicalJson({
         databaseIdentity: identity,
@@ -2034,7 +2022,7 @@ export class MigrationCoordinator {
       const tableDigestManifestPath = reusable?.tableDigestManifestPath ??
         adoptable?.tableDigestManifestPath ?? `${backupPath}.manifest.json`;
       if (!reusable && !adoptable) {
-        writeFileSync(tableDigestManifestPath, `${canonicalJson(legacyManifest)}\n`, { mode: 0o600, flag: "wx" });
+        writeFileSync(tableDigestManifestPath, serializeLegacyTableManifest(legacyManifest), { mode: 0o600, flag: "wx" });
         fsyncPath(tableDigestManifestPath);
         fsyncPath(dirname(tableDigestManifestPath));
         createConsistentBackup(state, backupPath);
@@ -2048,9 +2036,10 @@ export class MigrationCoordinator {
         const sidecars = ["-wal", "-shm", "-journal"].filter((suffix) => existsSync(`${backupPath}${suffix}`));
         if (sidecars.length > 0) throw new Error("state-v4 backup has unbound SQLite sidecar state");
         const manifestBytes = readFileSync(tableDigestManifestPath, "utf8");
-        const signedManifest = JSON.parse(manifestBytes) as LegacyTableManifest;
-        if (`${canonicalJson(signedManifest)}\n` !== manifestBytes ||
-            manifestSha256(signedManifest) !== tableDigestManifestSha256) {
+        let signedManifest: LegacyTableManifest;
+        try { signedManifest = parseLegacyTableManifest(manifestBytes); }
+        catch { throw new Error("state-v4 manifest changed before descriptor publication"); }
+        if (legacyTableManifestSha256(signedManifest) !== tableDigestManifestSha256) {
           throw new Error("state-v4 manifest changed before descriptor publication");
         }
         const backupSha256BeforeVerification = sha256Bytes(readFileSync(backupPath));
@@ -2060,7 +2049,7 @@ export class MigrationCoordinator {
           if (String(backup.pragma("integrity_check", { simple: true })) !== "ok" ||
               (backup.pragma("foreign_key_check") as unknown[]).length > 0 ||
               userVersion(backup) !== stateVersion ||
-              manifestSha256(legacyTableManifest(backup)) !== tableDigestManifestSha256 ||
+              legacyTableManifestSha256(legacyTableManifest(backup)) !== tableDigestManifestSha256 ||
               schemaSha256(backup) !== stateSchemaSha256) {
             throw new Error("state-v4 backup verification failed");
           }
@@ -2083,7 +2072,9 @@ export class MigrationCoordinator {
           const published = readActiveStateV4GuardDescriptor(migrationLayout.root);
           if (published?.descriptorSha256 !== descriptor.descriptorSha256 ||
               sha256Bytes(readFileSync(backupPath)) !== backupSha256 ||
-              manifestSha256(JSON.parse(readFileSync(tableDigestManifestPath, "utf8"))) !== tableDigestManifestSha256) {
+              legacyTableManifestSha256(parseLegacyTableManifest(
+                readFileSync(tableDigestManifestPath, "utf8"),
+              )) !== tableDigestManifestSha256) {
             throw new Error("published state-v4 descriptor does not bind exact artifact bytes");
           }
           this.options.faultInjector?.("after_v4_backup");

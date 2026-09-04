@@ -14,12 +14,18 @@ const canonicalJson = (value) => {
 };
 
 const parseArgs = (argv) => {
-  const result = { root: process.cwd(), gitRoot: undefined, packagePath: "docs/hybrid-flow-v1" };
+  const result = {
+    root: process.cwd(),
+    gitRoot: undefined,
+    packagePath: "docs/hybrid-flow-v1",
+    migrationSeedPath: undefined,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--root") result.root = resolve(argv[++index]);
     else if (flag === "--git-root") result.gitRoot = resolve(argv[++index]);
     else if (flag === "--package") result.packagePath = argv[++index];
+    else if (flag === "--migration-seed") result.migrationSeedPath = argv[++index];
     else throw new Error(`unknown argument: ${flag}`);
   }
   result.gitRoot ??= result.root;
@@ -29,6 +35,9 @@ const parseArgs = (argv) => {
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 const git = (root, args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
 const HASH = /^[a-f0-9]{64}$/;
+const STATE_V4_PROGRESS_SEED_SHA256 = "741d67139b3171d5e3d678e37de09385ccc7d0bd8058d9b8d8629a27a0b22cb7";
+const STATE_V4_REVIEWED_COMMIT = "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50";
+const STATE_V4_REVIEWED_TREE = "955260b898f2465b72ecaabcb43b1453a15e3ebc";
 const normalizePackagePath = (packagePath) => packagePath === "R2"
   ? "docs/hybrid-flow-v1-r2"
   : packagePath === "v1" ? "docs/hybrid-flow-v1" : packagePath;
@@ -144,7 +153,12 @@ const validatePassEvidence = (root, event, name) => {
   }
 };
 
-export function verifyImplementationStart({ root, gitRoot = root, packagePath = "docs/hybrid-flow-v1" }) {
+export function verifyImplementationStart({
+  root,
+  gitRoot = root,
+  packagePath = "docs/hybrid-flow-v1",
+  migrationSeedPath,
+}) {
   packagePath = normalizePackagePath(packagePath);
   const packageRoot = resolve(root, packagePath);
   const lockPath = resolve(packageRoot, "PLAN_LOCK.json");
@@ -185,15 +199,51 @@ export function verifyImplementationStart({ root, gitRoot = root, packagePath = 
   }
 
   const progressRoot = resolve(packageRoot, "stage-close/pre-v4");
-  const progressFiles = existsSync(progressRoot)
-    ? readdirSync(progressRoot).filter((name) => name.endsWith(".json")).sort()
-    : [];
+  let progressFiles;
+  let seedReferences;
+  if (migrationSeedPath !== undefined) {
+    const seedPath = safeArtifactPath(root, migrationSeedPath);
+    const seedBytes = readFileSync(seedPath);
+    if (sha256(seedBytes) !== STATE_V4_PROGRESS_SEED_SHA256) {
+      throw new Error("state-v4 progress seed manifest digest mismatch");
+    }
+    const seed = JSON.parse(seedBytes.toString("utf8"));
+    if (!exactKeys(seed, ["schemaVersion", "planId", "sourceIdentity", "startSha256", "lastEventSha256", "events"]) ||
+        !exactKeys(seed.sourceIdentity, ["commitOid", "treeOid"]) ||
+        seed.schemaVersion !== "state-v4-progress-seed/v1" || seed.planId !== start.planId ||
+        seed.startSha256 !== start.startSha256 ||
+        seed.sourceIdentity.commitOid !== STATE_V4_REVIEWED_COMMIT ||
+        seed.sourceIdentity.treeOid !== STATE_V4_REVIEWED_TREE ||
+        !Array.isArray(seed.events) || seed.events.length !== 3 ||
+        seed.lastEventSha256 !== seed.events.at(-1)?.eventSha256) {
+      throw new Error("state-v4 progress seed manifest contract mismatch");
+    }
+    seedReferences = seed.events;
+    progressFiles = seed.events.map((reference, index) => {
+      if (!exactKeys(reference, ["sequence", "path", "fileSha256", "eventSha256"]) ||
+          reference.sequence !== index + 1 || !HASH.test(reference.fileSha256) ||
+          !HASH.test(reference.eventSha256)) {
+        throw new Error("state-v4 progress seed event reference is invalid");
+      }
+      const path = safeArtifactPath(root, reference.path);
+      if (!path.startsWith(`${progressRoot}/`) || sha256(readFileSync(path)) !== reference.fileSha256) {
+        throw new Error("state-v4 progress seed event file digest or path mismatch");
+      }
+      return { name: reference.path.split("/").at(-1), path };
+    });
+  } else {
+    progressFiles = existsSync(progressRoot)
+      ? readdirSync(progressRoot).filter((name) => name.endsWith(".json")).sort()
+        .map((name) => ({ name, path: resolve(progressRoot, name) }))
+      : [];
+  }
   let previousEventSha256 = start.startSha256;
   const events = [];
   const eventIdPattern = /^[A-Za-z0-9._:-]+$/;
   const terminalResults = new Set(["PASS", "FAIL", "BLOCKED", "DEGRADED_REVIEW_SET", "READY_FOR_AUTHORIZED_PUBLISH"]);
-  for (const [index, name] of progressFiles.entries()) {
-    const event = readJson(resolve(progressRoot, name));
+  for (const [index, entry] of progressFiles.entries()) {
+    const { name, path } = entry;
+    const event = readJson(path);
     const sequence = index + 1;
     const match = name.match(/^(\d{6})-(.+)\.json$/);
     if (!match || Number(match[1]) !== sequence || match[2] !== event.eventId || !eventIdPattern.test(event.eventId)) {
@@ -222,6 +272,10 @@ export function verifyImplementationStart({ root, gitRoot = root, packagePath = 
     const digestInput = { ...event }; delete digestInput.eventSha256;
     const digest = sha256(canonicalJson(digestInput));
     if (event.eventSha256 !== digest) throw new Error(`eventSha256 mismatch: ${name}`);
+    if (seedReferences?.[index]?.eventSha256 !== undefined &&
+        seedReferences[index].eventSha256 !== event.eventSha256) {
+      throw new Error(`state-v4 progress seed event digest mismatch: ${name}`);
+    }
     previousEventSha256 = digest;
     events.push({ ...event, evidenceVerified: event.eventType === "step_completed" && event.terminalResult === "PASS" });
   }
@@ -239,6 +293,7 @@ export function verifyImplementationStart({ root, gitRoot = root, packagePath = 
     lastSequence: events.length,
     lastEventSha256: previousEventSha256,
     events,
+    ...(migrationSeedPath === undefined ? {} : { migrationSeedSha256: STATE_V4_PROGRESS_SEED_SHA256 }),
   };
 }
 

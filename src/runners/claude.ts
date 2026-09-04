@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 import { ProviderTransportFailure } from "../domain/outcomes.js";
 import { REVIEW_VERDICT_JSON_SCHEMA } from "../domain/review-verdict.js";
 import type { ApprovalScope, Effort } from "../domain/routing.js";
+import type { ProviderSessionRef } from "../runtime/provider-telemetry.js";
 import type { CommandSpec } from "./provider-command.js";
 
 export interface ClaudeCommandInput {
@@ -23,6 +24,7 @@ export interface NormalizedClaudeResult {
   effort: Effort;
   effortProvenance: "command_pinned";
   sessionId: string;
+  readonly providerSessionRef: ProviderSessionRef;
 }
 
 const MODEL = "glm-5.3";
@@ -129,7 +131,7 @@ export function normalizeClaudeResult(
   if (!isDeepStrictEqual(visible, structured)) {
     return transportFailure("Claude visible and structured results conflict");
   }
-  return {
+  const result = {
     text: JSON.stringify(structured),
     model: MODEL,
     modelProvenance: "command_pinned",
@@ -137,4 +139,14 @@ export function normalizeClaudeResult(
     effortProvenance: "command_pinned",
     sessionId: expected.expectedSessionId,
   };
+  Object.defineProperty(result, "providerSessionRef", {
+    value: Object.freeze({
+      value: expected.expectedSessionId,
+      provenance: "command_pinned" as const,
+    }),
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return result as NormalizedClaudeResult;
 }

@@ -19,9 +19,14 @@ import {
 } from "../src/migration/coordinator.js";
 import { appendStateV4GuardEvent, assertPhysicalRestoreAllowed } from "../src/migration/state-v4-restore-authority.js";
 import { StateV4RestoreGuard } from "../src/migration/operational-restore.js";
+import {
+  legacyTableManifest,
+  parseLegacyTableManifest,
+} from "../src/migration/state-v4-manifest.js";
+import { REVIEW_V3_TABLE_CLASSIFICATION } from "../src/migration/review-v3-schema.js";
 import { GraphFlowStore } from "../src/store/graph-flow-store.js";
 import { RunStore } from "../src/store/run-store.js";
-import { computeGraphDefinitionSha256, type GraphFlow } from "../src/workflow/flow-contract.js";
+import { canonicalJson, computeGraphDefinitionSha256, type GraphFlow } from "../src/workflow/flow-contract.js";
 import { dropGraphV4Schema, dropReviewV3Extension } from "./helpers/graph-schema.js";
 
 const roots: string[] = [];
@@ -202,6 +207,64 @@ function migrateV3Fixture(paths: ReturnType<typeof databases>): V4MigrationRecei
   }
   return result;
 }
+
+describe("state-v4 legacy manifest protocol", () => {
+  const validManifest = {
+    schemaVersion: "legacy-table-digest-manifest/v1" as const,
+    tables: [{ name: "legacy_rows", columns: ["id"], rowCount: 0, rowsSha256: "0".repeat(64) }],
+  };
+
+  it.each([
+    { name: "extra envelope key", value: { ...validManifest, extra: true } },
+    { name: "missing envelope key", value: { tables: validManifest.tables } },
+    { name: "extra table key", value: {
+      ...validManifest,
+      tables: [{ ...validManifest.tables[0]!, extra: true }],
+    } },
+    { name: "missing table key", value: {
+      ...validManifest,
+      tables: [{ name: "legacy_rows", columns: ["id"], rowCount: 0 }],
+    } },
+  ])("rejects $name even when the JSON bytes are canonical", ({ value }) => {
+    expect(() => parseLegacyTableManifest(`${canonicalJson(value)}\n`))
+      .toThrow(/manifest.*(malformed|key|identity)/i);
+  });
+
+  it("accepts the exact review-v3 additions and rejects any other post-backup table", () => {
+    expect(REVIEW_V3_TABLE_CLASSIFICATION).toEqual({
+      added: [
+        "runtime_provider_recovery_generations",
+        "runtime_review_attempt_authorities",
+        "runtime_review_attempt_base_policies",
+        "runtime_review_generation_consumptions",
+        "runtime_review_no_spawn_effects",
+        "runtime_review_receipt_heads",
+        "runtime_review_receipt_lifecycle",
+        "runtime_review_receipts",
+        "runtime_review_spawn_authorities",
+        "runtime_schema_capabilities",
+      ],
+      replaced: [
+        "runtime_review_barriers",
+        "runtime_review_lane_attempts",
+        "runtime_review_lanes",
+      ],
+    });
+    const db = new Database(":memory:");
+    try {
+      db.exec("CREATE TABLE expected_rows (id TEXT PRIMARY KEY); INSERT INTO expected_rows VALUES ('one')");
+      const expected = legacyTableManifest(db);
+      for (const table of REVIEW_V3_TABLE_CLASSIFICATION.added) {
+        db.exec(`CREATE TABLE "${table}" (id TEXT PRIMARY KEY)`);
+      }
+      expect(legacyTableManifest(db, expected)).toEqual(expected);
+      db.exec("CREATE TABLE injected_rows (id TEXT PRIMARY KEY)");
+      expect(() => legacyTableManifest(db, expected)).toThrow(/manifest.*table.*set|unexpected.*table/i);
+    } finally {
+      db.close();
+    }
+  });
+});
 
 describe("launch authority state schema v4 migration", () => {
   it("creates a fresh v4 schema with the legacy-safe default and enforcement triggers", () => {
@@ -596,7 +659,7 @@ describe("launch authority state schema v4 migration", () => {
       lastEventSha256: parsed.at(-1)!.eventSha256,
       events: parsed.map(({ stageId, terminalResult, eventSha256 }) => ({ stageId, terminalResult, eventSha256 })),
     };
-    expect(bindRereadProgressEvents(verification, payloads).events).toHaveLength(3);
+    expect(bindRereadProgressEvents(verification, payloads).events).toHaveLength(4);
     const replaced = JSON.parse(payloads[1]!) as Record<string, unknown>;
     replaced.eventId = "replaced-after-verification";
     const attacked = [...payloads];

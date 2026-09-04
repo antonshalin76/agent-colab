@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Effort } from "../domain/routing.js";
+import type { UsageTelemetry } from "../runtime/flow-telemetry.js";
+import type { ProviderSessionRef } from "../runtime/provider-telemetry.js";
 import type { CommandSpec } from "./provider-command.js";
 
 export type GrokEffort = "low" | "medium" | "high" | "xhigh";
@@ -25,21 +27,9 @@ export interface NormalizedGrokResult {
   protocolVersion: string;
 }
 export interface NormalizedGrokEvalResult extends NormalizedGrokResult {
-  visibleTextProvenance: "provider_structured" | "command_pinned_plain_text";
-  usage: GrokUsageTelemetry;
-}
-
-interface GrokUsageTelemetry {
-  inputTokens: number | null;
-  cachedInputTokens: number | null;
-  outputTokens: number | null;
-  reasoningTokens: number | null;
-  totalTokens: number | null;
-  costUsd: number | null;
-  provenance: Record<
-    "inputTokens" | "cachedInputTokens" | "outputTokens" | "reasoningTokens" | "totalTokens" | "costUsd",
-    "provider_reported" | "unavailable"
-  >;
+  readonly visibleTextProvenance: "provider_structured" | "command_pinned_plain_text";
+  readonly usage: UsageTelemetry;
+  readonly providerSessionRef: ProviderSessionRef;
 }
 
 const DEFAULT_GROK_BINARY = join(homedir(), ".local", "bin", "grok");
@@ -58,7 +48,7 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function reportedNumber(...values: unknown[]): number | null {
   for (const value of values) {
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    if (typeof value === "number") return value;
   }
   return null;
 }
@@ -67,7 +57,7 @@ function usageTelemetry(
   source: Record<string, unknown>,
   summary: Record<string, unknown> | null,
   envelope: Record<string, unknown>,
-): GrokUsageTelemetry {
+): UsageTelemetry {
   const values = {
     inputTokens: reportedNumber(source.inputTokens, summary?.input_tokens),
     cachedInputTokens: reportedNumber(
@@ -163,6 +153,7 @@ export function normalizeGrokResult(
   expected: {
     expectedEffort: Effort;
     expectedProtocolVersion: string;
+    expectedSessionId?: string;
     includeUsage: true;
     allowPlainVisibleText?: boolean;
   },
@@ -172,6 +163,7 @@ export function normalizeGrokResult(
   expected: {
     expectedEffort: Effort;
     expectedProtocolVersion: string;
+    expectedSessionId?: string;
     includeUsage?: false;
     allowPlainVisibleText?: boolean;
   },
@@ -181,6 +173,7 @@ export function normalizeGrokResult(
   expected: {
     expectedEffort: Effort;
     expectedProtocolVersion: string;
+    expectedSessionId?: string;
     includeUsage?: boolean;
     allowPlainVisibleText?: boolean;
   },
@@ -200,6 +193,14 @@ export function normalizeGrokResult(
   }
   if (!envelope || typeof envelope.text !== "string") {
     throw new Error("incomplete Grok terminal result");
+  }
+  const reportedSessionId = typeof envelope.sessionId === "string" && envelope.sessionId.trim()
+    ? envelope.sessionId
+    : null;
+  if (expected.expectedSessionId !== undefined &&
+      (!expected.expectedSessionId.trim() ||
+       (reportedSessionId !== null && reportedSessionId !== expected.expectedSessionId))) {
+    throw new Error("Grok result session identity mismatch");
   }
   if (envelope.stopReason !== "end_turn") {
     throw new Error("Grok result has an error or nonterminal stop reason");
@@ -259,11 +260,28 @@ export function normalizeGrokResult(
     effort: expectedEffort,
     protocolVersion: expected.expectedProtocolVersion,
   };
-  return expected.includeUsage
-    ? {
+  if (!expected.includeUsage) return base;
+  const providerSessionRef: ProviderSessionRef | null = expected.expectedSessionId !== undefined
+    ? { value: expected.expectedSessionId, provenance: "command_pinned" }
+    : reportedSessionId === null
+      ? null
+      : { value: reportedSessionId, provenance: "provider_reported" };
+  if (providerSessionRef === null) throw new Error("Grok result is missing its provider session identity");
+  return withProviderSessionRef({
       ...base,
       visibleTextProvenance,
       usage: usageTelemetry(modelUsage, record(envelope.usage), envelope),
-    }
-    : base;
+    }, providerSessionRef);
+}
+
+function withProviderSessionRef<T extends object>(value: T, providerSessionRef: ProviderSessionRef): T & {
+  readonly providerSessionRef: ProviderSessionRef;
+} {
+  Object.defineProperty(value, "providerSessionRef", {
+    value: Object.freeze({ ...providerSessionRef }),
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return value as T & { readonly providerSessionRef: ProviderSessionRef };
 }

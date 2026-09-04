@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "state-v4-progress-seed/v1",
+  "planId": "agent-collab-hybrid-flow-v1-r2",
+  "sourceIdentity": {
+    "commitOid": "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50",
+    "treeOid": "955260b898f2465b72ecaabcb43b1453a15e3ebc"
+  },
+  "startSha256": "851b7136b5642360481b9896b154745bb8bee06adcc0017058cd964add396aee",
+  "lastEventSha256": "924887cd4205a7b5b9a9fabad426162d32c3ec6da886eff24b8bc074ba0c5469",
+  "events": [
+    {
+      "sequence": 1,
+      "path": "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000001-r2-stg-00-pass.json",
+      "fileSha256": "45c8482fe8b52d76d7b623220fe9c41c93e0973fe843c31b24c0578e7f309561",
+      "eventSha256": "ca0e9dbd810ab6ed41c8b25c760b71d5bee8c621b60d3895fc778634e63c0bd7"
+    },
+    {
+      "sequence": 2,
+      "path": "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000002-stg-01-pass.json",
+      "fileSha256": "4793eb7b2978ea9842a3b5001936ac136be57f9484679a246f18606d4c6ef750",
+      "eventSha256": "98e901f40784a4b7d2bba23847b80e491f808eb710e14f9ce2fc59f070bb8b97"
+    },
+    {
+      "sequence": 3,
+      "path": "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000003-stg-02-pass.json",
+      "fileSha256": "2142a5f506cc8e4379f5c566b09c5b6579f5eb85ce809cc55e265869540a0137",
+      "eventSha256": "924887cd4205a7b5b9a9fabad426162d32c3ec6da886eff24b8bc074ba0c5469"
+    }
+  ]
+}

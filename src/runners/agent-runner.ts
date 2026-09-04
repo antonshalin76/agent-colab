@@ -18,6 +18,14 @@ import { classifyProviderFailure, classifyProviderFailureDetail } from "../domai
 import { redactSensitive } from "../security/redaction.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
+import {
+  carryQuarantinedProviderTelemetry,
+  mapProviderTelemetryOutcome,
+  type ProviderSessionRef,
+  type ProviderTelemetryOutcome,
+  type ProviderTerminalTelemetry,
+} from "../runtime/provider-telemetry.js";
+import type { UsageTelemetry } from "../runtime/flow-telemetry.js";
 import { normalizeCodexResult } from "./codex.js";
 import { normalizeGrokResult } from "./grok.js";
 import type { GrokEffort } from "./grok.js";
@@ -47,6 +55,8 @@ const EFFORT_MODIFIERS = [
   "broad_change_set",
 ] as const;
 const LIMIT_REASON = /^(provider_policy_limit:gpt-5\.6-sol:xhigh|model_capability_limit:grok-4\.6:xhigh|model_capability_limit:glm-5\.3:max)$/;
+const NOOP_LAUNCH_INFO = (_info: Record<string, unknown>): void => undefined;
+const NOOP_NO_SPAWN = (): void => undefined;
 
 export interface SavedRunnerDecision {
   agent: ReviewProviderId;
@@ -107,6 +117,19 @@ async function terminateProcess(
   signal: "SIGTERM" | "SIGKILL",
 ): Promise<void> {
   try { await launched.terminate(signal); } catch { /* process group already exited */ }
+}
+
+function commandPinnedProviderSession(payload: TaskPayload): ProviderSessionRef | null {
+  return payload.decision.agent === "codex" || payload.sessionId === undefined
+    ? null
+    : { value: payload.sessionId, provenance: "command_pinned" };
+}
+
+function runnerResultWithQuarantinedTelemetry(
+  result: Record<string, unknown>,
+  telemetryObservation: ProviderTerminalTelemetry,
+): Record<string, unknown> {
+  return carryQuarantinedProviderTelemetry(result, telemetryObservation);
 }
 
 function object(value: unknown): Record<string, unknown> | null {
@@ -449,9 +472,9 @@ export class AgentRunner {
 
   async run(
     run: ProcessTask,
-    onLaunch: (info: Record<string, unknown>) => void = () => undefined,
-    onLaunchIntent: (info: Record<string, unknown>) => void = () => undefined,
-    onProvenNoSpawn: () => void = () => undefined,
+    onLaunch: (info: Record<string, unknown>) => void = NOOP_LAUNCH_INFO,
+    onLaunchIntent: (info: Record<string, unknown>) => void = NOOP_LAUNCH_INFO,
+    onProvenNoSpawn: () => void = NOOP_NO_SPAWN,
   ): Promise<Record<string, unknown>> {
     let payload: TaskPayload;
     let command: CommandSpec;
@@ -530,27 +553,42 @@ export class AgentRunner {
       try {
         onProvenNoSpawn();
       } catch (clearError) {
-        return {
+        return runnerResultWithQuarantinedTelemetry({
           kind: "task_failure",
           agent: payload.decision.agent,
           error: clearError instanceof Error ? clearError.message : String(clearError),
-        };
+        }, mapProviderTelemetryOutcome({
+          provider: payload.decision.agent,
+          providerSessionRef: null,
+          outcome: "pre_session_failure",
+          usageReport: null,
+        }));
       }
       const kind = classifyRunnerFailure(error);
-      return {
+      return runnerResultWithQuarantinedTelemetry({
         kind,
         agent: payload.decision.agent,
         error: error instanceof Error ? error.message : String(error),
-      };
+      }, mapProviderTelemetryOutcome({
+        provider: payload.decision.agent,
+        providerSessionRef: null,
+        outcome: "pre_session_failure",
+        usageReport: null,
+      }));
     }
     if (!Number.isSafeInteger(launched.pid) || launched.pid <= 0) {
       void launched.result.catch(() => undefined);
       await terminateProcess(launched, "SIGTERM");
-      return {
+      return runnerResultWithQuarantinedTelemetry({
         kind: "cli_missing",
         agent: payload.decision.agent,
         error: "agent launcher returned without a started process id",
-      };
+      }, mapProviderTelemetryOutcome({
+        provider: payload.decision.agent,
+        providerSessionRef: null,
+        outcome: "pre_session_failure",
+        usageReport: null,
+      }));
     }
     try {
       onLaunch({
@@ -565,11 +603,16 @@ export class AgentRunner {
     } catch (error) {
       await terminateProcess(launched, "SIGTERM");
       await terminateProcess(launched, "SIGKILL");
-      return {
+      return runnerResultWithQuarantinedTelemetry({
         kind: "task_failure",
         agent: payload.decision.agent,
         error: error instanceof Error ? error.message : String(error),
-      };
+      }, mapProviderTelemetryOutcome({
+        provider: payload.decision.agent,
+        providerSessionRef: commandPinnedProviderSession(payload),
+        outcome: "provider_failure",
+        usageReport: null,
+      }));
     }
 
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -584,46 +627,79 @@ export class AgentRunner {
       }, command.timeoutMs);
       timer.unref();
     });
+    let terminalOutcome: Exclude<ProviderTelemetryOutcome, "succeeded" | "pre_session_failure"> =
+      "provider_failure";
     try {
       const result = await Promise.race([launched.result, timeout]);
       if (timedOut) await timeout;
       if (result.exitCode !== 0) {
         throw Object.assign(new Error(`agent exited ${result.exitCode}`), { stderr: result.stderr });
       }
-      const normalized = payload.decision.agent === "grok"
-        ? normalizeGrokResult(result.stdout, {
-            expectedEffort: payload.decision.effort as GrokEffort,
-            expectedProtocolVersion: PROTOCOL,
-            allowPlainVisibleText: true,
-          })
-        : payload.decision.agent === "claude"
-          ? normalizeClaudeResult(result.stdout, {
-              expectedSessionId: payload.sessionId ?? "",
-              expectedEffort: payload.decision.effort,
-            })
-          : normalizeCodexResult(result.stdout);
-      if (normalized.model !== payload.decision.model) {
-        throw new Error(`model identity mismatch: ${normalized.model}`);
+      terminalOutcome = "malformed_terminal";
+      let text: string;
+      let model: ProviderModel;
+      let providerSessionRef: ProviderSessionRef;
+      let usageReport: UsageTelemetry | null;
+      if (payload.decision.agent === "grok") {
+        const normalized = normalizeGrokResult(result.stdout, {
+          expectedEffort: payload.decision.effort as GrokEffort,
+          expectedProtocolVersion: PROTOCOL,
+          expectedSessionId: payload.sessionId ?? "",
+          includeUsage: true,
+          allowPlainVisibleText: true,
+        });
+        text = normalized.text;
+        model = normalized.model;
+        providerSessionRef = normalized.providerSessionRef;
+        usageReport = normalized.usage;
+      } else if (payload.decision.agent === "claude") {
+        const normalized = normalizeClaudeResult(result.stdout, {
+          expectedSessionId: payload.sessionId ?? "",
+          expectedEffort: payload.decision.effort,
+        });
+        text = normalized.text;
+        model = normalized.model;
+        providerSessionRef = normalized.providerSessionRef;
+        usageReport = null;
+      } else {
+        const normalized = normalizeCodexResult(result.stdout, { includeUsage: true });
+        text = normalized.text;
+        model = normalized.model;
+        providerSessionRef = normalized.providerSessionRef;
+        usageReport = normalized.usage;
       }
-      return {
+      if (model !== payload.decision.model) {
+        throw new Error(`model identity mismatch: ${model}`);
+      }
+      return runnerResultWithQuarantinedTelemetry({
         kind: "success",
         agent: payload.decision.agent,
         model: payload.decision.model,
         effort: payload.decision.effort,
         policyVersion: payload.decision.policyVersion,
         reasons: [...payload.decision.reasons],
-        text: normalized.text,
-      };
+        text,
+      }, mapProviderTelemetryOutcome({
+        provider: payload.decision.agent,
+        providerSessionRef,
+        outcome: "success",
+        usageReport,
+      }));
     } catch (error) {
       const stderr = error && typeof error === "object" && "stderr" in error
         ? redactSensitive(String(error.stderr))
         : "";
-      return {
+      return runnerResultWithQuarantinedTelemetry({
         ...classifyProviderFailureDetail(error, stderr),
         agent: payload.decision.agent,
         error: error instanceof Error ? error.message : String(error),
         ...(stderr ? { logs: [stderr] } : {}),
-      };
+      }, mapProviderTelemetryOutcome({
+        provider: payload.decision.agent,
+        providerSessionRef: commandPinnedProviderSession(payload),
+        outcome: timedOut ? "timeout" : terminalOutcome,
+        usageReport: null,
+      }));
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }

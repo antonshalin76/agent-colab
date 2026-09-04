@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
-import canonicalize from "canonicalize";
+import { assertJsonDocument, canonicalJson, computeJsonSha256 } from "../domain/canonical-json.js";
 import { buildFlowGraph, graphDepth, type FlowGraphIndex } from "./flow-graph.js";
+
+export { assertJsonDocument, canonicalJson, computeBytesSha256, computeJsonSha256 } from "../domain/canonical-json.js";
 
 export type JoinPolicy = "all_success" | "all_terminal";
 export type CanonicalNodeOutcome = "succeeded" | "failed" | "cancelled" | "skipped" | "blocked";
@@ -144,10 +145,6 @@ const outputCompiler = new Ajv2020({ strict: true, allErrors: true, validateSche
 const graphValidator = compiler.compile(GRAPH_SCHEMA);
 const nodeResultValidator = compiler.compile(NODE_RESULT_SCHEMA);
 
-export function computeJsonSha256(value: unknown): string {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex");
-}
-
 export function computeGraphDefinitionSha256(input: unknown): string {
   const value = plainRecord(structuredClone(input), "graph definition");
   delete value.definitionSha256;
@@ -244,28 +241,6 @@ export function validateJsonSchema(input: unknown, label = "schema"): JsonSchema
 export function validateJsonValue(schema: JsonSchema, value: unknown): void {
   const validator = outputValidator(schema);
   if (!validator(value)) throw new Error(`JSON Schema validation failed: ${outputCompiler.errorsText(validator.errors)}`);
-}
-
-export function canonicalJson(value: unknown): string {
-  assertJsonDocument(value);
-  const encoded = canonicalize(value);
-  if (encoded === undefined) throw new Error("value cannot be RFC 8785 canonicalized");
-  return encoded;
-}
-
-export function assertJsonDocument(value: unknown): void {
-  const ancestors = new Set<object>();
-  const visit = (candidate: unknown): void => {
-    if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") return;
-    if (typeof candidate === "number") { if (!Number.isFinite(candidate)) throw new Error("JSON document contains a non-finite number"); return; }
-    if (typeof candidate !== "object") throw new Error("value is not a JSON document");
-    if (ancestors.has(candidate)) throw new Error("JSON document contains a cycle");
-    if (!Array.isArray(candidate) && Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null) throw new Error("JSON document contains a non-plain object");
-    ancestors.add(candidate);
-    (Array.isArray(candidate) ? candidate : Object.values(candidate as Record<string, unknown>)).forEach(visit);
-    ancestors.delete(candidate);
-  };
-  visit(value);
 }
 
 function outputValidator(schema: JsonSchema): ValidateFunction {

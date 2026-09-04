@@ -1,7 +1,7 @@
 {
   "meta": {
     "version": "1.0",
-    "generated": "2026-09-01",
+    "generated": "2026-09-05",
     "root_path": ".",
     "languages": [
       "typescript",
@@ -15,10 +15,10 @@
       "Model Context Protocol SDK",
       "SQLite"
     ],
-    "description_1l": "Local durable collaboration router for Codex, Grok, and Claude Code agents.",
-    "description_short": "Agent Collab is a local TypeScript CLI and stdio MCP control plane backed by SQLite. It owns provider routing, durable workflow and graph state, review barriers, approvals, worktree leases, history indexing, recovery, migration, and evidence-gated evaluation.",
-    "file_count_approx": 119,
-    "token_estimate": 49551,
+    "description_1l": "Local durable collaboration router for Codex-led multi-agent workflows.",
+    "description_short": "Agent Collab is a machine-local CLI and MCP service backed by private SQLite state. Codex is the required execution harness; Grok and Claude Code are optional review providers. The service owns typed workflow execution, recovery, review barriers, provider health, and graph-linked telemetry.",
+    "file_count_approx": 139,
+    "token_estimate": 56916,
     "architecture_fidelity": {
       "graph_model": "component-level static multi-factor graph",
       "truth_model": "evidence-ranked approximation; not a complete runtime call graph",
@@ -28,8 +28,8 @@
         "ast-code-graph": "ok",
         "ast-index": "ok"
       },
-      "ast_index_symbols_observed": 18376,
-      "ast_index_refs_observed": 115402,
+      "ast_index_symbols_observed": 19402,
+      "ast_index_refs_observed": 127404,
       "ast_code_graph_nodes_observed": 759,
       "ast_code_graph_edges_observed": 11228,
       "confidence_scale": {
@@ -37,29 +37,29 @@
         "medium": "unique first-party symbol reference resolved to an existing file",
         "low": "heuristic relationship that needs human confirmation"
       },
-      "source_files": 119,
-      "code_evidence_files_read": 119,
-      "test_files_total": 76,
-      "test_files_read": 76,
+      "source_files": 139,
+      "code_evidence_files_read": 139,
+      "test_files_total": 88,
+      "test_files_read": 88,
       "component_coverage_pct": 100.0,
       "deep_analysis_coverage_pct": 100.0,
       "component_source_evidence_coverage_pct": 100.0,
       "component_test_coverage_pct": 78.3,
-      "symbol_references_observed": 22944,
-      "edges_with_test_evidence": 44,
+      "symbol_references_observed": 27430,
+      "edges_with_test_evidence": 55,
       "edge_count_by_type": {
-        "calls": 77,
-        "inherits": 1
+        "calls": 82,
+        "inherits": 4
       },
       "edge_count_by_confidence": {
-        "high": 1,
-        "medium": 77
+        "high": 4,
+        "medium": 82
       },
       "edge_count_by_factor": {
-        "constructor_call": 21,
-        "inheritance": 1,
-        "symbol_call": 77,
-        "test_exercises_both_ends": 44
+        "constructor_call": 22,
+        "inheritance": 4,
+        "symbol_call": 82,
+        "test_exercises_both_ends": 55
       },
       "partial_reasons": [],
       "blind_spots": [
@@ -88,36 +88,36 @@
           "commands": {
             "rebuild": {
               "status": "ok",
-              "elapsed_ms": 2827
+              "elapsed_ms": 3036
             },
             "stats": {
               "status": "ok",
-              "elapsed_ms": 26
+              "elapsed_ms": 35
             },
             "map": {
               "status": "ok",
-              "elapsed_ms": 49
+              "elapsed_ms": 33
             },
             "conventions": {
               "status": "ok",
-              "elapsed_ms": 83
+              "elapsed_ms": 79
             }
           },
           "partial_reasons": [],
           "stats": {
-            "file_count": 1392,
-            "symbol_count": 18376,
-            "refs_count": 115402,
+            "file_count": 1424,
+            "symbol_count": 19402,
+            "refs_count": 127404,
             "module_count": 0,
             "ios_assets_count": 0,
             "resources_count": 0,
             "storyboard_usages_count": 0,
             "xml_usages_count": 0,
-            "db_size_bytes": 20037632,
+            "db_size_bytes": 21790720,
             "cache_db_available": true
           },
           "map": {
-            "file_count": 1392,
+            "file_count": 1424,
             "groups": {
               "count": 12
             },
@@ -142,11 +142,11 @@
           "commands": {
             "python_graph": {
               "status": "ok",
-              "elapsed_ms": 388
+              "elapsed_ms": 313
             },
             "ast_grep_typescript_function_declarations": {
               "status": "ok",
-              "elapsed_ms": 42
+              "elapsed_ms": 71
             },
             "ast_grep_python_function_definitions": {
               "status": "failed",
@@ -156,7 +156,7 @@
             },
             "ast_grep_javascript_function_declarations": {
               "status": "ok",
-              "elapsed_ms": 8
+              "elapsed_ms": 9
             },
             "ast_grep_cpp_include_directives": {
               "status": "ok",
@@ -216,41 +216,36 @@
     "name": "Agent Collab",
     "type": "cli_tool",
     "c4_level": "SystemContext",
-    "description": "Local single-user collaboration control plane for coding agents, exposed through a CLI and stdio MCP server.",
+    "description": "Machine-local collaboration service that coordinates durable Codex-led workflows through CLI and MCP entry points.",
     "users": [
       {
         "name": "Local Operator",
-        "description": "Starts workflows, grants bounded authority, inspects durable state, runs migrations, and reconciles ambiguous attempts"
+        "description": "Configures, supervises, and audits collaboration workflows on the local machine"
       },
       {
         "name": "Coding Agent Client",
-        "description": "Uses stdio MCP tools to delegate bounded work, request reviews, and query durable results"
+        "description": "Invokes the collaboration service through its CLI or MCP interface"
       }
     ],
-    "top_boundary": "Local CLI and stdio MCP control plane with private SQLite state; provider CLIs are external execution adapters."
+    "top_boundary": "Machine-local collaboration runtime, private state, and first-party code contained in this repository."
   },
   "containers": [
     {
       "id": "app",
       "name": "Agent Collab",
       "c4_level": "Container",
-      "description": "Local process boundary hosting CLI commands, the stdio MCP server, durable routing and review orchestration, and offline SQLite migration tools.",
+      "description": "Node.js CLI and MCP process that owns workflow orchestration, durable SQLite state, provider routing, review barriers, recovery, and telemetry.",
       "technology": [
         "TypeScript",
-        "Python",
-        "JavaScript",
-        "SQL",
-        "C++",
         "Node.js",
-        "Model Context Protocol",
+        "Model Context Protocol SDK",
         "SQLite"
       ],
       "responsibilities": [
-        "Route bounded work across Codex and optional helper providers",
-        "Persist workflow, review, graph, approval, lease, and evidence state",
-        "Expose local CLI and stdio MCP control surfaces",
-        "Enforce provider health, authority, recovery, and production quarantine",
-        "Run guarded offline schema migrations and restore procedures"
+        "Execute typed graph workflows with durable recovery and review barriers",
+        "Route Codex execution and optional Grok or Claude Code review providers according to health and policy",
+        "Persist workflow state, evidence, provider health, and graph-linked telemetry in private SQLite stores",
+        "Expose local operator and coding-agent entry points through CLI and MCP"
       ],
       "entry_files": [
         "scripts/agent-collab-eval-launcher.mjs",
@@ -264,11 +259,11 @@
         "src/migration/",
         "src/flow/",
         ".map/",
-        "scripts/",
-        "src/history/",
-        "src/runners/",
         "src/store/",
-        "evals/"
+        "scripts/",
+        "src/app/",
+        "src/domain/",
+        "src/history/"
       ]
     }
   ],
@@ -470,10 +465,10 @@
         "tests/evidence-ledger.test.ts",
         "tests/fixtures/review-v3-activation-worker.mjs",
         "tests/fixtures/review-v3-terminal-worker.mjs",
+        "tests/flow-telemetry-archive-v4.test.ts",
+        "tests/flow-telemetry-store-v4.test.ts",
         "tests/graph-flow-store.test.ts",
-        "tests/history.test.ts",
-        "tests/migration-v2.test.ts",
-        "tests/migration-v3.test.ts"
+        "tests/helpers/flow-telemetry-fixture.ts"
       ],
       "test_evidence": [
         {
@@ -571,34 +566,65 @@
         }
       ],
       "test_files": [
+        "tests/flow-telemetry-archive-v4.test.ts",
         "tests/graph-flow-store.test.ts",
+        "tests/helpers/flow-telemetry-fixture.ts",
+        "tests/implementation-progress-v4.test.ts",
         "tests/schema-compatibility.test.ts"
       ],
       "test_evidence": [
         {
           "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:715",
+          "detail": "test references graph_node_results",
+          "symbol": "graph_node_results",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:850",
+          "detail": "test references graph_edge_evaluations",
+          "symbol": "graph_edge_evaluations",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:1445",
+          "detail": "test references agent_events",
+          "symbol": "agent_events",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:1464",
+          "detail": "test references agent_event_payloads",
+          "symbol": "agent_event_payloads",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:3173",
+          "detail": "test references agent_event_archives",
+          "symbol": "agent_event_archives",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:3186",
+          "detail": "test references agent_event_archive_members",
+          "symbol": "agent_event_archive_members",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/flow-telemetry-archive-v4.test.ts:3191",
+          "detail": "test references agent_event_payloads",
+          "symbol": "agent_event_payloads",
+          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
+        },
+        {
+          "kind": "test_symbol_ref",
           "file": "tests/graph-flow-store.test.ts:263",
-          "detail": "test references graph_flows",
-          "symbol": "graph_flows",
-          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
-        },
-        {
-          "kind": "test_symbol_ref",
-          "file": "tests/graph-flow-store.test.ts:319",
-          "detail": "test references graph_flows",
-          "symbol": "graph_flows",
-          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
-        },
-        {
-          "kind": "test_symbol_ref",
-          "file": "tests/schema-compatibility.test.ts:395",
-          "detail": "test references graph_flows",
-          "symbol": "graph_flows",
-          "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
-        },
-        {
-          "kind": "test_symbol_ref",
-          "file": "tests/schema-compatibility.test.ts:415",
           "detail": "test references graph_flows",
           "symbol": "graph_flows",
           "target_file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql"
@@ -688,8 +714,8 @@
         "verifyImplementationStart"
       ],
       "consumes_from": [
-        "map",
-        "workflow"
+        "domain",
+        "map"
       ],
       "data_flows": [],
       "source_evidence": [
@@ -727,10 +753,30 @@
         "Own the files listed for this component"
       ],
       "files": [
+        "src/app/implementation-progress-projector.ts",
+        "src/app/flow-telemetry-archive-authority.ts",
+        "src/app/flow-telemetry-archive-service.ts",
+        "src/app/implementation-progress-service.ts",
         "src/app/service.ts"
       ],
       "file_groups": [],
       "provides": [
+        "ImplementationProgressProjector",
+        "ArchiveCommitCapability",
+        "ArchiveDeletionCapability",
+        "ArchiveAuthorityFileProof",
+        "ArchiveCommitAuthorityInput",
+        "ArchiveDeletionAuthorityInput",
+        "FlowTelemetryArchiveServiceAuthorityPort",
+        "FlowTelemetryArchiveStoreAuthorityPort",
+        "assertFlowTelemetryArchiveStoreAuthorityPort",
+        "createFlowTelemetryArchiveAuthority",
+        "FlowTelemetryArchiveServiceOptions",
+        "FlowTelemetryArchiveResult",
+        "FlowTelemetryPayloadResult",
+        "FlowTelemetryArchiveService",
+        "ImplementationProgressVerification",
+        "ImplementationProgressService",
         "codexSessionProject",
         "grokSessionProject",
         "projectMemorySection",
@@ -753,37 +799,56 @@
       "source_evidence": [
         {
           "kind": "source_file",
-          "file": "src/app/service.ts",
+          "file": "src/app/flow-telemetry-archive-authority.ts",
+          "detail": "component-owned file read during final enrichment"
+        },
+        {
+          "kind": "source_file",
+          "file": "src/app/flow-telemetry-archive-service.ts",
           "detail": "component-owned file read during final enrichment"
         },
         {
           "kind": "provided_symbol",
-          "file": "src/app/service.ts",
-          "detail": "exports or defines codexSessionProject",
-          "symbol": "codexSessionProject"
+          "file": "src/app/flow-telemetry-archive-authority.ts",
+          "detail": "exports or defines ArchiveCommitCapability",
+          "symbol": "ArchiveCommitCapability"
         },
         {
           "kind": "provided_symbol",
-          "file": "src/app/service.ts",
-          "detail": "exports or defines grokSessionProject",
-          "symbol": "grokSessionProject"
+          "file": "src/app/flow-telemetry-archive-authority.ts",
+          "detail": "exports or defines ArchiveDeletionCapability",
+          "symbol": "ArchiveDeletionCapability"
         },
         {
           "kind": "provided_symbol",
-          "file": "src/app/service.ts",
-          "detail": "exports or defines projectMemorySection",
-          "symbol": "projectMemorySection"
+          "file": "src/app/flow-telemetry-archive-authority.ts",
+          "detail": "exports or defines ArchiveAuthorityFileProof",
+          "symbol": "ArchiveAuthorityFileProof"
         },
         {
           "kind": "data_structure",
-          "file": "src/app/service.ts:149",
-          "detail": "defines LocalCollabService",
-          "symbol": "LocalCollabService"
+          "file": "src/app/flow-telemetry-archive-authority.ts:26",
+          "detail": "defines ArchiveAuthorityFileProof",
+          "symbol": "ArchiveAuthorityFileProof"
+        },
+        {
+          "kind": "data_structure",
+          "file": "src/app/flow-telemetry-archive-authority.ts:35",
+          "detail": "defines ArchiveCommitAuthorityInput",
+          "symbol": "ArchiveCommitAuthorityInput"
+        },
+        {
+          "kind": "provided_symbol",
+          "file": "src/app/flow-telemetry-archive-service.ts",
+          "detail": "exports or defines FlowTelemetryArchiveServiceOptions",
+          "symbol": "FlowTelemetryArchiveServiceOptions"
         }
       ],
       "test_files": [
         "tests/app-service.test.ts",
+        "tests/fixtures/flow-telemetry-archive-worker.mjs",
         "tests/history.test.ts",
+        "tests/implementation-progress-v4.test.ts",
         "tests/review-evidence-capture.test.ts",
         "tests/review-v3-schema-signature.test.ts",
         "tests/state-database-fence.test.ts"
@@ -901,6 +966,7 @@
         "Own the files listed for this component"
       ],
       "files": [
+        "src/domain/canonical-json.ts",
         "src/domain/review-verdict.ts",
         "src/domain/review.ts",
         "src/domain/outcomes.ts",
@@ -908,6 +974,10 @@
       ],
       "file_groups": [],
       "provides": [
+        "assertJsonDocument",
+        "canonicalJson",
+        "computeBytesSha256",
+        "computeJsonSha256",
         "ReviewVerdictEnvelopeSchema",
         "ReviewVerdictEnvelope",
         "REVIEW_VERDICT_JSON_SCHEMA",
@@ -933,24 +1003,40 @@
         "MAX_PROVIDER_RESET_HORIZON_MS",
         "parseProviderRetryAt",
         "ProviderTransportFailure",
-        "classifyProviderFailureDetail",
-        "classifyProviderFailure",
-        "isFailoverOutcome",
-        "classifyOutcome",
-        "StartupProbeExpected"
+        "classifyProviderFailureDetail"
       ],
-      "consumes_from": [],
+      "consumes_from": [
+        "map"
+      ],
       "data_flows": [],
       "source_evidence": [
+        {
+          "kind": "source_file",
+          "file": "src/domain/canonical-json.ts",
+          "detail": "component-owned file read during final enrichment"
+        },
         {
           "kind": "source_file",
           "file": "src/domain/outcomes.ts",
           "detail": "component-owned file read during final enrichment"
         },
         {
-          "kind": "source_file",
-          "file": "src/domain/review-verdict.ts",
-          "detail": "component-owned file read during final enrichment"
+          "kind": "provided_symbol",
+          "file": "src/domain/canonical-json.ts",
+          "detail": "exports or defines assertJsonDocument",
+          "symbol": "assertJsonDocument"
+        },
+        {
+          "kind": "provided_symbol",
+          "file": "src/domain/canonical-json.ts",
+          "detail": "exports or defines canonicalJson",
+          "symbol": "canonicalJson"
+        },
+        {
+          "kind": "provided_symbol",
+          "file": "src/domain/canonical-json.ts",
+          "detail": "exports or defines computeBytesSha256",
+          "symbol": "computeBytesSha256"
         },
         {
           "kind": "provided_symbol",
@@ -969,36 +1055,21 @@
           "file": "src/domain/outcomes.ts",
           "detail": "exports or defines OutcomeKind",
           "symbol": "OutcomeKind"
-        },
-        {
-          "kind": "data_structure",
-          "file": "src/domain/outcomes.ts:21",
-          "detail": "defines OutcomeKind",
-          "symbol": "OutcomeKind"
-        },
-        {
-          "kind": "data_structure",
-          "file": "src/domain/outcomes.ts:48",
-          "detail": "defines ProviderTransportFailure",
-          "symbol": "ProviderTransportFailure"
-        },
-        {
-          "kind": "provided_symbol",
-          "file": "src/domain/review-verdict.ts",
-          "detail": "exports or defines ReviewVerdictEnvelopeSchema",
-          "symbol": "ReviewVerdictEnvelopeSchema"
         }
       ],
       "test_files": [
         "tests/claude.test.ts",
         "tests/effort-policy.test.ts",
-        "tests/outcomes.test.ts",
-        "tests/review-evidence-capture.test.ts",
-        "tests/review-lanes.test.ts",
-        "tests/review-verdict.test.ts",
-        "tests/routing-v2.test.ts",
-        "tests/routing-v5-contract.test.ts",
-        "tests/runner-commands.test.ts"
+        "tests/flow-contract.test.ts",
+        "tests/flow-telemetry-archive-v4.test.ts",
+        "tests/flow-telemetry-store-v4.test.ts",
+        "tests/flow-telemetry-v4.test.ts",
+        "tests/graph-flow-store.test.ts",
+        "tests/helpers/flow-telemetry-fixture.ts",
+        "tests/helpers/implementation-progress-fixture.ts",
+        "tests/implementation-progress-v4.test.ts",
+        "tests/migration-v4.test.ts",
+        "tests/outcomes.test.ts"
       ],
       "test_evidence": [
         {
@@ -1031,31 +1102,31 @@
         },
         {
           "kind": "test_symbol_ref",
-          "file": "tests/outcomes.test.ts:14",
-          "detail": "test references classifyOutcome",
-          "symbol": "classifyOutcome",
-          "target_file": "src/domain/outcomes.ts"
+          "file": "tests/flow-contract.test.ts:90",
+          "detail": "test references computeJsonSha256",
+          "symbol": "computeJsonSha256",
+          "target_file": "src/domain/canonical-json.ts"
         },
         {
           "kind": "test_symbol_ref",
-          "file": "tests/outcomes.test.ts:27",
-          "detail": "test references classifyOutcome",
-          "symbol": "classifyOutcome",
-          "target_file": "src/domain/outcomes.ts"
+          "file": "tests/flow-contract.test.ts:93",
+          "detail": "test references computeJsonSha256",
+          "symbol": "computeJsonSha256",
+          "target_file": "src/domain/canonical-json.ts"
         },
         {
           "kind": "test_symbol_ref",
-          "file": "tests/outcomes.test.ts:34",
-          "detail": "test references classifyOutcome",
-          "symbol": "classifyOutcome",
-          "target_file": "src/domain/outcomes.ts"
+          "file": "tests/flow-contract.test.ts:133",
+          "detail": "test references computeJsonSha256",
+          "symbol": "computeJsonSha256",
+          "target_file": "src/domain/canonical-json.ts"
         },
         {
           "kind": "test_symbol_ref",
-          "file": "tests/outcomes.test.ts:58",
-          "detail": "test references evaluateStartupProbe",
-          "symbol": "evaluateStartupProbe",
-          "target_file": "src/domain/outcomes.ts"
+          "file": "tests/flow-contract.test.ts:152",
+          "detail": "test references computeJsonSha256",
+          "symbol": "computeJsonSha256",
+          "target_file": "src/domain/canonical-json.ts"
         }
       ]
     },
@@ -1129,9 +1200,9 @@
         "CertificationBinding"
       ],
       "consumes_from": [
+        "domain",
         "map",
-        "runners",
-        "workflow"
+        "runners"
       ],
       "data_flows": [],
       "source_evidence": [
@@ -1267,14 +1338,18 @@
       "files": [
         "src/flow/map-admin-cli.ts",
         "src/flow/map-admission.ts",
+        "src/flow/reviewed-v4-source.ts",
+        "src/flow/implementation-progress-authority.ts",
         "src/flow/execution-snapshot.ts",
         "src/flow/learning-policy.ts",
+        "src/flow/implementation-amendment.ts",
         "src/flow/map-update-cli.ts",
         "src/flow/map-update.ts",
         "src/flow/map-profile.ts",
         "src/flow/map-admin.ts",
         "src/flow/evidence-ledger.ts",
-        "src/flow/map-learning.ts"
+        "src/flow/map-learning.ts",
+        "src/flow/implementation-progress.ts"
       ],
       "file_groups": [],
       "provides": [
@@ -1284,6 +1359,20 @@
         "mapAdmissionGates",
         "mapAdmissionReviewId",
         "mapAdmissionReviewExpectation",
+        "ReviewedV4File",
+        "ReviewedV4SourceInput",
+        "VerifiedReviewedV4Source",
+        "REVIEWED_V4_COMMIT",
+        "REVIEWED_V4_TREE",
+        "REVIEWED_V4_LAST_EVENT_SHA256",
+        "verifyReviewedV4Source",
+        "ProgressStoreIdentity",
+        "AuthorizedProgressEvent",
+        "ProgressEventVerificationRequest",
+        "ProgressEventVerifierPort",
+        "ProgressEventCommitClaim",
+        "ProgressEventCommitPort",
+        "createImplementationProgressAuthority",
         "ExecutionSnapshotSchema",
         "ExecutionSnapshot",
         "ExecutionSnapshotBindingSchema",
@@ -1293,21 +1382,7 @@
         "executionSnapshotBytes",
         "executionSnapshotSha256",
         "parseExecutionSnapshot",
-        "bindExecutionSnapshot",
-        "snapshotFromBinding",
-        "EvidenceReceiptSchema",
-        "FindingLifecycleSchema",
-        "CanonicalFindingExecutorDescriptor",
-        "CANONICAL_FINDING_EXECUTOR_REGISTRY",
-        "CLOSABLE_FINDING_EXECUTOR_CLASSES",
-        "APPROVED_LEARNING_CONTROL_IDS",
-        "canonicalFindingExecutorDescriptor",
-        "EvidenceReceipt",
-        "FindingLifecycle",
-        "validateFindingLifecycle",
-        "MapUpdateProtocol",
-        "MapUpdateCandidateStatus",
-        "MapUpdateExecution"
+        "bindExecutionSnapshot"
       ],
       "consumes_from": [
         "domain",
@@ -1372,12 +1447,12 @@
         "tests/evidence-ledger.test.ts",
         "tests/execution-admission.test.ts",
         "tests/execution-snapshot.test.ts",
+        "tests/flow-telemetry-archive-v4.test.ts",
+        "tests/flow-telemetry-v4.test.ts",
+        "tests/implementation-progress-v4.test.ts",
+        "tests/implementation-progress.test.ts",
         "tests/map-admin.test.ts",
-        "tests/map-framework-integration.test.ts",
-        "tests/map-learning-fixture.ts",
-        "tests/map-update.test.ts",
-        "tests/routing-v5-contract.test.ts",
-        "tests/runner-commands.test.ts"
+        "tests/map-framework-integration.test.ts"
       ],
       "test_evidence": [
         {
@@ -1656,9 +1731,17 @@
         }
       ],
       "test_files": [
+        "tests/implementation-progress-v4.test.ts",
         "tests/mcp.test.ts"
       ],
       "test_evidence": [
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/implementation-progress-v4.test.ts:2791",
+          "detail": "test references createCollabMcpServer",
+          "symbol": "createCollabMcpServer",
+          "target_file": "src/mcp/server.ts"
+        },
         {
           "kind": "test_symbol_ref",
           "file": "tests/mcp.test.ts:20",
@@ -1689,11 +1772,14 @@
         "src/migration/graph-v4-schema.ts",
         "src/migration/journal-writer.ts",
         "src/migration/operational-host.ts",
+        "src/migration/state-v4-manifest.ts",
         "src/migration/rollback-bundle.ts",
         "src/migration/database-pair.ts",
         "src/migration/operational-runner.ts",
         "src/migration/state-v4-restore-authority.ts",
         "src/migration/stable-dispatcher.ts",
+        "src/migration/reviewed-v4-bootstrap.ts",
+        "src/migration/reviewed-v4-migration-authority.ts",
         "src/migration/review-v3-schema.ts",
         "src/migration/v1-runtime.ts",
         "src/migration/operational-restore.ts",
@@ -1711,6 +1797,13 @@
         "writeJournalAtomically",
         "recoverJournal",
         "bootstrapOperationalHost",
+        "LegacyTableManifest",
+        "LegacyDatabaseObservation",
+        "legacyTableManifest",
+        "legacyTableManifestSha256",
+        "serializeLegacyTableManifest",
+        "parseLegacyTableManifest",
+        "observeLegacyDatabase",
         "ROLLBACK_BUNDLE_FORMAT",
         "RollbackBundleManifest",
         "RollbackArtifact",
@@ -1723,21 +1816,15 @@
         "recoverDatabasePairReplacement",
         "abortDatabasePairReplacement",
         "ActiveStateV4GuardDescriptor",
-        "activeStateV4GuardDescriptor",
-        "stateV4ActiveDescriptorPath",
-        "readActiveStateV4GuardDescriptor",
-        "requireStateV4RestoreAuthority",
-        "writeActiveStateV4GuardDescriptor",
-        "StateV4OpenAdmission",
-        "assertPhysicalRestoreAllowed",
-        "inspectStateV4OpenAdmission"
+        "activeStateV4GuardDescriptor"
       ],
       "consumes_from": [
         "docs",
+        "domain",
+        "flow",
         "map",
         "security",
-        "store",
-        "workflow"
+        "store"
       ],
       "data_flows": [],
       "source_evidence": [
@@ -1771,13 +1858,13 @@
         },
         {
           "kind": "data_structure",
-          "file": "src/migration/coordinator.ts:158",
+          "file": "src/migration/coordinator.ts:165",
           "detail": "defines MigrationFaultPoint",
           "symbol": "MigrationFaultPoint"
         },
         {
           "kind": "data_structure",
-          "file": "src/migration/coordinator.ts:193",
+          "file": "src/migration/coordinator.ts:200",
           "detail": "defines V4MigrationReceipt",
           "symbol": "V4MigrationReceipt"
         },
@@ -1794,13 +1881,13 @@
         "tests/collaboration-runtime.test.ts",
         "tests/execution-admission.test.ts",
         "tests/graph-flow-store.test.ts",
+        "tests/helpers/flow-telemetry-fixture.ts",
+        "tests/helpers/implementation-progress-fixture.ts",
+        "tests/implementation-progress-v4.test.ts",
         "tests/map-learning-fixture.ts",
         "tests/mcp.test.ts",
         "tests/migration-v2.test.ts",
-        "tests/migration-v3.test.ts",
-        "tests/migration-v4-launch-authority-v3.test.ts",
-        "tests/migration-v4.test.ts",
-        "tests/operational-restore.test.ts"
+        "tests/migration-v3.test.ts"
       ],
       "test_evidence": [
         {
@@ -2092,13 +2179,13 @@
         },
         {
           "kind": "data_structure",
-          "file": "src/runners/agent-runner.ts:51",
+          "file": "src/runners/agent-runner.ts:61",
           "detail": "defines SavedRunnerDecision",
           "symbol": "SavedRunnerDecision"
         },
         {
           "kind": "data_structure",
-          "file": "src/runners/agent-runner.ts:59",
+          "file": "src/runners/agent-runner.ts:69",
           "detail": "defines ProcessTask",
           "symbol": "ProcessTask"
         },
@@ -2115,6 +2202,7 @@
         "tests/effort-policy.test.ts",
         "tests/eval-provider.test.ts",
         "tests/grok-v2.test.ts",
+        "tests/provider-telemetry-v4.test.ts",
         "tests/runner-commands.test.ts"
       ],
       "test_evidence": [
@@ -2187,25 +2275,31 @@
       "files": [
         "src/runtime/production-release-gate.ts",
         "src/runtime/prelaunch-evidence.ts",
+        "src/runtime/flow-telemetry-exporter.ts",
         "src/runtime/graph-scheduler.ts",
         "src/runtime/review-attempt-identity.ts",
         "src/runtime/provider-recovery-loop.ts",
         "src/runtime/node-result.ts",
+        "src/runtime/provider-telemetry.ts",
         "src/runtime/review-rejoin.ts",
         "src/runtime/session-context.ts",
+        "src/runtime/flow-telemetry-identity.ts",
         "src/runtime/review-launch-admission.ts",
         "src/runtime/review-evidence-capture.ts",
         "src/runtime/workspace-fingerprint.ts",
-        "src/runtime/flow-telemetry.ts",
         "src/runtime/execution-admission.ts",
         "src/runtime/provider-health-store.ts",
+        "src/runtime/flow-telemetry-archive.ts",
         "src/runtime/collaboration-runtime.ts",
+        "src/runtime/flow-telemetry.ts",
         "src/runtime/run-gate-unit-of-work.ts"
       ],
       "file_groups": [],
       "provides": [
         "assertProductionRuntimeReleased",
         "matchesExactPrelaunchCliMissing",
+        "TelemetryExportDispatch",
+        "dispatchTelemetryExport",
         "ReadyNodeBatch",
         "scheduleReadyNodes",
         "runReadOnlyFanOut",
@@ -2215,25 +2309,23 @@
         "AutomaticProviderProbeResult",
         "ProviderRecoveryResult",
         "runAutomaticProviderRecovery",
-        "UsageCompleteness",
         "NodeUsage",
         "NodeResultInput",
         "ValidatedNodeResult",
         "validateNodeResult",
+        "ProviderSessionProvenance",
+        "ProviderTelemetryOutcome",
+        "ProviderSessionRef",
+        "ProviderTerminalTelemetry",
+        "carryQuarantinedProviderTelemetry",
+        "readQuarantinedProviderTelemetry",
+        "mapProviderTelemetryOutcome",
         "ReviewRejoinResult",
         "activateRecoveredReviewLanes",
         "SessionCheckpointBody",
         "SessionCheckpoint",
         "createSessionCheckpoint",
-        "verifySessionCheckpoint",
-        "assertSessionIsolation",
-        "executeReviewLaunchWithFence",
-        "ReviewEvidenceCaptureEntryPoint",
-        "ReviewEvidenceCaptureInput",
-        "ReviewSourceObservation",
-        "ReviewReadyObservation",
-        "ReviewUnavailableObservation",
-        "ReviewEvidenceReadyOutcome"
+        "verifySessionCheckpoint"
       ],
       "consumes_from": [
         "domain",
@@ -2301,11 +2393,11 @@
         "tests/execution-snapshot.test.ts",
         "tests/fixtures/review-v3-activation-worker.mjs",
         "tests/fixtures/review-v3-terminal-worker.mjs",
+        "tests/flow-telemetry-archive-v4.test.ts",
+        "tests/flow-telemetry-v4.test.ts",
         "tests/graph-core.test.ts",
         "tests/map-learning-fixture.ts",
-        "tests/migration-v3.test.ts",
-        "tests/migration-v4-launch-authority-v3.test.ts",
-        "tests/production-release-gate.test.ts"
+        "tests/migration-v3.test.ts"
       ],
       "test_evidence": [
         {
@@ -2621,14 +2713,19 @@
         "Own the files listed for this component"
       ],
       "files": [
+        "src/store/implementation-progress-projection-files.ts",
         "src/store/state-layout.ts",
         "src/store/graph-flow-store.ts",
         "src/store/collaboration-run-store.ts",
         "src/store/state-database-fence.ts",
-        "src/store/run-store.ts"
+        "src/store/implementation-progress-store.ts",
+        "src/store/state-file-durability.ts",
+        "src/store/run-store.ts",
+        "src/store/flow-telemetry-store.ts"
       ],
       "file_groups": [],
       "provides": [
+        "ImplementationProgressProjectionFiles",
         "StateLayout",
         "StateV4MigrationLayout",
         "StateRootLease",
@@ -2657,13 +2754,16 @@
         "StateStoreInput",
         "StateDatabaseLease",
         "openStateStoreAccess",
-        "RunStatus",
-        "RunRecord"
+        "ProgressStoreAccess"
       ],
       "consumes_from": [
+        "app",
         "docs",
+        "domain",
+        "flow",
         "map",
         "migration",
+        "runtime",
         "security",
         "workflow"
       ],
@@ -2676,7 +2776,7 @@
         },
         {
           "kind": "source_file",
-          "file": "src/store/graph-flow-store.ts",
+          "file": "src/store/flow-telemetry-store.ts",
           "detail": "component-owned file read during final enrichment"
         },
         {
@@ -2705,30 +2805,30 @@
         },
         {
           "kind": "provided_symbol",
-          "file": "src/store/graph-flow-store.ts",
-          "detail": "exports or defines GraphFlowSubmission",
-          "symbol": "GraphFlowSubmission"
+          "file": "src/store/flow-telemetry-store.ts",
+          "detail": "exports or defines ArchiveMemberProjection",
+          "symbol": "ArchiveMemberProjection"
         },
         {
           "kind": "provided_symbol",
-          "file": "src/store/graph-flow-store.ts",
-          "detail": "exports or defines GraphFlowSubmissionResult",
-          "symbol": "GraphFlowSubmissionResult"
+          "file": "src/store/flow-telemetry-store.ts",
+          "detail": "exports or defines FreshArchivePreparation",
+          "symbol": "FreshArchivePreparation"
         }
       ],
       "test_files": [
         "tests/collaboration-runtime.test.ts",
         "tests/execution-admission.test.ts",
+        "tests/fixtures/flow-telemetry-archive-worker.mjs",
+        "tests/fixtures/flow-telemetry-worker.mjs",
+        "tests/flow-telemetry-store-v4.test.ts",
         "tests/graph-flow-store.test.ts",
+        "tests/helpers/flow-telemetry-fixture.ts",
+        "tests/implementation-progress-v4.test.ts",
         "tests/map-framework-integration.test.ts",
         "tests/map-learning-fixture.ts",
         "tests/mcp.test.ts",
-        "tests/migration-v4.test.ts",
-        "tests/review-launch-admission.test.ts",
-        "tests/review-rejoin-v3.test.ts",
-        "tests/review-v3-worker-boundary.test.ts",
-        "tests/review-verdict.test.ts",
-        "tests/routing-v5-contract.test.ts"
+        "tests/migration-v4.test.ts"
       ],
       "test_evidence": [
         {
@@ -2869,13 +2969,29 @@
         }
       ],
       "test_files": [
+        "tests/implementation-progress-v4.test.ts",
         "tests/mcp.test.ts",
+        "tests/provider-telemetry-v4.test.ts",
         "tests/worker.test.ts"
       ],
       "test_evidence": [
         {
           "kind": "test_symbol_ref",
+          "file": "tests/implementation-progress-v4.test.ts:2768",
+          "detail": "test references DurableWorker",
+          "symbol": "DurableWorker",
+          "target_file": "src/worker/durable-worker.ts"
+        },
+        {
+          "kind": "test_symbol_ref",
           "file": "tests/mcp.test.ts:191",
+          "detail": "test references DurableWorker",
+          "symbol": "DurableWorker",
+          "target_file": "src/worker/durable-worker.ts"
+        },
+        {
+          "kind": "test_symbol_ref",
+          "file": "tests/provider-telemetry-v4.test.ts:880",
           "detail": "test references DurableWorker",
           "symbol": "DurableWorker",
           "target_file": "src/worker/durable-worker.ts"
@@ -2911,20 +3027,6 @@
         {
           "kind": "test_symbol_ref",
           "file": "tests/worker.test.ts:83",
-          "detail": "test references DurableWorker",
-          "symbol": "DurableWorker",
-          "target_file": "src/worker/durable-worker.ts"
-        },
-        {
-          "kind": "test_symbol_ref",
-          "file": "tests/worker.test.ts:99",
-          "detail": "test references DurableWorker",
-          "symbol": "DurableWorker",
-          "target_file": "src/worker/durable-worker.ts"
-        },
-        {
-          "kind": "test_symbol_ref",
-          "file": "tests/worker.test.ts:116",
           "detail": "test references DurableWorker",
           "symbol": "DurableWorker",
           "target_file": "src/worker/durable-worker.ts"
@@ -2980,8 +3082,7 @@
         "StageKind"
       ],
       "consumes_from": [
-        "domain",
-        "map"
+        "domain"
       ],
       "data_flows": [],
       "source_evidence": [
@@ -3015,13 +3116,13 @@
         },
         {
           "kind": "data_structure",
-          "file": "src/workflow/flow-contract.ts:13",
+          "file": "src/workflow/flow-contract.ts:14",
           "detail": "defines InputPort",
           "symbol": "InputPort"
         },
         {
           "kind": "data_structure",
-          "file": "src/workflow/flow-contract.ts:14",
+          "file": "src/workflow/flow-contract.ts:15",
           "detail": "defines GraphNode",
           "symbol": "GraphNode"
         },
@@ -3039,9 +3140,9 @@
         "tests/flow-contract.test.ts",
         "tests/graph-core.test.ts",
         "tests/graph-flow-store.test.ts",
+        "tests/helpers/flow-telemetry-fixture.ts",
+        "tests/implementation-progress-v4.test.ts",
         "tests/migration-v4.test.ts",
-        "tests/review-prelaunch-fence.test.ts",
-        "tests/review-rejoin-v3.test.ts",
         "tests/routing-v5-contract.test.ts",
         "tests/runner-commands.test.ts",
         "tests/workflow.test.ts"
@@ -3268,57 +3369,117 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/app/service.ts:455",
-            "detail": "stageRequiresReadOnly",
-            "symbol": "stageRequiresReadOnly"
+            "file": "src/app/flow-telemetry-archive-authority.ts:114",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:469",
-            "detail": "preferredAgentForStage",
-            "symbol": "preferredAgentForStage"
+            "file": "src/app/flow-telemetry-archive-authority.ts:114",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:524",
-            "detail": "preferredAgentForStage",
-            "symbol": "preferredAgentForStage"
+            "file": "src/app/flow-telemetry-archive-authority.ts:196",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:525",
-            "detail": "routeStage",
-            "symbol": "routeStage"
+            "file": "src/app/flow-telemetry-archive-service.ts:233",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/review-evidence-capture.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:234",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/implementation-progress-service.ts:112",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/implementation-progress-service.ts:168",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/implementation-progress-service.ts:175",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           }
         ],
         "calls": [
           {
+            "file": "src/app/flow-telemetry-archive-authority.ts:114",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-authority.ts:114",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-authority.ts:196",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:233",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:234",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:112",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:168",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:175",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:212",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:412",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:419",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
             "file": "src/app/service.ts:455",
             "symbol": "stageRequiresReadOnly",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:469",
-            "symbol": "preferredAgentForStage",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:524",
-            "symbol": "preferredAgentForStage",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:525",
-            "symbol": "routeStage",
             "kind": "call"
           }
         ],
         "tested_by": [
+          "tests/implementation-progress-v4.test.ts",
           "tests/review-evidence-capture.test.ts"
         ]
       },
@@ -3328,61 +3489,101 @@
         "type": "calls",
         "confidence": "medium",
         "factors": [
-          "constructor_call",
           "symbol_call",
+          "constructor_call",
           "test_exercises_both_ends"
         ],
         "evidence": [
           {
-            "kind": "construct",
-            "file": "src/app/service.ts:205",
-            "detail": "new MapControlPlane",
-            "symbol": "MapControlPlane"
+            "kind": "call",
+            "file": "src/app/implementation-progress-projector.ts:39",
+            "detail": "renderImplementationProgressProjection",
+            "symbol": "renderImplementationProgressProjection"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:205",
-            "detail": "MapControlPlane",
-            "symbol": "MapControlPlane"
+            "file": "src/app/implementation-progress-service.ts:172",
+            "detail": "buildNextStageEligibilityEvent",
+            "symbol": "buildNextStageEligibilityEvent"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:405",
-            "detail": "snapshotFromBinding",
-            "symbol": "snapshotFromBinding"
+            "file": "src/app/implementation-progress-service.ts:199",
+            "detail": "verifyLiveProviderLaunchAccounting",
+            "symbol": "verifyLiveProviderLaunchAccounting"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:408",
-            "detail": "mapAdmissionGates",
-            "symbol": "mapAdmissionGates"
+            "file": "src/app/implementation-progress-service.ts:207",
+            "detail": "buildNextStageEligibilityEvent",
+            "symbol": "buildNextStageEligibilityEvent"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:414",
-            "detail": "mapAdmissionReviewExpectation",
-            "symbol": "mapAdmissionReviewExpectation"
+            "file": "src/app/implementation-progress-service.ts:265",
+            "detail": "reduceImplementationProgress",
+            "symbol": "reduceImplementationProgress"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:443",
-            "detail": "mapProfileSha256",
-            "symbol": "mapProfileSha256"
+            "file": "src/app/implementation-progress-service.ts:271",
+            "detail": "verifyLiveProviderLaunchAccounting",
+            "symbol": "verifyLiveProviderLaunchAccounting"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:476",
-            "detail": "createCurrentMapLearningLaunchBinding",
-            "symbol": "createCurrentMapLearningLaunchBinding"
+            "file": "src/app/implementation-progress-service.ts:285",
+            "detail": "verifyAcceptedAmendmentEvents",
+            "symbol": "verifyAcceptedAmendmentEvents"
           },
           {
             "kind": "call",
-            "file": "src/app/service.ts:477",
-            "detail": "formatMapLearningLaunchBindingContext",
-            "symbol": "formatMapLearningLaunchBindingContext"
+            "file": "src/app/implementation-progress-service.ts:449",
+            "detail": "renderImplementationProgressProjection",
+            "symbol": "renderImplementationProgressProjection"
           }
         ],
         "calls": [
+          {
+            "file": "src/app/implementation-progress-projector.ts:39",
+            "symbol": "renderImplementationProgressProjection",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:172",
+            "symbol": "buildNextStageEligibilityEvent",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:199",
+            "symbol": "verifyLiveProviderLaunchAccounting",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:207",
+            "symbol": "buildNextStageEligibilityEvent",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:265",
+            "symbol": "reduceImplementationProgress",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:271",
+            "symbol": "verifyLiveProviderLaunchAccounting",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:285",
+            "symbol": "verifyAcceptedAmendmentEvents",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-service.ts:449",
+            "symbol": "renderImplementationProgressProjection",
+            "kind": "call"
+          },
           {
             "file": "src/app/service.ts:205",
             "symbol": "MapControlPlane",
@@ -3402,35 +3603,11 @@
             "file": "src/app/service.ts:408",
             "symbol": "mapAdmissionGates",
             "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:414",
-            "symbol": "mapAdmissionReviewExpectation",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:443",
-            "symbol": "mapProfileSha256",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:476",
-            "symbol": "createCurrentMapLearningLaunchBinding",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:477",
-            "symbol": "formatMapLearningLaunchBindingContext",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:489",
-            "symbol": "executionAuthorityConsumerKey",
-            "kind": "call"
           }
         ],
         "tested_by": [
           "tests/app-service.test.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/state-database-fence.test.ts"
         ]
       },
@@ -3546,6 +3723,11 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/review-v3-schema-signature.test.ts",
             "detail": "test references both connected components"
           },
@@ -3570,6 +3752,7 @@
         "tested_by": [
           "tests/app-service.test.ts",
           "tests/history.test.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/review-v3-schema-signature.test.ts",
           "tests/state-database-fence.test.ts"
         ]
@@ -3597,6 +3780,11 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/review-evidence-capture.test.ts",
             "detail": "test references both connected components"
           },
@@ -3620,6 +3808,7 @@
         ],
         "tested_by": [
           "tests/app-service.test.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/review-evidence-capture.test.ts",
           "tests/review-v3-schema-signature.test.ts",
           "tests/state-database-fence.test.ts"
@@ -3631,62 +3820,97 @@
         "type": "calls",
         "confidence": "medium",
         "factors": [
-          "constructor_call",
           "symbol_call",
+          "constructor_call",
           "test_exercises_both_ends"
         ],
         "evidence": [
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-authority.ts:199",
+            "detail": "verifyStoredAgentEventArchive",
+            "symbol": "verifyStoredAgentEventArchive"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:140",
+            "detail": "deriveTelemetryArchiveIdentity",
+            "symbol": "deriveTelemetryArchiveIdentity"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:150",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:151",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:189",
+            "detail": "deriveTelemetryArchiveIdentity",
+            "symbol": "deriveTelemetryArchiveIdentity"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:216",
+            "detail": "verifyStoredAgentEventArchive",
+            "symbol": "verifyStoredAgentEventArchive"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-service.ts:261",
+            "detail": "buildAgentEventArchive",
+            "symbol": "buildAgentEventArchive"
+          },
           {
             "kind": "construct",
             "file": "src/app/service.ts:179",
             "detail": "new ReviewEvidenceCapture",
             "symbol": "ReviewEvidenceCapture"
-          },
-          {
-            "kind": "construct",
-            "file": "src/app/service.ts:201",
-            "detail": "new ProviderHealthStore",
-            "symbol": "ProviderHealthStore"
-          },
-          {
-            "kind": "construct",
-            "file": "src/app/service.ts:203",
-            "detail": "new RunGateUnitOfWork",
-            "symbol": "RunGateUnitOfWork"
-          },
-          {
-            "kind": "construct",
-            "file": "src/app/service.ts:207",
-            "detail": "new CollaborationRuntime",
-            "symbol": "CollaborationRuntime"
-          },
-          {
-            "kind": "call",
-            "file": "src/app/service.ts:179",
-            "detail": "ReviewEvidenceCapture",
-            "symbol": "ReviewEvidenceCapture"
-          },
-          {
-            "kind": "call",
-            "file": "src/app/service.ts:181",
-            "detail": "captureWorkspaceFingerprint",
-            "symbol": "captureWorkspaceFingerprint"
-          },
-          {
-            "kind": "call",
-            "file": "src/app/service.ts:201",
-            "detail": "ProviderHealthStore",
-            "symbol": "ProviderHealthStore"
-          },
-          {
-            "kind": "call",
-            "file": "src/app/service.ts:203",
-            "detail": "RunGateUnitOfWork",
-            "symbol": "RunGateUnitOfWork"
           }
         ],
         "calls": [
           {
+            "file": "src/app/flow-telemetry-archive-authority.ts:199",
+            "symbol": "verifyStoredAgentEventArchive",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:140",
+            "symbol": "deriveTelemetryArchiveIdentity",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:150",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:151",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:189",
+            "symbol": "deriveTelemetryArchiveIdentity",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:216",
+            "symbol": "verifyStoredAgentEventArchive",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/flow-telemetry-archive-service.ts:261",
+            "symbol": "buildAgentEventArchive",
+            "kind": "call"
+          },
+          {
             "file": "src/app/service.ts:179",
             "symbol": "ReviewEvidenceCapture",
             "kind": "construct"
@@ -3710,36 +3934,56 @@
             "file": "src/app/service.ts:179",
             "symbol": "ReviewEvidenceCapture",
             "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/app-service.test.ts",
+          "tests/review-evidence-capture.test.ts",
+          "tests/review-v3-schema-signature.test.ts",
+          "tests/state-database-fence.test.ts"
+        ]
+      },
+      {
+        "from": "app",
+        "to": "runtime",
+        "type": "inherits",
+        "confidence": "high",
+        "factors": [
+          "inheritance",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "inherits",
+            "file": "src/app/flow-telemetry-archive-service.ts:20",
+            "detail": "extends AgentEventArchiveMemberProjection",
+            "symbol": "AgentEventArchiveMemberProjection"
           },
           {
-            "file": "src/app/service.ts:181",
-            "symbol": "captureWorkspaceFingerprint",
-            "kind": "call"
+            "kind": "inherits",
+            "file": "src/app/flow-telemetry-archive-service.ts:43",
+            "detail": "extends AgentEventArchiveManifestProjection",
+            "symbol": "AgentEventArchiveManifestProjection"
           },
           {
-            "file": "src/app/service.ts:201",
-            "symbol": "ProviderHealthStore",
-            "kind": "call"
+            "kind": "test_covers_edge",
+            "file": "tests/app-service.test.ts",
+            "detail": "test references both connected components"
           },
           {
-            "file": "src/app/service.ts:203",
-            "symbol": "RunGateUnitOfWork",
-            "kind": "call"
+            "kind": "test_covers_edge",
+            "file": "tests/review-evidence-capture.test.ts",
+            "detail": "test references both connected components"
           },
           {
-            "file": "src/app/service.ts:207",
-            "symbol": "CollaborationRuntime",
-            "kind": "call"
+            "kind": "test_covers_edge",
+            "file": "tests/review-v3-schema-signature.test.ts",
+            "detail": "test references both connected components"
           },
           {
-            "file": "src/app/service.ts:475",
-            "symbol": "captureWorkspaceFingerprint",
-            "kind": "call"
-          },
-          {
-            "file": "src/app/service.ts:546",
-            "symbol": "captureWorkspaceFingerprint",
-            "kind": "call"
+            "kind": "test_covers_edge",
+            "file": "tests/state-database-fence.test.ts",
+            "detail": "test references both connected components"
           }
         ],
         "tested_by": [
@@ -3919,11 +4163,29 @@
         "type": "calls",
         "confidence": "medium",
         "factors": [
-          "constructor_call",
           "symbol_call",
+          "constructor_call",
           "test_exercises_both_ends"
         ],
         "evidence": [
+          {
+            "kind": "call",
+            "file": "src/app/flow-telemetry-archive-authority.ts:189",
+            "detail": "assertAuthenticPinnedStateFile",
+            "symbol": "assertAuthenticPinnedStateFile"
+          },
+          {
+            "kind": "construct",
+            "file": "src/app/implementation-progress-projector.ts:21",
+            "detail": "new StateFileDurability",
+            "symbol": "StateFileDurability"
+          },
+          {
+            "kind": "call",
+            "file": "src/app/implementation-progress-projector.ts:21",
+            "detail": "StateFileDurability",
+            "symbol": "StateFileDurability"
+          },
           {
             "kind": "construct",
             "file": "src/app/service.ts:193",
@@ -3944,11 +4206,31 @@
           },
           {
             "kind": "test_covers_edge",
-            "file": "tests/state-database-fence.test.ts",
+            "file": "tests/fixtures/flow-telemetry-archive-worker.mjs",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
             "detail": "test references both connected components"
           }
         ],
         "calls": [
+          {
+            "file": "src/app/flow-telemetry-archive-authority.ts:189",
+            "symbol": "assertAuthenticPinnedStateFile",
+            "kind": "call"
+          },
+          {
+            "file": "src/app/implementation-progress-projector.ts:21",
+            "symbol": "StateFileDurability",
+            "kind": "construct"
+          },
+          {
+            "file": "src/app/implementation-progress-projector.ts:21",
+            "symbol": "StateFileDurability",
+            "kind": "call"
+          },
           {
             "file": "src/app/service.ts:193",
             "symbol": "RunStore",
@@ -3966,6 +4248,46 @@
           }
         ],
         "tested_by": [
+          "tests/fixtures/flow-telemetry-archive-worker.mjs",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/state-database-fence.test.ts"
+        ]
+      },
+      {
+        "from": "app",
+        "to": "store",
+        "type": "inherits",
+        "confidence": "high",
+        "factors": [
+          "inheritance",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "inherits",
+            "file": "src/app/flow-telemetry-archive-service.ts:24",
+            "detail": "extends ArchiveMemberProjection",
+            "symbol": "ArchiveMemberProjection"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/fixtures/flow-telemetry-archive-worker.mjs",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/state-database-fence.test.ts",
+            "detail": "test references both connected components"
+          }
+        ],
+        "tested_by": [
+          "tests/fixtures/flow-telemetry-archive-worker.mjs",
+          "tests/implementation-progress-v4.test.ts",
           "tests/state-database-fence.test.ts"
         ]
       },
@@ -3975,7 +4297,8 @@
         "type": "calls",
         "confidence": "medium",
         "factors": [
-          "symbol_call"
+          "symbol_call",
+          "test_exercises_both_ends"
         ],
         "evidence": [
           {
@@ -3989,6 +4312,11 @@
             "file": "src/app/service.ts:491",
             "detail": "createCollaborationRun",
             "symbol": "createCollaborationRun"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
           }
         ],
         "calls": [
@@ -4002,6 +4330,9 @@
             "symbol": "createCollaborationRun",
             "kind": "call"
           }
+        ],
+        "tested_by": [
+          "tests/implementation-progress-v4.test.ts"
         ]
       },
       {
@@ -5011,6 +5342,150 @@
         ]
       },
       {
+        "from": "domain",
+        "to": "map",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/domain/canonical-json.ts:22",
+            "detail": "visit",
+            "symbol": "visit"
+          },
+          {
+            "kind": "call",
+            "file": "src/domain/canonical-json.ts:25",
+            "detail": "visit",
+            "symbol": "visit"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/effort-policy.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/flow-telemetry-archive-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/flow-telemetry-store-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/graph-flow-store.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/helpers/flow-telemetry-fixture.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/helpers/implementation-progress-fixture.ts",
+            "detail": "test references both connected components"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/domain/canonical-json.ts:22",
+            "symbol": "visit",
+            "kind": "call"
+          },
+          {
+            "file": "src/domain/canonical-json.ts:25",
+            "symbol": "visit",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/effort-policy.test.ts",
+          "tests/flow-telemetry-archive-v4.test.ts",
+          "tests/flow-telemetry-store-v4.test.ts",
+          "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/helpers/implementation-progress-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/migration-v4.test.ts"
+        ]
+      },
+      {
+        "from": "eval",
+        "to": "domain",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/eval/benchmark-runner.ts:592",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/eval/run-manifest.ts:136",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/eval/run-manifest.ts:148",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/eval/run-manifest.ts:154",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/eval/run-manifest.ts:158",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/eval/benchmark-runner.ts:592",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/eval/run-manifest.ts:136",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/eval/run-manifest.ts:148",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/eval/run-manifest.ts:154",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/eval/run-manifest.ts:158",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          }
+        ]
+      },
+      {
         "from": "eval",
         "to": "map",
         "type": "calls",
@@ -5178,74 +5653,6 @@
         ],
         "tested_by": [
           "tests/eval-provider.test.ts"
-        ]
-      },
-      {
-        "from": "eval",
-        "to": "workflow",
-        "type": "calls",
-        "confidence": "medium",
-        "factors": [
-          "symbol_call"
-        ],
-        "evidence": [
-          {
-            "kind": "call",
-            "file": "src/eval/benchmark-runner.ts:592",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/eval/run-manifest.ts:136",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/eval/run-manifest.ts:148",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/eval/run-manifest.ts:154",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/eval/run-manifest.ts:158",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          }
-        ],
-        "calls": [
-          {
-            "file": "src/eval/benchmark-runner.ts:592",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/eval/run-manifest.ts:136",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/eval/run-manifest.ts:148",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/eval/run-manifest.ts:154",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/eval/run-manifest.ts:158",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          }
         ]
       },
       {
@@ -5614,19 +6021,46 @@
             "symbol": "stageRequiresReadOnly"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/effort-policy.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:182",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/routing-v5-contract.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:188",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/runner-commands.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:212",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:217",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:246",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:260",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/flow/implementation-amendment.ts:261",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
           }
         ],
         "calls": [
@@ -5634,10 +6068,68 @@
             "file": "src/flow/execution-snapshot.ts:98",
             "symbol": "stageRequiresReadOnly",
             "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:182",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:188",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:212",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:217",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:246",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:260",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:261",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:280",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:281",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:282",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/flow/implementation-amendment.ts:286",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
           }
         ],
         "tested_by": [
           "tests/effort-policy.test.ts",
+          "tests/flow-telemetry-archive-v4.test.ts",
+          "tests/flow-telemetry-v4.test.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/routing-v5-contract.test.ts",
           "tests/runner-commands.test.ts"
         ]
@@ -5768,10 +6260,10 @@
           "tests/collaboration-runtime.test.ts",
           "tests/effort-policy.test.ts",
           "tests/evidence-ledger.test.ts",
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts",
-          "tests/runtime-review-barrier.test.ts",
-          "tests/state-database-fence.test.ts"
+          "tests/flow-telemetry-archive-v4.test.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/provider-telemetry-v4.test.ts",
+          "tests/reviewed-v4-source.test.ts"
         ]
       },
       {
@@ -5870,9 +6362,9 @@
           "tests/effort-policy.test.ts",
           "tests/execution-admission.test.ts",
           "tests/execution-snapshot.test.ts",
-          "tests/map-learning-fixture.ts",
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts"
+          "tests/flow-telemetry-archive-v4.test.ts",
+          "tests/flow-telemetry-v4.test.ts",
+          "tests/map-learning-fixture.ts"
         ]
       },
       {
@@ -5954,17 +6446,17 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/map-framework-integration.test.ts",
             "detail": "test references both connected components"
           },
           {
             "kind": "test_covers_edge",
             "file": "tests/map-learning-fixture.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/routing-v5-contract.test.ts",
             "detail": "test references both connected components"
           }
         ],
@@ -5988,12 +6480,12 @@
         "tested_by": [
           "tests/collaboration-runtime.test.ts",
           "tests/execution-admission.test.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/map-framework-integration.test.ts",
           "tests/map-learning-fixture.ts",
+          "tests/provider-telemetry-v4.test.ts",
           "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts",
-          "tests/runtime-review-barrier.test.ts",
-          "tests/security.test.ts"
+          "tests/runner-commands.test.ts"
         ]
       },
       {
@@ -6227,13 +6719,13 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:1719",
+            "file": "src/migration/coordinator.ts:1706",
             "detail": "plan_progress_events\n      ",
             "symbol": "plan_progress_events"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:1724",
+            "file": "src/migration/coordinator.ts:1711",
             "detail": "plan_progress_outbox\n      ",
             "symbol": "plan_progress_outbox"
           },
@@ -6244,25 +6736,239 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/helpers/flow-telemetry-fixture.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/schema-compatibility.test.ts",
             "detail": "test references both connected components"
           }
         ],
         "calls": [
           {
-            "file": "src/migration/coordinator.ts:1719",
+            "file": "src/migration/coordinator.ts:1706",
             "symbol": "plan_progress_events",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1724",
+            "file": "src/migration/coordinator.ts:1711",
             "symbol": "plan_progress_outbox",
             "kind": "call"
           }
         ],
         "tested_by": [
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/schema-compatibility.test.ts"
+        ]
+      },
+      {
+        "from": "migration",
+        "to": "domain",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:581",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:726",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:732",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:890",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:1745",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:1999",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/operational-restore.ts:594",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/operational-restore.ts:597",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/migration/coordinator.ts:581",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:726",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:732",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:890",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:1745",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:1999",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/operational-restore.ts:594",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/operational-restore.ts:597",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/operational-restore.ts:623",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/operational-restore.ts:629",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/reviewed-v4-bootstrap.ts:162",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/reviewed-v4-bootstrap.ts:167",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/helpers/implementation-progress-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/migration-v4.test.ts",
+          "tests/review-evidence-capture.test.ts",
+          "tests/review-prelaunch-fence.test.ts",
+          "tests/review-rejoin-v3.test.ts"
+        ]
+      },
+      {
+        "from": "migration",
+        "to": "flow",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/migration/reviewed-v4-bootstrap.ts:314",
+            "detail": "verifyReviewedV4Source",
+            "symbol": "verifyReviewedV4Source"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/app-service.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/collaboration-runtime.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/execution-admission.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/map-learning-fixture.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/routing-v5-contract.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/runner-commands.test.ts",
+            "detail": "test references both connected components"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/migration/reviewed-v4-bootstrap.ts:314",
+            "symbol": "verifyReviewedV4Source",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/app-service.test.ts",
+          "tests/collaboration-runtime.test.ts",
+          "tests/execution-admission.test.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/map-learning-fixture.ts",
+          "tests/routing-v5-contract.test.ts",
+          "tests/runner-commands.test.ts",
+          "tests/runtime-review-barrier.test.ts"
         ]
       },
       {
@@ -6277,19 +6983,37 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:1730",
+            "file": "src/migration/coordinator.ts:1717",
             "detail": "run",
             "symbol": "run"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:1731",
+            "file": "src/migration/coordinator.ts:1718",
             "detail": "run",
             "symbol": "run"
           },
           {
             "kind": "call",
-            "file": "src/migration/review-v3-schema.ts:438",
+            "file": "src/migration/review-v3-schema.ts:454",
+            "detail": "run",
+            "symbol": "run"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/reviewed-v4-bootstrap.ts:68",
+            "detail": "run",
+            "symbol": "run"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/reviewed-v4-bootstrap.ts:216",
+            "detail": "match",
+            "symbol": "match"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/reviewed-v4-bootstrap.ts:315",
             "detail": "run",
             "symbol": "run"
           },
@@ -6304,39 +7028,36 @@
             "file": "src/migration/v1-runtime.ts:182",
             "detail": "visit",
             "symbol": "visit"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/v1-runtime.ts:260",
-            "detail": "match",
-            "symbol": "match"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/v1-runtime.ts:524",
-            "detail": "visit",
-            "symbol": "visit"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/v1-runtime.ts:532",
-            "detail": "visit",
-            "symbol": "visit"
           }
         ],
         "calls": [
           {
-            "file": "src/migration/coordinator.ts:1730",
+            "file": "src/migration/coordinator.ts:1717",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1731",
+            "file": "src/migration/coordinator.ts:1718",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/migration/review-v3-schema.ts:438",
+            "file": "src/migration/review-v3-schema.ts:454",
+            "symbol": "run",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/reviewed-v4-bootstrap.ts:68",
+            "symbol": "run",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/reviewed-v4-bootstrap.ts:216",
+            "symbol": "match",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/reviewed-v4-bootstrap.ts:315",
             "symbol": "run",
             "kind": "call"
           },
@@ -6370,11 +7091,11 @@
           "tests/app-service.test.ts",
           "tests/collaboration-runtime.test.ts",
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/helpers/implementation-progress-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/migration-v2.test.ts",
-          "tests/migration-v3.test.ts",
-          "tests/migration-v4-launch-authority-v3.test.ts",
-          "tests/migration-v4.test.ts",
-          "tests/operational-restore.test.ts"
+          "tests/migration-v3.test.ts"
         ]
       },
       {
@@ -6389,13 +7110,13 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:962",
+            "file": "src/migration/coordinator.ts:949",
             "detail": "redactSensitive",
             "symbol": "redactSensitive"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:967",
+            "file": "src/migration/coordinator.ts:954",
             "detail": "redactSensitive",
             "symbol": "redactSensitive"
           },
@@ -6430,12 +7151,12 @@
         ],
         "calls": [
           {
-            "file": "src/migration/coordinator.ts:962",
+            "file": "src/migration/coordinator.ts:949",
             "symbol": "redactSensitive",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:967",
+            "file": "src/migration/coordinator.ts:954",
             "symbol": "redactSensitive",
             "kind": "call"
           },
@@ -6467,116 +7188,117 @@
         "confidence": "medium",
         "factors": [
           "symbol_call",
+          "constructor_call",
           "test_exercises_both_ends"
         ],
         "evidence": [
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:464",
+            "file": "src/migration/coordinator.ts:471",
             "detail": "acquireStateRootLease",
             "symbol": "acquireStateRootLease"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:471",
-            "detail": "canonicalStateDatabaseIdentity",
-            "symbol": "canonicalStateDatabaseIdentity"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:472",
-            "detail": "assertCanonicalStateDatabaseIdentity",
-            "symbol": "assertCanonicalStateDatabaseIdentity"
           },
           {
             "kind": "call",
             "file": "src/migration/coordinator.ts:478",
+            "detail": "canonicalStateDatabaseIdentity",
+            "symbol": "canonicalStateDatabaseIdentity"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:479",
             "detail": "assertCanonicalStateDatabaseIdentity",
             "symbol": "assertCanonicalStateDatabaseIdentity"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:810",
+            "file": "src/migration/coordinator.ts:485",
+            "detail": "assertCanonicalStateDatabaseIdentity",
+            "symbol": "assertCanonicalStateDatabaseIdentity"
+          },
+          {
+            "kind": "call",
+            "file": "src/migration/coordinator.ts:797",
             "detail": "canonicalStateDatabaseIdentity",
             "symbol": "canonicalStateDatabaseIdentity"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:811",
+            "file": "src/migration/coordinator.ts:798",
             "detail": "acquireStateRootLease",
             "symbol": "acquireStateRootLease"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:1445",
+            "file": "src/migration/coordinator.ts:1432",
             "detail": "canonicalStateDatabaseIdentity",
             "symbol": "canonicalStateDatabaseIdentity"
           },
           {
             "kind": "call",
-            "file": "src/migration/coordinator.ts:1446",
+            "file": "src/migration/coordinator.ts:1433",
             "detail": "canonicalStateDatabaseIdentity",
             "symbol": "canonicalStateDatabaseIdentity"
           }
         ],
         "calls": [
           {
-            "file": "src/migration/coordinator.ts:464",
-            "symbol": "acquireStateRootLease",
-            "kind": "call"
-          },
-          {
             "file": "src/migration/coordinator.ts:471",
-            "symbol": "canonicalStateDatabaseIdentity",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:472",
-            "symbol": "assertCanonicalStateDatabaseIdentity",
+            "symbol": "acquireStateRootLease",
             "kind": "call"
           },
           {
             "file": "src/migration/coordinator.ts:478",
-            "symbol": "assertCanonicalStateDatabaseIdentity",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:810",
             "symbol": "canonicalStateDatabaseIdentity",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:811",
+            "file": "src/migration/coordinator.ts:479",
+            "symbol": "assertCanonicalStateDatabaseIdentity",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:485",
+            "symbol": "assertCanonicalStateDatabaseIdentity",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:797",
+            "symbol": "canonicalStateDatabaseIdentity",
+            "kind": "call"
+          },
+          {
+            "file": "src/migration/coordinator.ts:798",
             "symbol": "acquireStateRootLease",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1445",
+            "file": "src/migration/coordinator.ts:1432",
             "symbol": "canonicalStateDatabaseIdentity",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1446",
+            "file": "src/migration/coordinator.ts:1433",
             "symbol": "canonicalStateDatabaseIdentity",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1453",
+            "file": "src/migration/coordinator.ts:1440",
             "symbol": "acquireStateRootLease",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1456",
+            "file": "src/migration/coordinator.ts:1443",
             "symbol": "assertCanonicalStateDatabaseIdentity",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1457",
+            "file": "src/migration/coordinator.ts:1444",
             "symbol": "assertCanonicalStateDatabaseIdentity",
             "kind": "call"
           },
           {
-            "file": "src/migration/coordinator.ts:1465",
+            "file": "src/migration/coordinator.ts:1452",
             "symbol": "assertCanonicalStateDatabaseIdentity",
             "kind": "call"
           }
@@ -6585,143 +7307,11 @@
           "tests/collaboration-runtime.test.ts",
           "tests/execution-admission.test.ts",
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/map-learning-fixture.ts",
           "tests/mcp.test.ts",
-          "tests/migration-v4.test.ts",
-          "tests/review-launch-admission.test.ts",
-          "tests/review-rejoin-v3.test.ts"
-        ]
-      },
-      {
-        "from": "migration",
-        "to": "workflow",
-        "type": "calls",
-        "confidence": "medium",
-        "factors": [
-          "symbol_call",
-          "test_exercises_both_ends"
-        ],
-        "evidence": [
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:609",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:619",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:624",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:683",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:706",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:758",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:764",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/migration/coordinator.ts:840",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          }
-        ],
-        "calls": [
-          {
-            "file": "src/migration/coordinator.ts:609",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:619",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:624",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:683",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:706",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:758",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:764",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:840",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:903",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:1758",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:1768",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/migration/coordinator.ts:2011",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          }
-        ],
-        "tested_by": [
-          "tests/collaboration-runtime.test.ts",
-          "tests/execution-admission.test.ts",
-          "tests/graph-flow-store.test.ts",
-          "tests/migration-v4.test.ts",
-          "tests/review-prelaunch-fence.test.ts",
-          "tests/review-rejoin-v3.test.ts",
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts"
+          "tests/migration-v4.test.ts"
         ]
       },
       {
@@ -6849,31 +7439,31 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:150",
+            "file": "src/runners/agent-runner.ts:173",
             "detail": "increaseRequestedEffort",
             "symbol": "increaseRequestedEffort"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:151",
+            "file": "src/runners/agent-runner.ts:174",
             "detail": "constrainEffortForAgent",
             "symbol": "constrainEffortForAgent"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:622",
+            "file": "src/runners/agent-runner.ts:693",
             "detail": "classifyProviderFailureDetail",
             "symbol": "classifyProviderFailureDetail"
           },
           {
             "kind": "construct",
-            "file": "src/runners/claude.ts:95",
+            "file": "src/runners/claude.ts:97",
             "detail": "new ProviderTransportFailure",
             "symbol": "ProviderTransportFailure"
           },
           {
             "kind": "call",
-            "file": "src/runners/claude.ts:95",
+            "file": "src/runners/claude.ts:97",
             "detail": "ProviderTransportFailure",
             "symbol": "ProviderTransportFailure"
           },
@@ -6895,27 +7485,27 @@
         ],
         "calls": [
           {
-            "file": "src/runners/agent-runner.ts:150",
+            "file": "src/runners/agent-runner.ts:173",
             "symbol": "increaseRequestedEffort",
             "kind": "call"
           },
           {
-            "file": "src/runners/agent-runner.ts:151",
+            "file": "src/runners/agent-runner.ts:174",
             "symbol": "constrainEffortForAgent",
             "kind": "call"
           },
           {
-            "file": "src/runners/agent-runner.ts:622",
+            "file": "src/runners/agent-runner.ts:693",
             "symbol": "classifyProviderFailureDetail",
             "kind": "call"
           },
           {
-            "file": "src/runners/claude.ts:95",
+            "file": "src/runners/claude.ts:97",
             "symbol": "ProviderTransportFailure",
             "kind": "construct"
           },
           {
-            "file": "src/runners/claude.ts:95",
+            "file": "src/runners/claude.ts:97",
             "symbol": "ProviderTransportFailure",
             "kind": "call"
           }
@@ -6938,7 +7528,7 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:253",
+            "file": "src/runners/agent-runner.ts:276",
             "detail": "assertCurrentControlMapLearningLaunchBinding",
             "symbol": "assertCurrentControlMapLearningLaunchBinding"
           },
@@ -6954,13 +7544,18 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/provider-telemetry-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/runner-commands.test.ts",
             "detail": "test references both connected components"
           }
         ],
         "calls": [
           {
-            "file": "src/runners/agent-runner.ts:253",
+            "file": "src/runners/agent-runner.ts:276",
             "symbol": "assertCurrentControlMapLearningLaunchBinding",
             "kind": "call"
           }
@@ -6968,6 +7563,7 @@
         "tested_by": [
           "tests/app-service.test.ts",
           "tests/effort-policy.test.ts",
+          "tests/provider-telemetry-v4.test.ts",
           "tests/runner-commands.test.ts"
         ]
       },
@@ -6983,7 +7579,7 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:450",
+            "file": "src/runners/agent-runner.ts:473",
             "detail": "run",
             "symbol": "run"
           },
@@ -6999,13 +7595,18 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/provider-telemetry-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/runner-commands.test.ts",
             "detail": "test references both connected components"
           }
         ],
         "calls": [
           {
-            "file": "src/runners/agent-runner.ts:450",
+            "file": "src/runners/agent-runner.ts:473",
             "symbol": "run",
             "kind": "call"
           }
@@ -7013,6 +7614,7 @@
         "tested_by": [
           "tests/app-service.test.ts",
           "tests/effort-policy.test.ts",
+          "tests/provider-telemetry-v4.test.ts",
           "tests/runner-commands.test.ts"
         ]
       },
@@ -7029,80 +7631,119 @@
         "evidence": [
           {
             "kind": "construct",
-            "file": "src/runners/agent-runner.ts:309",
+            "file": "src/runners/agent-runner.ts:332",
             "detail": "new RunGateUnitOfWork",
             "symbol": "RunGateUnitOfWork"
           },
           {
             "kind": "construct",
-            "file": "src/runners/agent-runner.ts:313",
+            "file": "src/runners/agent-runner.ts:336",
             "detail": "new ExecutionAdmission",
             "symbol": "ExecutionAdmission"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:309",
+            "file": "src/runners/agent-runner.ts:132",
+            "detail": "carryQuarantinedProviderTelemetry",
+            "symbol": "carryQuarantinedProviderTelemetry"
+          },
+          {
+            "kind": "call",
+            "file": "src/runners/agent-runner.ts:332",
             "detail": "RunGateUnitOfWork",
             "symbol": "RunGateUnitOfWork"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:313",
+            "file": "src/runners/agent-runner.ts:336",
             "detail": "ExecutionAdmission",
             "symbol": "ExecutionAdmission"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:329",
+            "file": "src/runners/agent-runner.ts:352",
             "detail": "captureWorkspaceFingerprint",
             "symbol": "captureWorkspaceFingerprint"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/app-service.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/runners/agent-runner.ts:560",
+            "detail": "mapProviderTelemetryOutcome",
+            "symbol": "mapProviderTelemetryOutcome"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/effort-policy.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/runner-commands.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/runners/agent-runner.ts:572",
+            "detail": "mapProviderTelemetryOutcome",
+            "symbol": "mapProviderTelemetryOutcome"
           }
         ],
         "calls": [
           {
-            "file": "src/runners/agent-runner.ts:309",
+            "file": "src/runners/agent-runner.ts:332",
             "symbol": "RunGateUnitOfWork",
             "kind": "construct"
           },
           {
-            "file": "src/runners/agent-runner.ts:313",
+            "file": "src/runners/agent-runner.ts:336",
             "symbol": "ExecutionAdmission",
             "kind": "construct"
           },
           {
-            "file": "src/runners/agent-runner.ts:309",
+            "file": "src/runners/agent-runner.ts:132",
+            "symbol": "carryQuarantinedProviderTelemetry",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:332",
             "symbol": "RunGateUnitOfWork",
             "kind": "call"
           },
           {
-            "file": "src/runners/agent-runner.ts:313",
+            "file": "src/runners/agent-runner.ts:336",
             "symbol": "ExecutionAdmission",
             "kind": "call"
           },
           {
-            "file": "src/runners/agent-runner.ts:329",
+            "file": "src/runners/agent-runner.ts:352",
             "symbol": "captureWorkspaceFingerprint",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:560",
+            "symbol": "mapProviderTelemetryOutcome",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:572",
+            "symbol": "mapProviderTelemetryOutcome",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:586",
+            "symbol": "mapProviderTelemetryOutcome",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:610",
+            "symbol": "mapProviderTelemetryOutcome",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:682",
+            "symbol": "mapProviderTelemetryOutcome",
+            "kind": "call"
+          },
+          {
+            "file": "src/runners/agent-runner.ts:697",
+            "symbol": "mapProviderTelemetryOutcome",
             "kind": "call"
           }
         ],
         "tested_by": [
           "tests/app-service.test.ts",
           "tests/effort-policy.test.ts",
+          "tests/provider-telemetry-v4.test.ts",
           "tests/runner-commands.test.ts"
         ]
       },
@@ -7118,36 +7759,36 @@
         "evidence": [
           {
             "kind": "construct",
-            "file": "src/runners/agent-runner.ts:310",
+            "file": "src/runners/agent-runner.ts:333",
             "detail": "new ApprovalLedger",
             "symbol": "ApprovalLedger"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:310",
+            "file": "src/runners/agent-runner.ts:333",
             "detail": "ApprovalLedger",
             "symbol": "ApprovalLedger"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:619",
+            "file": "src/runners/agent-runner.ts:690",
             "detail": "redactSensitive",
             "symbol": "redactSensitive"
           }
         ],
         "calls": [
           {
-            "file": "src/runners/agent-runner.ts:310",
+            "file": "src/runners/agent-runner.ts:333",
             "symbol": "ApprovalLedger",
             "kind": "construct"
           },
           {
-            "file": "src/runners/agent-runner.ts:310",
+            "file": "src/runners/agent-runner.ts:333",
             "symbol": "ApprovalLedger",
             "kind": "call"
           },
           {
-            "file": "src/runners/agent-runner.ts:619",
+            "file": "src/runners/agent-runner.ts:690",
             "symbol": "redactSensitive",
             "kind": "call"
           }
@@ -7166,21 +7807,26 @@
         "evidence": [
           {
             "kind": "construct",
-            "file": "src/runners/agent-runner.ts:308",
+            "file": "src/runners/agent-runner.ts:331",
             "detail": "new CollaborationRunStore",
             "symbol": "CollaborationRunStore"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:306",
+            "file": "src/runners/agent-runner.ts:329",
             "detail": "openStateDatabaseLease",
             "symbol": "openStateDatabaseLease"
           },
           {
             "kind": "call",
-            "file": "src/runners/agent-runner.ts:308",
+            "file": "src/runners/agent-runner.ts:331",
             "detail": "CollaborationRunStore",
             "symbol": "CollaborationRunStore"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/provider-telemetry-v4.test.ts",
+            "detail": "test references both connected components"
           },
           {
             "kind": "test_covers_edge",
@@ -7190,22 +7836,23 @@
         ],
         "calls": [
           {
-            "file": "src/runners/agent-runner.ts:308",
+            "file": "src/runners/agent-runner.ts:331",
             "symbol": "CollaborationRunStore",
             "kind": "construct"
           },
           {
-            "file": "src/runners/agent-runner.ts:306",
+            "file": "src/runners/agent-runner.ts:329",
             "symbol": "openStateDatabaseLease",
             "kind": "call"
           },
           {
-            "file": "src/runners/agent-runner.ts:308",
+            "file": "src/runners/agent-runner.ts:331",
             "symbol": "CollaborationRunStore",
             "kind": "call"
           }
         ],
         "tested_by": [
+          "tests/provider-telemetry-v4.test.ts",
           "tests/runner-commands.test.ts"
         ]
       },
@@ -7245,27 +7892,27 @@
           },
           {
             "kind": "call",
-            "file": "src/runtime/provider-health-store.ts:336",
-            "detail": "classifyOutcome",
-            "symbol": "classifyOutcome"
+            "file": "src/runtime/flow-telemetry-archive.ts:147",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
           },
           {
             "kind": "call",
-            "file": "src/runtime/run-gate-unit-of-work.ts:584",
-            "detail": "isFailoverOutcome",
-            "symbol": "isFailoverOutcome"
+            "file": "src/runtime/flow-telemetry-archive.ts:149",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
           },
           {
             "kind": "call",
-            "file": "src/runtime/run-gate-unit-of-work.ts:825",
-            "detail": "assertExactReviewTopology",
-            "symbol": "assertExactReviewTopology"
+            "file": "src/runtime/flow-telemetry-archive.ts:164",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           },
           {
             "kind": "call",
-            "file": "src/runtime/run-gate-unit-of-work.ts:846",
-            "detail": "createReviewPlan",
-            "symbol": "createReviewPlan"
+            "file": "src/runtime/flow-telemetry-archive.ts:181",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           }
         ],
         "calls": [
@@ -7290,52 +7937,55 @@
             "kind": "call"
           },
           {
-            "file": "src/runtime/provider-health-store.ts:336",
-            "symbol": "classifyOutcome",
+            "file": "src/runtime/flow-telemetry-archive.ts:147",
+            "symbol": "computeBytesSha256",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:584",
-            "symbol": "isFailoverOutcome",
+            "file": "src/runtime/flow-telemetry-archive.ts:149",
+            "symbol": "computeBytesSha256",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:825",
-            "symbol": "assertExactReviewTopology",
+            "file": "src/runtime/flow-telemetry-archive.ts:164",
+            "symbol": "canonicalJson",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:846",
-            "symbol": "createReviewPlan",
+            "file": "src/runtime/flow-telemetry-archive.ts:181",
+            "symbol": "canonicalJson",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:1208",
-            "symbol": "assertExactReviewTopology",
+            "file": "src/runtime/flow-telemetry-archive.ts:215",
+            "symbol": "canonicalJson",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:1280",
-            "symbol": "hasExactReviewTopology",
+            "file": "src/runtime/flow-telemetry-archive.ts:268",
+            "symbol": "canonicalJson",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:1328",
-            "symbol": "isFailoverOutcome",
+            "file": "src/runtime/flow-telemetry-archive.ts:269",
+            "symbol": "canonicalJson",
             "kind": "call"
           },
           {
-            "file": "src/runtime/run-gate-unit-of-work.ts:1424",
-            "symbol": "assertExactReviewTopology",
+            "file": "src/runtime/flow-telemetry-archive.ts:320",
+            "symbol": "canonicalJson",
             "kind": "call"
           }
         ],
         "tested_by": [
           "tests/effort-policy.test.ts",
+          "tests/flow-telemetry-archive-v4.test.ts",
+          "tests/flow-telemetry-v4.test.ts",
           "tests/review-evidence-capture.test.ts",
+          "tests/review-prelaunch-fence.test.ts",
+          "tests/review-rejoin-v3.test.ts",
           "tests/review-verdict.test.ts",
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts"
+          "tests/routing-v5-contract.test.ts"
         ]
       },
       {
@@ -7465,9 +8115,9 @@
           "tests/effort-policy.test.ts",
           "tests/execution-admission.test.ts",
           "tests/execution-snapshot.test.ts",
-          "tests/map-learning-fixture.ts",
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts"
+          "tests/flow-telemetry-archive-v4.test.ts",
+          "tests/flow-telemetry-v4.test.ts",
+          "tests/map-learning-fixture.ts"
         ]
       },
       {
@@ -7597,9 +8247,9 @@
           "tests/effort-policy.test.ts",
           "tests/fixtures/review-v3-activation-worker.mjs",
           "tests/fixtures/review-v3-terminal-worker.mjs",
+          "tests/flow-telemetry-archive-v4.test.ts",
           "tests/migration-v3.test.ts",
-          "tests/migration-v4-launch-authority-v3.test.ts",
-          "tests/review-attempt-identity.test.ts"
+          "tests/migration-v4-launch-authority-v3.test.ts"
         ]
       },
       {
@@ -7703,6 +8353,18 @@
           },
           {
             "kind": "call",
+            "file": "src/runtime/flow-telemetry-identity.ts:53",
+            "detail": "redactSensitive",
+            "symbol": "redactSensitive"
+          },
+          {
+            "kind": "call",
+            "file": "src/runtime/flow-telemetry.ts:339",
+            "detail": "sanitizeResult",
+            "symbol": "sanitizeResult"
+          },
+          {
+            "kind": "call",
             "file": "src/runtime/run-gate-unit-of-work.ts:1077",
             "detail": "sanitizeResult",
             "symbol": "sanitizeResult"
@@ -7716,18 +8378,6 @@
           {
             "kind": "call",
             "file": "src/runtime/run-gate-unit-of-work.ts:1150",
-            "detail": "sanitizeResult",
-            "symbol": "sanitizeResult"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/run-gate-unit-of-work.ts:1158",
-            "detail": "sanitizeResult",
-            "symbol": "sanitizeResult"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/run-gate-unit-of-work.ts:1166",
             "detail": "sanitizeResult",
             "symbol": "sanitizeResult"
           }
@@ -7745,6 +8395,16 @@
           },
           {
             "file": "src/runtime/collaboration-runtime.ts:502",
+            "symbol": "sanitizeResult",
+            "kind": "call"
+          },
+          {
+            "file": "src/runtime/flow-telemetry-identity.ts:53",
+            "symbol": "redactSensitive",
+            "kind": "call"
+          },
+          {
+            "file": "src/runtime/flow-telemetry.ts:339",
             "symbol": "sanitizeResult",
             "kind": "call"
           },
@@ -7905,11 +8565,11 @@
           "tests/collaboration-runtime.test.ts",
           "tests/execution-admission.test.ts",
           "tests/map-learning-fixture.ts",
+          "tests/provider-telemetry-v4.test.ts",
           "tests/review-launch-admission.test.ts",
           "tests/review-rejoin-v3.test.ts",
           "tests/review-v3-worker-boundary.test.ts",
-          "tests/review-verdict.test.ts",
-          "tests/routing-v5-contract.test.ts"
+          "tests/review-verdict.test.ts"
         ]
       },
       {
@@ -7924,112 +8584,56 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/runtime/flow-telemetry.ts:86",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/flow-telemetry.ts:95",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/flow-telemetry.ts:100",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/flow-telemetry.ts:101",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/flow-telemetry.ts:102",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "src/runtime/flow-telemetry.ts:128",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
             "file": "src/runtime/graph-scheduler.ts:14",
             "detail": "readyNodeIds",
             "symbol": "readyNodeIds"
           },
           {
             "kind": "call",
-            "file": "src/runtime/node-result.ts:42",
+            "file": "src/runtime/node-result.ts:43",
             "detail": "validateJsonValue",
             "symbol": "validateJsonValue"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/collaboration-runtime.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/execution-admission.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/execution-snapshot.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/graph-core.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/routing-v5-contract.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/runner-commands.test.ts",
+            "detail": "test references both connected components"
           }
         ],
         "calls": [
-          {
-            "file": "src/runtime/flow-telemetry.ts:86",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/flow-telemetry.ts:95",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/flow-telemetry.ts:100",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/flow-telemetry.ts:101",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/flow-telemetry.ts:102",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/flow-telemetry.ts:128",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
           {
             "file": "src/runtime/graph-scheduler.ts:14",
             "symbol": "readyNodeIds",
             "kind": "call"
           },
           {
-            "file": "src/runtime/node-result.ts:42",
+            "file": "src/runtime/node-result.ts:43",
             "symbol": "validateJsonValue",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/node-result.ts:44",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/run-gate-unit-of-work.ts:46",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/run-gate-unit-of-work.ts:646",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "src/runtime/run-gate-unit-of-work.ts:647",
-            "symbol": "canonicalJson",
             "kind": "call"
           }
         ],
@@ -8038,10 +8642,109 @@
           "tests/execution-admission.test.ts",
           "tests/execution-snapshot.test.ts",
           "tests/graph-core.test.ts",
-          "tests/review-prelaunch-fence.test.ts",
-          "tests/review-rejoin-v3.test.ts",
           "tests/routing-v5-contract.test.ts",
           "tests/runner-commands.test.ts"
+        ]
+      },
+      {
+        "from": "scripts",
+        "to": "domain",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:13",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:45",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:105",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:151",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:177",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:182",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:258",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "scripts/verify-implementation-progress.mjs:273",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          }
+        ],
+        "calls": [
+          {
+            "file": "scripts/verify-implementation-progress.mjs:13",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:45",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:105",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:151",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:177",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:182",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:258",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "scripts/verify-implementation-progress.mjs:273",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          }
         ]
       },
       {
@@ -8055,116 +8758,15 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:198",
+            "file": "scripts/verify-implementation-progress.mjs:248",
             "detail": "match",
             "symbol": "match"
           }
         ],
         "calls": [
           {
-            "file": "scripts/verify-implementation-progress.mjs:198",
+            "file": "scripts/verify-implementation-progress.mjs:248",
             "symbol": "match",
-            "kind": "call"
-          }
-        ]
-      },
-      {
-        "from": "scripts",
-        "to": "workflow",
-        "type": "calls",
-        "confidence": "medium",
-        "factors": [
-          "symbol_call"
-        ],
-        "evidence": [
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:13",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:36",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:96",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:142",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:163",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:168",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:208",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          },
-          {
-            "kind": "call",
-            "file": "scripts/verify-implementation-progress.mjs:223",
-            "detail": "canonicalJson",
-            "symbol": "canonicalJson"
-          }
-        ],
-        "calls": [
-          {
-            "file": "scripts/verify-implementation-progress.mjs:13",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:36",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:96",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:142",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:163",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:168",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:208",
-            "symbol": "canonicalJson",
-            "kind": "call"
-          },
-          {
-            "file": "scripts/verify-implementation-progress.mjs:223",
-            "symbol": "canonicalJson",
             "kind": "call"
           }
         ]
@@ -8256,6 +8858,51 @@
       },
       {
         "from": "store",
+        "to": "app",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:422",
+            "detail": "assertFlowTelemetryArchiveStoreAuthorityPort",
+            "symbol": "assertFlowTelemetryArchiveStoreAuthorityPort"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/fixtures/flow-telemetry-archive-worker.mjs",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/state-database-fence.test.ts",
+            "detail": "test references both connected components"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/store/flow-telemetry-store.ts:422",
+            "symbol": "assertFlowTelemetryArchiveStoreAuthorityPort",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/fixtures/flow-telemetry-archive-worker.mjs",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/state-database-fence.test.ts"
+        ]
+      },
+      {
+        "from": "store",
         "to": "docs",
         "type": "calls",
         "confidence": "medium",
@@ -8266,34 +8913,89 @@
         "evidence": [
           {
             "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:818",
+            "detail": "agent_sessions\n      ",
+            "symbol": "agent_sessions"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:972",
+            "detail": "agent_events\n      ",
+            "symbol": "agent_events"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:992",
+            "detail": "agent_event_payloads",
+            "symbol": "agent_event_payloads"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:1067",
+            "detail": "agent_attempt_usage\n      ",
+            "symbol": "agent_attempt_usage"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:1086",
+            "detail": "agent_usage_coverage\n      ",
+            "symbol": "agent_usage_coverage"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:1487",
+            "detail": "agent_event_archives\n      ",
+            "symbol": "agent_event_archives"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:1500",
+            "detail": "agent_event_archive_members\n      ",
+            "symbol": "agent_event_archive_members"
+          },
+          {
+            "kind": "call",
             "file": "src/store/graph-flow-store.ts:140",
             "detail": "graph_flows\n        ",
             "symbol": "graph_flows"
-          },
-          {
-            "kind": "call",
-            "file": "src/store/graph-flow-store.ts:156",
-            "detail": "graph_nodes\n        ",
-            "symbol": "graph_nodes"
-          },
-          {
-            "kind": "call",
-            "file": "src/store/graph-flow-store.ts:162",
-            "detail": "graph_edges\n        ",
-            "symbol": "graph_edges"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/graph-flow-store.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/schema-compatibility.test.ts",
-            "detail": "test references both connected components"
           }
         ],
         "calls": [
+          {
+            "file": "src/store/flow-telemetry-store.ts:818",
+            "symbol": "agent_sessions",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:972",
+            "symbol": "agent_events",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:992",
+            "symbol": "agent_event_payloads",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1067",
+            "symbol": "agent_attempt_usage",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1086",
+            "symbol": "agent_usage_coverage",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1487",
+            "symbol": "agent_event_archives",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1500",
+            "symbol": "agent_event_archive_members",
+            "kind": "call"
+          },
           {
             "file": "src/store/graph-flow-store.ts:140",
             "symbol": "graph_flows",
@@ -8308,11 +9010,294 @@
             "file": "src/store/graph-flow-store.ts:162",
             "symbol": "graph_edges",
             "kind": "call"
+          },
+          {
+            "file": "src/store/implementation-progress-store.ts:288",
+            "symbol": "plan_progress_events",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/implementation-progress-store.ts:295",
+            "symbol": "plan_progress_outbox",
+            "kind": "call"
           }
         ],
         "tested_by": [
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/schema-compatibility.test.ts"
+        ]
+      },
+      {
+        "from": "store",
+        "to": "domain",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:348",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:371",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:374",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:379",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:565",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:572",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:696",
+            "detail": "computeBytesSha256",
+            "symbol": "computeBytesSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:705",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/store/flow-telemetry-store.ts:348",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:371",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:374",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:379",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:565",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:572",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:696",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:705",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:869",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1214",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1428",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:1429",
+            "symbol": "computeBytesSha256",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/flow-telemetry-store-v4.test.ts",
+          "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/migration-v4.test.ts",
+          "tests/review-rejoin-v3.test.ts",
+          "tests/review-verdict.test.ts",
+          "tests/routing-v5-contract.test.ts"
+        ]
+      },
+      {
+        "from": "store",
+        "to": "flow",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/store/implementation-progress-store.ts:180",
+            "detail": "buildAmendmentAcceptanceEvents",
+            "symbol": "buildAmendmentAcceptanceEvents"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/collaboration-runtime.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/execution-admission.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/map-framework-integration.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/map-learning-fixture.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/provider-telemetry-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/routing-v5-contract.test.ts",
+            "detail": "test references both connected components"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/store/implementation-progress-store.ts:180",
+            "symbol": "buildAmendmentAcceptanceEvents",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/collaboration-runtime.test.ts",
+          "tests/execution-admission.test.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/map-framework-integration.test.ts",
+          "tests/map-learning-fixture.ts",
+          "tests/provider-telemetry-v4.test.ts",
+          "tests/routing-v5-contract.test.ts",
+          "tests/runner-commands.test.ts"
+        ]
+      },
+      {
+        "from": "store",
+        "to": "flow",
+        "type": "inherits",
+        "confidence": "high",
+        "factors": [
+          "inheritance",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:41",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:50",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:56",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:65",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:80",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:99",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "inherits",
+            "file": "src/store/flow-telemetry-store.ts:118",
+            "detail": "extends JsonObject",
+            "symbol": "JsonObject"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/collaboration-runtime.test.ts",
+            "detail": "test references both connected components"
+          }
+        ],
+        "tested_by": [
+          "tests/collaboration-runtime.test.ts",
+          "tests/execution-admission.test.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/map-framework-integration.test.ts",
+          "tests/map-learning-fixture.ts",
+          "tests/provider-telemetry-v4.test.ts",
+          "tests/routing-v5-contract.test.ts",
+          "tests/runner-commands.test.ts"
         ]
       },
       {
@@ -8363,13 +9348,13 @@
           },
           {
             "kind": "call",
-            "file": "src/store/graph-flow-store.ts:143",
+            "file": "src/store/flow-telemetry-store.ts:652",
             "detail": "run",
             "symbol": "run"
           },
           {
             "kind": "call",
-            "file": "src/store/graph-flow-store.ts:160",
+            "file": "src/store/flow-telemetry-store.ts:820",
             "detail": "run",
             "symbol": "run"
           }
@@ -8406,45 +9391,45 @@
             "kind": "call"
           },
           {
-            "file": "src/store/graph-flow-store.ts:143",
+            "file": "src/store/flow-telemetry-store.ts:652",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/store/graph-flow-store.ts:160",
+            "file": "src/store/flow-telemetry-store.ts:820",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/store/graph-flow-store.ts:167",
+            "file": "src/store/flow-telemetry-store.ts:872",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/store/run-store.ts:83",
+            "file": "src/store/flow-telemetry-store.ts:975",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/store/run-store.ts:159",
+            "file": "src/store/flow-telemetry-store.ts:993",
             "symbol": "run",
             "kind": "call"
           },
           {
-            "file": "src/store/run-store.ts:194",
+            "file": "src/store/flow-telemetry-store.ts:1070",
             "symbol": "run",
             "kind": "call"
           }
         ],
         "tested_by": [
           "tests/collaboration-runtime.test.ts",
+          "tests/flow-telemetry-store-v4.test.ts",
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/migration-v4.test.ts",
-          "tests/review-rejoin-v3.test.ts",
-          "tests/review-v3-worker-boundary.test.ts",
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts",
-          "tests/runtime-review-barrier.test.ts"
+          "tests/provider-telemetry-v4.test.ts",
+          "tests/review-rejoin-v3.test.ts"
         ]
       },
       {
@@ -8459,7 +9444,25 @@
         "evidence": [
           {
             "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:405",
+            "detail": "assertGraphV4PersistenceSchema",
+            "symbol": "assertGraphV4PersistenceSchema"
+          },
+          {
+            "kind": "call",
             "file": "src/store/graph-flow-store.ts:93",
+            "detail": "assertGraphV4PersistenceSchema",
+            "symbol": "assertGraphV4PersistenceSchema"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/implementation-progress-store.ts:96",
+            "detail": "assertGraphV4PersistenceSchema",
+            "symbol": "assertGraphV4PersistenceSchema"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/implementation-progress-store.ts:337",
             "detail": "assertGraphV4PersistenceSchema",
             "symbol": "assertGraphV4PersistenceSchema"
           },
@@ -8485,26 +9488,26 @@
             "kind": "test_covers_edge",
             "file": "tests/collaboration-runtime.test.ts",
             "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/execution-admission.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/graph-flow-store.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/map-learning-fixture.ts",
-            "detail": "test references both connected components"
           }
         ],
         "calls": [
           {
+            "file": "src/store/flow-telemetry-store.ts:405",
+            "symbol": "assertGraphV4PersistenceSchema",
+            "kind": "call"
+          },
+          {
             "file": "src/store/graph-flow-store.ts:93",
+            "symbol": "assertGraphV4PersistenceSchema",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/implementation-progress-store.ts:96",
+            "symbol": "assertGraphV4PersistenceSchema",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/implementation-progress-store.ts:337",
             "symbol": "assertGraphV4PersistenceSchema",
             "kind": "call"
           },
@@ -8528,11 +9531,143 @@
           "tests/collaboration-runtime.test.ts",
           "tests/execution-admission.test.ts",
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/map-learning-fixture.ts",
           "tests/mcp.test.ts",
-          "tests/migration-v4.test.ts",
+          "tests/migration-v4.test.ts"
+        ]
+      },
+      {
+        "from": "store",
+        "to": "runtime",
+        "type": "calls",
+        "confidence": "medium",
+        "factors": [
+          "symbol_call",
+          "test_exercises_both_ends"
+        ],
+        "evidence": [
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:313",
+            "detail": "assertProviderSessionIdentity",
+            "symbol": "assertProviderSessionIdentity"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:382",
+            "detail": "sanitizeTelemetryProjection",
+            "symbol": "sanitizeTelemetryProjection"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:501",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:502",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:693",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:694",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:708",
+            "detail": "sanitizeTelemetryProjection",
+            "symbol": "sanitizeTelemetryProjection"
+          },
+          {
+            "kind": "call",
+            "file": "src/store/flow-telemetry-store.ts:768",
+            "detail": "assertTelemetryStableId",
+            "symbol": "assertTelemetryStableId"
+          }
+        ],
+        "calls": [
+          {
+            "file": "src/store/flow-telemetry-store.ts:313",
+            "symbol": "assertProviderSessionIdentity",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:382",
+            "symbol": "sanitizeTelemetryProjection",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:501",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:502",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:693",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:694",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:708",
+            "symbol": "sanitizeTelemetryProjection",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:768",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:769",
+            "symbol": "assertTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:770",
+            "symbol": "assertNullableTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:771",
+            "symbol": "assertNullableTelemetryStableId",
+            "kind": "call"
+          },
+          {
+            "file": "src/store/flow-telemetry-store.ts:776",
+            "symbol": "assertTelemetrySessionKind",
+            "kind": "call"
+          }
+        ],
+        "tested_by": [
+          "tests/collaboration-runtime.test.ts",
+          "tests/execution-admission.test.ts",
+          "tests/map-learning-fixture.ts",
+          "tests/provider-telemetry-v4.test.ts",
           "tests/review-launch-admission.test.ts",
-          "tests/review-rejoin-v3.test.ts"
+          "tests/review-rejoin-v3.test.ts",
+          "tests/review-v3-worker-boundary.test.ts",
+          "tests/review-verdict.test.ts"
         ]
       },
       {
@@ -8777,8 +9912,8 @@
             "kind": "call"
           },
           {
-            "file": "src/store/graph-flow-store.ts:58",
-            "symbol": "canonicalJson",
+            "file": "src/store/graph-flow-store.ts:103",
+            "symbol": "validateGraphFlow",
             "kind": "call"
           }
         ],
@@ -8786,8 +9921,9 @@
           "tests/collaboration-runtime.test.ts",
           "tests/execution-admission.test.ts",
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/migration-v4.test.ts",
-          "tests/review-rejoin-v3.test.ts",
           "tests/routing-v5-contract.test.ts",
           "tests/runner-commands.test.ts"
         ]
@@ -8798,7 +9934,8 @@
         "type": "calls",
         "confidence": "medium",
         "factors": [
-          "symbol_call"
+          "symbol_call",
+          "test_exercises_both_ends"
         ],
         "evidence": [
           {
@@ -8812,6 +9949,11 @@
             "file": "src/worker/domain-effect.ts:159",
             "detail": "isFailoverOutcome",
             "symbol": "isFailoverOutcome"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
           }
         ],
         "calls": [
@@ -8825,6 +9967,9 @@
             "symbol": "isFailoverOutcome",
             "kind": "call"
           }
+        ],
+        "tested_by": [
+          "tests/implementation-progress-v4.test.ts"
         ]
       },
       {
@@ -8833,7 +9978,8 @@
         "type": "calls",
         "confidence": "medium",
         "factors": [
-          "symbol_call"
+          "symbol_call",
+          "test_exercises_both_ends"
         ],
         "evidence": [
           {
@@ -8841,6 +9987,11 @@
             "file": "src/worker/domain-effect.ts:159",
             "detail": "matchesExactPrelaunchCliMissing",
             "symbol": "matchesExactPrelaunchCliMissing"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/provider-telemetry-v4.test.ts",
+            "detail": "test references both connected components"
           }
         ],
         "calls": [
@@ -8849,6 +10000,9 @@
             "symbol": "matchesExactPrelaunchCliMissing",
             "kind": "call"
           }
+        ],
+        "tested_by": [
+          "tests/provider-telemetry-v4.test.ts"
         ]
       },
       {
@@ -8898,28 +10052,94 @@
         "evidence": [
           {
             "kind": "call",
-            "file": "src/workflow/workflow.ts:216",
-            "detail": "selectStageAssignment",
-            "symbol": "selectStageAssignment"
+            "file": "src/workflow/flow-contract.ts:151",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
           },
           {
             "kind": "call",
-            "file": "src/workflow/workflow.ts:501",
-            "detail": "classifyOutcome",
-            "symbol": "classifyOutcome"
+            "file": "src/workflow/flow-contract.ts:155",
+            "detail": "assertJsonDocument",
+            "symbol": "assertJsonDocument"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/routing-v5-contract.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/workflow/flow-contract.ts:156",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           },
           {
-            "kind": "test_covers_edge",
-            "file": "tests/runner-commands.test.ts",
-            "detail": "test references both connected components"
+            "kind": "call",
+            "file": "src/workflow/flow-contract.ts:167",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
+          },
+          {
+            "kind": "call",
+            "file": "src/workflow/flow-contract.ts:206",
+            "detail": "assertJsonDocument",
+            "symbol": "assertJsonDocument"
+          },
+          {
+            "kind": "call",
+            "file": "src/workflow/flow-contract.ts:214",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/workflow/flow-contract.ts:223",
+            "detail": "computeJsonSha256",
+            "symbol": "computeJsonSha256"
+          },
+          {
+            "kind": "call",
+            "file": "src/workflow/flow-contract.ts:275",
+            "detail": "canonicalJson",
+            "symbol": "canonicalJson"
           }
         ],
         "calls": [
+          {
+            "file": "src/workflow/flow-contract.ts:151",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:155",
+            "symbol": "assertJsonDocument",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:156",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:167",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:206",
+            "symbol": "assertJsonDocument",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:214",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:223",
+            "symbol": "computeJsonSha256",
+            "kind": "call"
+          },
+          {
+            "file": "src/workflow/flow-contract.ts:275",
+            "symbol": "canonicalJson",
+            "kind": "call"
+          },
           {
             "file": "src/workflow/workflow.ts:216",
             "symbol": "selectStageAssignment",
@@ -8932,6 +10152,11 @@
           }
         ],
         "tested_by": [
+          "tests/flow-contract.test.ts",
+          "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
+          "tests/migration-v4.test.ts",
           "tests/routing-v5-contract.test.ts",
           "tests/runner-commands.test.ts"
         ]
@@ -8954,39 +10179,7 @@
           },
           {
             "kind": "test_covers_edge",
-            "file": "tests/routing-v5-contract.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/runner-commands.test.ts",
-            "detail": "test references both connected components"
-          }
-        ],
-        "tested_by": [
-          "tests/routing-v5-contract.test.ts",
-          "tests/runner-commands.test.ts"
-        ]
-      },
-      {
-        "from": "workflow",
-        "to": "map",
-        "type": "calls",
-        "confidence": "medium",
-        "factors": [
-          "symbol_call",
-          "test_exercises_both_ends"
-        ],
-        "evidence": [
-          {
-            "kind": "call",
-            "file": "src/workflow/flow-contract.ts:268",
-            "detail": "visit",
-            "symbol": "visit"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/collaboration-runtime.test.ts",
+            "file": "tests/flow-contract.test.ts",
             "detail": "test references both connected components"
           },
           {
@@ -8996,17 +10189,17 @@
           },
           {
             "kind": "test_covers_edge",
+            "file": "tests/helpers/flow-telemetry-fixture.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
+            "file": "tests/implementation-progress-v4.test.ts",
+            "detail": "test references both connected components"
+          },
+          {
+            "kind": "test_covers_edge",
             "file": "tests/migration-v4.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/review-prelaunch-fence.test.ts",
-            "detail": "test references both connected components"
-          },
-          {
-            "kind": "test_covers_edge",
-            "file": "tests/review-rejoin-v3.test.ts",
             "detail": "test references both connected components"
           },
           {
@@ -9020,19 +10213,12 @@
             "detail": "test references both connected components"
           }
         ],
-        "calls": [
-          {
-            "file": "src/workflow/flow-contract.ts:268",
-            "symbol": "visit",
-            "kind": "call"
-          }
-        ],
         "tested_by": [
-          "tests/collaboration-runtime.test.ts",
+          "tests/flow-contract.test.ts",
           "tests/graph-flow-store.test.ts",
+          "tests/helpers/flow-telemetry-fixture.ts",
+          "tests/implementation-progress-v4.test.ts",
           "tests/migration-v4.test.ts",
-          "tests/review-prelaunch-fence.test.ts",
-          "tests/review-rejoin-v3.test.ts",
           "tests/routing-v5-contract.test.ts",
           "tests/runner-commands.test.ts"
         ]
@@ -9219,7 +10405,7 @@
     },
     {
       "name": "CompatibilityRuntimeObservation",
-      "file": "src/migration/coordinator.ts:238",
+      "file": "src/migration/coordinator.ts:245",
       "description": "Exported TypeScript/JavaScript data shape.",
       "fields": {
         "graphExecution": "\"disabled\" field",
@@ -9254,8 +10440,50 @@
       }
     },
     {
+      "name": "LegacyDatabaseObservation",
+      "file": "src/migration/state-v4-manifest.ts:13",
+      "description": "Exported TypeScript/JavaScript data shape.",
+      "fields": {
+        "bytesSha256": "string field",
+        "manifest": "LegacyTableManifest field",
+        "manifestSha256": "string field",
+        "userVersion": "number field"
+      }
+    },
+    {
+      "name": "LegacyTableManifest",
+      "file": "src/migration/state-v4-manifest.ts:8",
+      "description": "Exported TypeScript/JavaScript data shape.",
+      "fields": {
+        "schemaVersion": "\"legacy-table-digest-manifest/v1\" field",
+        "tables": "Array<{ name: string field"
+      }
+    },
+    {
+      "name": "MigrationAuthorityBinding",
+      "file": "src/migration/reviewed-v4-migration-authority.ts:27",
+      "description": "Exported TypeScript/JavaScript data shape.",
+      "fields": {
+        "consumer": "\"codex:/root:state-v4-reviewed-bootstrap\" field",
+        "operationId": "string field",
+        "scope": "\"reviewed-state-v4-migration\" field",
+        "sourceIdentity": "{ readonly commitOid: typeof REVIEWED_V4_COMMIT field"
+      }
+    },
+    {
+      "name": "MigrationAuthorityClaim",
+      "file": "src/migration/reviewed-v4-migration-authority.ts:36",
+      "description": "Exported TypeScript/JavaScript data shape.",
+      "fields": {
+        "alreadyCompleted": "boolean field",
+        "completedReceipt": "Readonly<Record<string field",
+        "preHistory": "LegacyDatabaseObservation field",
+        "preState": "LegacyDatabaseObservation field"
+      }
+    },
+    {
       "name": "MigrationFaultPoint",
-      "file": "src/migration/coordinator.ts:158",
+      "file": "src/migration/coordinator.ts:165",
       "description": "Exported TypeScript/JavaScript data shape.",
       "fields": {
         "backupDirectory": "string field",
@@ -9328,15 +10556,34 @@
       "file": "src/migration/review-v3-schema.ts:3",
       "description": "Exported TypeScript/JavaScript data shape.",
       "fields": {
-        "runtime_provider_recovery_generations": "[ field",
-        "runtime_review_attempt_authorities": "[ field",
-        "runtime_review_attempt_base_policies": "[ field",
-        "runtime_review_generation_consumptions": "[ field",
-        "runtime_review_no_spawn_effects": "[\"attempt_id\" field",
-        "runtime_review_receipt_heads": "[\"scope\" field",
-        "runtime_review_receipt_lifecycle": "[ field",
-        "runtime_review_receipts": "[ field",
-        "runtime_review_spawn_authorities": "[ field"
+        "added": "Object.freeze([ field",
+        "replaced": "Object.freeze([ field"
+      }
+    },
+    {
+      "name": "ReviewedV4BootstrapInput",
+      "file": "src/migration/reviewed-v4-bootstrap.ts:47",
+      "description": "Exported TypeScript/JavaScript data shape.",
+      "fields": {
+        "gitRoot": "string field",
+        "operationId": "string field",
+        "reviewedWorktreeParent": "string field",
+        "sourceIdentity": "{ readonly commitOid: string field"
+      }
+    },
+    {
+      "name": "ReviewedV4BootstrapReceipt",
+      "file": "src/migration/reviewed-v4-bootstrap.ts:56",
+      "description": "Exported TypeScript/JavaScript data shape.",
+      "fields": {
+        "backupPath": "string field",
+        "graphExecution": "\"disabled\" field",
+        "guardPath": "string field",
+        "importedProgressEvents": "number field",
+        "lastProgressEventSha256": "string field",
+        "sourceCommitOid": "string field",
+        "sourceTreeOid": "string field",
+        "status": "\"migrated\" | \"already_current\" field"
       }
     },
     {
@@ -9390,7 +10637,7 @@
     },
     {
       "name": "V1DoctorResult",
-      "file": "src/migration/coordinator.ts:216",
+      "file": "src/migration/coordinator.ts:223",
       "description": "Exported TypeScript/JavaScript data shape.",
       "fields": {
         "blockers": "string[] field",
@@ -9426,7 +10673,7 @@
     },
     {
       "name": "V4MigrationReceipt",
-      "file": "src/migration/coordinator.ts:193",
+      "file": "src/migration/coordinator.ts:200",
       "description": "Exported TypeScript/JavaScript data shape.",
       "fields": {
         "backupPath": "string field",
@@ -9508,98 +10755,6 @@
         "payload_json": "TEXT column",
         "payload_sha256": "TEXT column"
       }
-    },
-    {
-      "name": "agent_events",
-      "file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql:144",
-      "description": "SQL table detected from schema or migration.",
-      "fields": {
-        "attempt_id": "TEXT column",
-        "created_at": "INTEGER column",
-        "event_id": "TEXT column",
-        "event_sha256": "TEXT column",
-        "event_type": "TEXT column",
-        "event_version": "TEXT column",
-        "flow_id": "TEXT column",
-        "node_id": "TEXT column",
-        "payload_sha256": "TEXT column",
-        "previous_event_sha256": "TEXT column",
-        "sequence_no": "INTEGER column",
-        "session_id": "TEXT column",
-        "span_id": "TEXT column",
-        "trace_id": "TEXT column"
-      }
-    },
-    {
-      "name": "agent_sessions",
-      "file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql:126",
-      "description": "SQL table detected from schema or migration.",
-      "fields": {
-        "attempt_id": "TEXT column",
-        "created_at": "INTEGER column",
-        "flow_id": "TEXT column",
-        "kind": "TEXT column",
-        "parent_session_id": "TEXT column",
-        "provider_session_ref": "TEXT column",
-        "session_id": "TEXT column",
-        "status": "TEXT column",
-        "terminal_at": "INTEGER column"
-      }
-    },
-    {
-      "name": "agent_usage_coverage",
-      "file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql:175",
-      "description": "SQL table detected from schema or migration.",
-      "fields": {
-        "covered_attempt_id": "TEXT column",
-        "flow_id": "TEXT column",
-        "usage_id": "TEXT column"
-      }
-    },
-    {
-      "name": "flow_mcp_idempotency",
-      "file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql:198",
-      "description": "SQL table detected from schema or migration.",
-      "fields": {
-        "created_at": "INTEGER column",
-        "idempotency_key": "TEXT column",
-        "project": "TEXT column",
-        "request_json": "TEXT column",
-        "request_sha256": "TEXT column",
-        "requester": "TEXT column",
-        "response_json": "TEXT column",
-        "response_sha256": "TEXT column",
-        "status": "TEXT column",
-        "terminal_at": "INTEGER column",
-        "tool_name": "TEXT column"
-      }
-    },
-    {
-      "name": "graph_budget_reservations",
-      "file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql:105",
-      "description": "SQL table detected from schema or migration.",
-      "fields": {
-        "attempt_no": "INTEGER column",
-        "budget_kind": "TEXT column",
-        "created_at": "INTEGER column",
-        "flow_id": "TEXT column",
-        "node_id": "TEXT column",
-        "reserved_amount": "INTEGER column"
-      }
-    },
-    {
-      "name": "graph_budget_settlements",
-      "file": "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql:114",
-      "description": "SQL table detected from schema or migration.",
-      "fields": {
-        "actual_amount": "INTEGER column",
-        "attempt_no": "INTEGER column",
-        "budget_kind": "TEXT column",
-        "completeness": "TEXT column",
-        "created_at": "INTEGER column",
-        "flow_id": "TEXT column",
-        "node_id": "TEXT column"
-      }
     }
   ],
   "external_services": [],
@@ -9618,6 +10773,22 @@
     },
     {
       "term": "JournalPayload",
+      "definition": "Repository term detected from first-party symbols or component names."
+    },
+    {
+      "term": "LegacyDatabaseObservation",
+      "definition": "Repository term detected from first-party symbols or component names."
+    },
+    {
+      "term": "LegacyTableManifest",
+      "definition": "Repository term detected from first-party symbols or component names."
+    },
+    {
+      "term": "MigrationAuthorityBinding",
+      "definition": "Repository term detected from first-party symbols or component names."
+    },
+    {
+      "term": "MigrationAuthorityClaim",
       "definition": "Repository term detected from first-party symbols or component names."
     },
     {
@@ -9646,22 +10817,6 @@
     },
     {
       "term": "ReviewV3FaultPoint",
-      "definition": "Repository term detected from first-party symbols or component names."
-    },
-    {
-      "term": "RollbackBundleManifest",
-      "definition": "Repository term detected from first-party symbols or component names."
-    },
-    {
-      "term": "StateV4GuardEvent",
-      "definition": "Repository term detected from first-party symbols or component names."
-    },
-    {
-      "term": "StateV4OpenAdmission",
-      "definition": "Repository term detected from first-party symbols or component names."
-    },
-    {
-      "term": "StateV4RestoreGuard",
       "definition": "Repository term detected from first-party symbols or component names."
     }
   ]

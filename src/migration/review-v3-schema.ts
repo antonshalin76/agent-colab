@@ -12,13 +12,29 @@ const capabilities = [
   ["review-receipt-ledger", 1],
 ] as const;
 
-const ownedTables = [
-  "runtime_provider_recovery_generations", "runtime_review_attempt_base_policies",
-  "runtime_review_attempt_authorities", "runtime_review_generation_consumptions",
-  "runtime_review_receipts", "runtime_review_receipt_heads",
-  "runtime_review_receipt_lifecycle", "runtime_review_spawn_authorities",
-  "runtime_review_no_spawn_effects",
-] as const;
+export const REVIEW_V3_TABLE_CLASSIFICATION = Object.freeze({
+  added: Object.freeze([
+    "runtime_provider_recovery_generations",
+    "runtime_review_attempt_authorities",
+    "runtime_review_attempt_base_policies",
+    "runtime_review_generation_consumptions",
+    "runtime_review_no_spawn_effects",
+    "runtime_review_receipt_heads",
+    "runtime_review_receipt_lifecycle",
+    "runtime_review_receipts",
+    "runtime_review_spawn_authorities",
+    "runtime_schema_capabilities",
+  ] as const),
+  replaced: Object.freeze([
+    "runtime_review_barriers",
+    "runtime_review_lane_attempts",
+    "runtime_review_lanes",
+  ] as const),
+});
+
+const ownedTables = REVIEW_V3_TABLE_CLASSIFICATION.added.filter(
+  (table) => table !== "runtime_schema_capabilities",
+);
 
 const exactColumns: Readonly<Record<string, readonly string[]>> = {
   runtime_provider_recovery_generations: [

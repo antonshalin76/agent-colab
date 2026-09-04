@@ -1,0 +1,378 @@
+import { spawnSync } from "node:child_process";
+import { closeSync, constants, fstatSync, lstatSync, openSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { z } from "zod";
+import { canonicalJson } from "../domain/canonical-json.js";
+import {
+  assertCanonicalStateDatabaseIdentity,
+  canonicalStateDatabaseIdentity,
+} from "../store/state-database-fence.js";
+import { openExistingStateLayout } from "../store/state-layout.js";
+import { StateFileDurability } from "../store/state-file-durability.js";
+import {
+  legacyTableManifestSha256,
+  observeLegacyDatabase,
+  parseLegacyTableManifest,
+  type LegacyDatabaseObservation,
+} from "./state-v4-manifest.js";
+import {
+  REVIEWED_V4_COMMIT,
+  REVIEWED_V4_LAST_EVENT_SHA256,
+  REVIEWED_V4_TREE,
+} from "../flow/reviewed-v4-source.js";
+
+declare const migrationAuthorityBrand: unique symbol;
+export interface MigrationAuthorityCapability { readonly [migrationAuthorityBrand]: true }
+
+export interface MigrationAuthorityBinding {
+  readonly operationId: string;
+  readonly consumer: "codex:/root:state-v4-reviewed-bootstrap";
+  readonly scope: "reviewed-state-v4-migration";
+  readonly sourceIdentity: { readonly commitOid: typeof REVIEWED_V4_COMMIT; readonly treeOid: typeof REVIEWED_V4_TREE };
+  readonly stateDatabase: string;
+  readonly historyDatabase: string;
+}
+
+export interface MigrationAuthorityClaim {
+  readonly preState: LegacyDatabaseObservation;
+  readonly preHistory: LegacyDatabaseObservation;
+  readonly alreadyCompleted: boolean;
+  readonly completedReceipt: Readonly<Record<string, unknown>> | null;
+  assertCurrent(): void;
+  complete(receipt: Readonly<Record<string, unknown>>): void;
+  abort(): void;
+}
+
+export interface MigrationAuthorityConsumerPort {
+  claim(capability: MigrationAuthorityCapability | undefined, binding: MigrationAuthorityBinding): MigrationAuthorityClaim;
+}
+
+interface DurableAuthorization {
+  readonly schemaVersion: "reviewed-v4-migration-authorization/v1";
+  readonly binding: MigrationAuthorityBinding;
+  readonly rootIdentity: { readonly dev: number; readonly ino: number };
+  readonly stateIdentity: { readonly dev: number; readonly ino: number };
+  readonly historyIdentity: { readonly dev: number; readonly ino: number };
+  readonly preState: LegacyDatabaseObservation;
+  readonly preHistory: LegacyDatabaseObservation;
+}
+
+interface DurableCompletion {
+  readonly schemaVersion: "reviewed-v4-migration-completion/v1";
+  readonly operationId: string;
+  readonly binding: MigrationAuthorityBinding;
+  readonly receipt: Readonly<Record<string, unknown>>;
+}
+
+const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const safeInteger = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const fileIdentitySchema = z.object({ dev: safeInteger, ino: safeInteger }).strict();
+const legacyManifestSchema = z.object({
+  schemaVersion: z.literal("legacy-table-digest-manifest/v1"),
+  tables: z.array(z.object({
+    name: z.string().min(1),
+    columns: z.array(z.string().min(1)),
+    rowCount: safeInteger,
+    rowsSha256: z.string().regex(SHA256),
+  }).strict()),
+}).strict().superRefine((manifest, context) => {
+  try { parseLegacyTableManifest(`${canonicalJson(manifest)}\n`); }
+  catch { context.addIssue({ code: "custom", message: "legacy manifest is invalid" }); }
+});
+const legacyObservationSchema = (userVersion: 2 | 3) => z.object({
+  userVersion: z.literal(userVersion),
+  bytesSha256: z.string().regex(SHA256),
+  manifest: legacyManifestSchema,
+  manifestSha256: z.string().regex(SHA256),
+}).strict().superRefine((observation, context) => {
+  if (legacyTableManifestSha256(observation.manifest) !== observation.manifestSha256) {
+    context.addIssue({ code: "custom", message: "legacy manifest digest is invalid" });
+  }
+});
+const migrationBindingSchema = z.object({
+  operationId: z.string().regex(OPERATION_ID),
+  consumer: z.literal("codex:/root:state-v4-reviewed-bootstrap"),
+  scope: z.literal("reviewed-state-v4-migration"),
+  sourceIdentity: z.object({
+    commitOid: z.literal(REVIEWED_V4_COMMIT),
+    treeOid: z.literal(REVIEWED_V4_TREE),
+  }).strict(),
+  stateDatabase: z.string().min(1).refine(isAbsolute),
+  historyDatabase: z.string().min(1).refine(isAbsolute),
+}).strict();
+const durableAuthorizationSchema = z.object({
+  schemaVersion: z.literal("reviewed-v4-migration-authorization/v1"),
+  binding: migrationBindingSchema,
+  rootIdentity: fileIdentitySchema,
+  stateIdentity: fileIdentitySchema,
+  historyIdentity: fileIdentitySchema,
+  preState: legacyObservationSchema(3),
+  preHistory: legacyObservationSchema(2),
+}).strict();
+
+function exactBinding(left: MigrationAuthorityBinding, right: MigrationAuthorityBinding): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function observeAuthorization(binding: MigrationAuthorityBinding): DurableAuthorization {
+  if (!OPERATION_ID.test(binding.operationId) || binding.consumer !== "codex:/root:state-v4-reviewed-bootstrap" ||
+      binding.scope !== "reviewed-state-v4-migration" || binding.sourceIdentity.commitOid !== REVIEWED_V4_COMMIT ||
+      binding.sourceIdentity.treeOid !== REVIEWED_V4_TREE) {
+    throw new Error("migration authority binding is outside the reviewed source scope");
+  }
+  const root = dirname(resolve(binding.stateDatabase));
+  const layout = openExistingStateLayout(root);
+  if (binding.stateDatabase !== layout.database || binding.historyDatabase !== layout.historyDatabase) {
+    throw new Error("migration authority requires the canonical state/history database pair");
+  }
+  const state = canonicalStateDatabaseIdentity(binding.stateDatabase);
+  const history = canonicalStateDatabaseIdentity(binding.historyDatabase);
+  if (state.root !== history.root) throw new Error("migration authority database roots differ");
+  const rootStat = statSync(state.root);
+  const preState = observeLegacyDatabase(state.path, "state");
+  const preHistory = observeLegacyDatabase(history.path, "history");
+  if (preState.userVersion !== 3 || preHistory.userVersion !== 2) {
+    throw new Error("migration authority may only be issued against the exact pre-v4 database pair");
+  }
+  return {
+    schemaVersion: "reviewed-v4-migration-authorization/v1",
+    binding: structuredClone(binding),
+    rootIdentity: { dev: rootStat.dev, ino: rootStat.ino },
+    stateIdentity: structuredClone(state.databaseIdentity),
+    historyIdentity: structuredClone(history.databaseIdentity),
+    preState,
+    preHistory,
+  };
+}
+
+function parseAuthorization(bytes: Buffer): DurableAuthorization {
+  let parsed: unknown;
+  try { parsed = JSON.parse(bytes.toString("utf8")); }
+  catch (error) { throw new Error("durable migration authority record is malformed", { cause: error }); }
+  const result = durableAuthorizationSchema.safeParse(parsed);
+  if (!result.success || !bytes.equals(Buffer.from(`${canonicalJson(parsed)}\n`))) {
+    throw new Error("durable migration authority record is invalid or noncanonical");
+  }
+  return result.data as DurableAuthorization;
+}
+
+function parseCompletion(bytes: Buffer, binding: MigrationAuthorityBinding): DurableCompletion {
+  let parsed: unknown;
+  try { parsed = JSON.parse(bytes.toString("utf8")); }
+  catch (error) { throw new Error("durable migration completion record is malformed", { cause: error }); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("durable migration completion record is not an object");
+  }
+  const completion = parsed as DurableCompletion;
+  const keys = Object.keys(completion).sort();
+  if (canonicalJson(keys) !== canonicalJson(["binding", "operationId", "receipt", "schemaVersion"].sort()) ||
+      !bytes.equals(Buffer.from(`${canonicalJson(completion)}\n`)) ||
+      completion.schemaVersion !== "reviewed-v4-migration-completion/v1" ||
+      completion.operationId !== binding.operationId || !exactBinding(completion.binding, binding) ||
+      completion.receipt === null || typeof completion.receipt !== "object" || Array.isArray(completion.receipt)) {
+    throw new Error("durable migration completion record is noncanonical or conflicts with its exact operation");
+  }
+  const receiptKeys = Object.keys(completion.receipt).sort();
+  if (canonicalJson(receiptKeys) !== canonicalJson([
+    "backupPath", "graphExecution", "guardPath", "importedProgressEvents", "lastProgressEventSha256",
+    "sourceCommitOid", "sourceTreeOid", "status",
+  ].sort()) ||
+      (completion.receipt.status !== "migrated" && completion.receipt.status !== "already_current") ||
+      completion.receipt.sourceCommitOid !== REVIEWED_V4_COMMIT ||
+      completion.receipt.sourceTreeOid !== REVIEWED_V4_TREE ||
+      completion.receipt.importedProgressEvents !== 3 ||
+      completion.receipt.lastProgressEventSha256 !== REVIEWED_V4_LAST_EVENT_SHA256 ||
+      completion.receipt.graphExecution !== "disabled" ||
+      typeof completion.receipt.backupPath !== "string" || !isAbsolute(completion.receipt.backupPath) ||
+      typeof completion.receipt.guardPath !== "string" || !isAbsolute(completion.receipt.guardPath)) {
+    throw new Error("durable migration completion receipt does not match the reviewed v4 contract");
+  }
+  return completion;
+}
+
+export function createReviewedV4MigrationAuthority(input: { readonly stateRoot: string }): {
+  readonly issuer: { issue(binding: MigrationAuthorityBinding): MigrationAuthorityCapability };
+  readonly consumer: MigrationAuthorityConsumerPort;
+  close(): void;
+} {
+  const durability = new StateFileDurability({ stateRoot: input.stateRoot });
+  const capabilities = new WeakMap<object, DurableAuthorization>();
+  const lockPathFor = (operationId: string): string =>
+    resolve(input.stateRoot, "migration-v4", "authority", `${operationId}.lock`);
+  const openOperationLock = (operationId: string, create: boolean): number => {
+    const descriptor = openSync(
+      lockPathFor(operationId),
+      constants.O_RDWR | constants.O_NOFOLLOW | (create ? constants.O_CREAT : 0),
+      0o600,
+    );
+    try {
+      const descriptorStat = fstatSync(descriptor);
+      const pathStat = lstatSync(lockPathFor(operationId));
+      if (!descriptorStat.isFile() || !pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.nlink !== 1 ||
+          descriptorStat.dev !== pathStat.dev || descriptorStat.ino !== pathStat.ino) {
+        throw new Error("migration authority lock identity is invalid");
+      }
+      return descriptor;
+    } catch (error) {
+      closeSync(descriptor);
+      throw error;
+    }
+  };
+  const acquireOperationLock = (operationId: string): (() => void) => {
+    const descriptor = openOperationLock(operationId, false);
+    try {
+      const locked = spawnSync("/usr/bin/flock", ["-n", "-x", "3"], {
+        encoding: "utf8",
+        stdio: ["ignore", "ignore", "pipe", descriptor],
+      });
+      if (locked.error || locked.status !== 0) {
+        throw new Error("migration operation already has a concurrent active claim");
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        closeSync(descriptor);
+      };
+    } catch (error) {
+      closeSync(descriptor);
+      throw error;
+    }
+  };
+  const pathFor = (operationId: string, suffix: string): string =>
+    `migration-v4/authority/${operationId}.${suffix}.json`;
+
+  const issuer = Object.freeze({
+    issue(binding: MigrationAuthorityBinding): MigrationAuthorityCapability {
+      if (!OPERATION_ID.test(binding.operationId)) throw new Error("migration operation id is invalid");
+      const path = pathFor(binding.operationId, "authorization");
+      let authorization: DurableAuthorization;
+      try {
+        const pinned = durability.openPinned(path);
+        try { authorization = parseAuthorization(pinned.read()); }
+        finally { pinned.close(); }
+        if (!exactBinding(authorization.binding, binding)) {
+          throw new Error("migration operation identity was already bound to another authority");
+        }
+      } catch (error) {
+        if (!(error instanceof Error) || !/does not exist|cannot be opened|parent directory/i.test(error.message)) throw error;
+        authorization = observeAuthorization(binding);
+        const published = durability.publishImmutable({
+          relativePath: path,
+          bytes: Buffer.from(`${canonicalJson(authorization)}\n`),
+        });
+        try {
+          const persisted = parseAuthorization(published.file.read());
+          if (!exactBinding(persisted.binding, binding)) throw new Error("durable migration authority publication raced");
+          authorization = persisted;
+        } finally { published.file.close(); }
+      }
+      const lockDescriptor = openOperationLock(binding.operationId, true);
+      closeSync(lockDescriptor);
+      const token = Object.freeze({}) as MigrationAuthorityCapability;
+      capabilities.set(token, authorization);
+      return token;
+    },
+  });
+
+  const consumer: MigrationAuthorityConsumerPort = Object.freeze({
+    claim(capability: MigrationAuthorityCapability | undefined, binding: MigrationAuthorityBinding) {
+      const authorization = capability ? capabilities.get(capability as object) : undefined;
+      if (!authorization || !exactBinding(authorization.binding, binding)) {
+        throw new Error("issued durable migration authority capability is required for the exact operation");
+      }
+      const releaseOperationLock = acquireOperationLock(binding.operationId);
+      let ownsOperationLock = true;
+      const releaseLock = (): void => {
+        if (!ownsOperationLock) return;
+        ownsOperationLock = false;
+        releaseOperationLock();
+      };
+      try {
+      const assertCurrent = (): void => {
+        const state = canonicalStateDatabaseIdentity(binding.stateDatabase);
+        const history = canonicalStateDatabaseIdentity(binding.historyDatabase);
+        assertCanonicalStateDatabaseIdentity(state);
+        assertCanonicalStateDatabaseIdentity(history);
+        const rootStat = statSync(state.root);
+        if (rootStat.dev !== authorization.rootIdentity.dev || rootStat.ino !== authorization.rootIdentity.ino ||
+            state.databaseIdentity.dev !== authorization.stateIdentity.dev || state.databaseIdentity.ino !== authorization.stateIdentity.ino ||
+            history.databaseIdentity.dev !== authorization.historyIdentity.dev || history.databaseIdentity.ino !== authorization.historyIdentity.ino) {
+          throw new Error("migration authority database or canonical root identity drifted");
+        }
+        const currentState = observeLegacyDatabase(state.path, "state");
+        if (currentState.userVersion === 3 &&
+            (currentState.bytesSha256 !== authorization.preState.bytesSha256 ||
+             currentState.manifestSha256 !== authorization.preState.manifestSha256)) {
+          throw new Error("migration authority state bytes or manifest drifted after issuance");
+        }
+        if (currentState.userVersion !== 3 && currentState.userVersion !== 4) {
+          throw new Error("migration authority state schema version drifted");
+        }
+        const currentHistory = observeLegacyDatabase(history.path, "history", authorization.preHistory.manifest);
+        if (currentHistory.bytesSha256 !== authorization.preHistory.bytesSha256 ||
+            currentHistory.manifestSha256 !== authorization.preHistory.manifestSha256) {
+          throw new Error("migration authority history digest drifted");
+        }
+      };
+      assertCurrent();
+      const completionPath = pathFor(binding.operationId, "completion");
+      let persistedCompletion: DurableCompletion | undefined;
+      try {
+        const completed = durability.openPinned(completionPath);
+        try { persistedCompletion = parseCompletion(completed.read(), binding); }
+        finally { completed.close(); }
+      } catch (error) {
+        if (!(error instanceof Error) || !/does not exist|cannot be opened|parent directory/i.test(error.message)) throw error;
+      }
+      const alreadyCompleted = persistedCompletion !== undefined;
+      let settled = false;
+      return Object.freeze({
+        preState: authorization.preState,
+        preHistory: authorization.preHistory,
+        alreadyCompleted,
+        completedReceipt: persistedCompletion === undefined
+          ? null
+          : Object.freeze(structuredClone(persistedCompletion.receipt)),
+        assertCurrent() {
+          if (settled) throw new Error("migration authority claim is no longer active");
+          assertCurrent();
+        },
+        complete(receipt: Readonly<Record<string, unknown>>) {
+          if (settled) throw new Error("migration authority claim is no longer active");
+          if (alreadyCompleted) {
+            if (canonicalJson(persistedCompletion!.receipt) !== canonicalJson(receipt)) {
+              throw new Error("migration completion replay conflicts with the persisted exact receipt");
+            }
+            settled = true;
+            releaseLock();
+            return;
+          }
+          const bytes = Buffer.from(`${canonicalJson({
+            schemaVersion: "reviewed-v4-migration-completion/v1",
+            operationId: binding.operationId,
+            binding,
+            receipt,
+          })}\n`);
+          const published = durability.publishImmutable({ relativePath: completionPath, bytes });
+          try {
+            if (!published.file.read().equals(bytes)) throw new Error("migration completion replay conflicts with durable authority");
+          } finally { published.file.close(); }
+          settled = true;
+          releaseLock();
+        },
+        abort() {
+          if (settled) return;
+          settled = true;
+          releaseLock();
+        },
+      });
+      } catch (error) {
+        releaseLock();
+        throw error;
+      }
+    },
+  });
+  return Object.freeze({ issuer, consumer, close: () => durability.close() });
+}

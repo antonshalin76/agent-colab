@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { canonicalJson, validateJsonValue, type GraphNode } from "../workflow/flow-contract.js";
+import { isUsageCompleteness, type UsageCompleteness } from "./flow-telemetry.js";
 
-export type UsageCompleteness = "exact" | "partial" | "unavailable";
+export type { UsageCompleteness } from "./flow-telemetry.js";
 
 export interface NodeUsage {
   readonly inputTokens?: number | null;
@@ -62,7 +63,7 @@ function validateUsage(input: unknown): void {
   const usage = input as Record<string, unknown>;
   const unknown = Object.keys(usage).find((key) => !["inputTokens", "outputTokens", "costMicroUsd", "completeness", "provenance"].includes(key));
   if (unknown) throw new Error(`usage contains unknown field ${unknown}`);
-  if (!["exact", "partial", "unavailable"].includes(String(usage.completeness))) throw new Error("usage completeness is invalid");
+  if (!isUsageCompleteness(usage.completeness)) throw new Error("usage completeness is invalid");
   for (const key of ["inputTokens", "outputTokens", "costMicroUsd"] as const) {
     const amount = usage[key];
     if (amount !== undefined && amount !== null && (!Number.isInteger(amount) || (amount as number) < 0)) throw new Error(`usage.${key} is invalid`);

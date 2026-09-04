@@ -1,5 +1,10 @@
 import { isAbsolute } from "node:path";
 import type { ApprovalScope, Effort } from "../domain/routing.js";
+import type {
+  UsageProvenance as CanonicalUsageProvenance,
+  UsageTelemetry as CanonicalUsageTelemetry,
+} from "../runtime/flow-telemetry.js";
+import type { ProviderSessionRef } from "../runtime/provider-telemetry.js";
 import type { CommandSpec } from "./provider-command.js";
 
 export interface CodexCommandInput {
@@ -16,26 +21,16 @@ const MODEL = "gpt-5.6-sol";
 const MAX_RESULT_BYTES = 1024 * 1024;
 const EXECUTABLE_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh"]);
 
-export type UsageProvenance = "provider_reported" | "derived" | "unavailable";
-export interface UsageTelemetry {
-  inputTokens: number | null;
-  cachedInputTokens: number | null;
-  outputTokens: number | null;
-  reasoningTokens: number | null;
-  totalTokens: number | null;
-  costUsd: number | null;
-  provenance: Record<
-    "inputTokens" | "cachedInputTokens" | "outputTokens" | "reasoningTokens" | "totalTokens" | "costUsd",
-    UsageProvenance
-  >;
-}
+export type UsageProvenance = CanonicalUsageProvenance;
+export type UsageTelemetry = CanonicalUsageTelemetry;
 
 export interface NormalizedCodexBaseResult {
   text: string;
   model: "gpt-5.6-sol";
 }
 export interface NormalizedCodexResult extends NormalizedCodexBaseResult {
-  usage: UsageTelemetry;
+  readonly usage: UsageTelemetry;
+  readonly providerSessionRef: ProviderSessionRef;
 }
 export interface NormalizedCodexEvalResult extends NormalizedCodexResult {
   modelProvenance: "command_pinned";
@@ -57,7 +52,7 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 function reportedNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  return typeof value === "number" ? value : null;
 }
 
 function usageTelemetry(source: Record<string, unknown> | null): UsageTelemetry {
@@ -151,11 +146,16 @@ export function normalizeCodexResult(
   const current = records.some((item) => item.type === "thread.started");
   const texts: string[] = [];
   let usageSource: Record<string, unknown> | null = null;
+  let providerSessionId: string;
   if (current) {
     if (records[0]?.type !== "thread.started" ||
         records.filter((item) => item.type === "thread.started").length !== 1) {
       throw new Error("incomplete Codex stream: invalid thread identity");
     }
+    if (typeof records[0].thread_id !== "string" || !records[0].thread_id.trim()) {
+      throw new Error("incomplete Codex stream: invalid thread identity");
+    }
+    providerSessionId = records[0].thread_id;
     let completed = false;
     for (const event of records.slice(1)) {
       if (completed) {
@@ -182,6 +182,10 @@ export function normalizeCodexResult(
     if (sessions.length !== 1 || sessions[0]?.model !== MODEL) {
       throw new Error(`model identity mismatch: ${String(sessions[0]?.model)}`);
     }
+    if (typeof sessions[0].id !== "string" || !sessions[0].id.trim()) {
+      throw new Error("incomplete Codex stream: invalid session identity");
+    }
+    providerSessionId = sessions[0].id;
     for (const event of records) {
       if (event.type === "response_item") {
         const payload = record(event.payload);
@@ -222,15 +226,29 @@ export function normalizeCodexResult(
       throw new Error("incomplete Codex result: missing visible text");
     }
     text = payload.visibleText;
-    return {
+    return withProviderSessionRef({
       text,
       model: MODEL,
       modelProvenance: "command_pinned",
       effort: options.expectedEffort,
       protocolVersion: options.expectedProtocolVersion,
       usage: usageTelemetry(usageSource),
-    };
+    }, providerSessionId);
   }
   const base: NormalizedCodexBaseResult = { text, model: MODEL };
-  return options?.includeUsage ? { ...base, usage: usageTelemetry(usageSource) } : base;
+  return options?.includeUsage
+    ? withProviderSessionRef({ ...base, usage: usageTelemetry(usageSource) }, providerSessionId)
+    : base;
+}
+
+function withProviderSessionRef<T extends object>(value: T, sessionId: string): T & {
+  readonly providerSessionRef: ProviderSessionRef;
+} {
+  Object.defineProperty(value, "providerSessionRef", {
+    value: Object.freeze({ value: sessionId, provenance: "provider_reported" as const }),
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return value as T & { readonly providerSessionRef: ProviderSessionRef };
 }
