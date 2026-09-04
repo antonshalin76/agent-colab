@@ -1,11 +1,15 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readlinkSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -49,6 +53,26 @@ describe("permanent legacy runtime quarantine", () => {
       XDG_RUNTIME_DIR: "/custom/runtime",
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/custom/bus",
     });
+  });
+  it("rejects non-default XDG unit paths instead of staging into a different precedence tree", () => {
+    const root = temporaryRoot();
+    const previousConfig = process.env.XDG_CONFIG_HOME;
+    const previousData = process.env.XDG_DATA_HOME;
+    process.env.XDG_CONFIG_HOME = join(root, "custom-config");
+    process.env.XDG_DATA_HOME = join(root, "custom-data");
+    try {
+      expect(() => stageReviewedWorkerService({
+        repositoryRoot: resolve("."),
+        homeDirectory: join(root, "home"),
+        backupDirectory: join(root, "backup"),
+        systemctl: () => ({ status: 0, stdout: "", stderr: "" }),
+      })).toThrow(/default HOME-scoped XDG/i);
+    } finally {
+      if (previousConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousConfig;
+      if (previousData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = previousData;
+    }
   });
   it.each([
     "worker",
@@ -177,15 +201,21 @@ describe("permanent legacy runtime quarantine", () => {
   it("keeps the legacy unit persistently masked while staging and activating a distinct reviewed unit", () => {
     const root = temporaryRoot();
     const home = join(root, "home");
-    const unitDirectory = join(home, ".config/systemd/user");
-    const legacyPath = join(unitDirectory, "agent-collab.service");
+    const configDirectory = join(home, ".config/systemd/user");
+    const dataDirectory = join(home, ".local/share/systemd/user");
+    const legacyPath = join(configDirectory, "agent-collab.service");
     const legacyDropIns = `${legacyPath}.d`;
-    const reviewedPath = join(unitDirectory, "agent-collab-reviewed.service");
+    const reviewedMaskPath = join(configDirectory, "agent-collab-reviewed.service");
+    const reviewedPath = join(dataDirectory, "agent-collab-reviewed.service");
     const backup = join(root, "backup");
     mkdirSync(legacyDropIns, { recursive: true });
     symlinkSync("/dev/null", legacyPath);
+    writeFileSync(reviewedMaskPath, "[Service]\nExecStart=/repo/dist/cli.js worker\n");
+    mkdirSync(`${reviewedMaskPath}.d`, { recursive: true });
+    mkdirSync(`${reviewedPath}.d`, { recursive: true });
+    writeFileSync(join(`${reviewedMaskPath}.d`, "config-override.conf"), "[Service]\nEnvironment=STALE=1\n");
+    writeFileSync(join(`${reviewedPath}.d`, "data-override.conf"), "[Service]\nEnvironment=STALE=2\n");
     writeFileSync(join(legacyDropIns, "override.conf"), "[Service]\nExecStart=/repo/dist/cli.js worker\n");
-    let reviewedMasked = false;
     let reviewedActive = false;
     let reviewedEnabled = false;
     const calls: string[] = [];
@@ -196,23 +226,27 @@ describe("permanent legacy runtime quarantine", () => {
         return { status: active ? 0 : 3, stdout: `${active ? "active" : "inactive"}\n`, stderr: "" };
       }
       if (args[0] === "is-enabled") {
+        const reviewedMasked = existsSync(reviewedMaskPath) && lstatSync(reviewedMaskPath).isSymbolicLink();
         return { status: reviewedEnabled ? 0 : 1,
           stdout: `${reviewedMasked ? "masked" : reviewedEnabled ? "enabled" : "disabled"}\n`, stderr: "" };
       }
       if (args[0] === "disable") { reviewedEnabled = false; reviewedActive = false; }
-      if (args[0] === "mask") reviewedMasked = true;
-      if (args[0] === "unmask") reviewedMasked = false;
+      if (args[0] === "unmask" && !args.includes("--runtime") && existsSync(reviewedMaskPath)) {
+        unlinkSync(reviewedMaskPath);
+      }
       if (args[0] === "enable") { reviewedEnabled = true; reviewedActive = args.includes("--now"); }
       if (args[0] === "show") {
         const legacy = args[1] === "agent-collab.service";
+        const reviewedMasked = existsSync(reviewedMaskPath) && lstatSync(reviewedMaskPath).isSymbolicLink();
         return {
           status: 0,
           stdout: [
-            `FragmentPath=${legacy ? legacyPath : reviewedPath}`,
+            `FragmentPath=${legacy ? legacyPath : reviewedMasked ? reviewedMaskPath : reviewedPath}`,
             `ExecStart=${legacy ? "" : `{ path=/usr/bin/env ; argv[]=/usr/bin/env node ${resolve(".")}/scripts/agent-collab-launcher.mjs review-worker ; }`}`,
             `DropInPaths=${legacy ? join(legacyDropIns, "override.conf") : ""}`,
             `LoadState=${legacy || reviewedMasked ? "masked" : "loaded"}`,
             `ActiveState=${reviewedActive ? "active" : "inactive"}`,
+            `UnitFileState=${legacy || reviewedMasked ? "masked" : reviewedEnabled ? "enabled" : "disabled"}`,
           ].join("\n") + "\n",
           stderr: "",
         };
@@ -228,6 +262,16 @@ describe("permanent legacy runtime quarantine", () => {
     });
     expect(staged).toMatchObject({ status: "staged_masked", fragmentPath: reviewedPath, loadState: "masked" });
     expect(readFileSync(reviewedPath)).toEqual(readFileSync("systemd/agent-collab.service"));
+    expect(readlinkSync(reviewedMaskPath)).toBe("/dev/null");
+    expect(readFileSync(join(backup, "previous-config-agent-collab-reviewed.service"), "utf8"))
+      .toContain("dist/cli.js worker");
+    expect(existsSync(`${reviewedMaskPath}.d`)).toBe(false);
+    expect(existsSync(`${reviewedPath}.d`)).toBe(false);
+    for (const layer of ["config", "data"] as const) {
+      expect(existsSync(join(backup, `snapshot-${layer}-agent-collab-reviewed.service.d`))).toBe(true);
+      expect(existsSync(join(backup, `removed-${layer}-agent-collab-reviewed.service.d`))).toBe(true);
+    }
+    expect(statSync(join(configDirectory, "agent-collab-reviewed.cutover.lock")).mode & 0o777).toBe(0o600);
     expect(readFileSync(legacyPath).length).toBe(0);
     expect(readFileSync(join(legacyDropIns, "override.conf"), "utf8")).toContain("dist/cli.js worker");
     expect(calls).not.toContain("unmask agent-collab.service");
@@ -241,21 +285,24 @@ describe("permanent legacy runtime quarantine", () => {
     expect(reviewedEnabled).toBe(true);
     expect(reviewedActive).toBe(true);
     expect(calls).toContain("daemon-reload");
-    expect(calls).toContain("mask --runtime agent-collab-reviewed.service");
     expect(calls).toContain("unmask --runtime agent-collab-reviewed.service");
+    expect(calls).toContain("unmask agent-collab-reviewed.service");
     expect(calls).toContain("enable --now agent-collab-reviewed.service");
   });
 
-  it("restores the runtime mask when post-unmask activation verification fails", () => {
+  it("restores the persistent mask when post-unmask activation verification fails", () => {
     const root = temporaryRoot();
     const home = join(root, "home");
-    const unitDirectory = join(home, ".config/systemd/user");
-    const legacyPath = join(unitDirectory, "agent-collab.service");
-    const unitPath = join(unitDirectory, "agent-collab-reviewed.service");
-    mkdirSync(unitDirectory, { recursive: true });
+    const configDirectory = join(home, ".config/systemd/user");
+    const dataDirectory = join(home, ".local/share/systemd/user");
+    const legacyPath = join(configDirectory, "agent-collab.service");
+    const maskPath = join(configDirectory, "agent-collab-reviewed.service");
+    const unitPath = join(dataDirectory, "agent-collab-reviewed.service");
+    mkdirSync(configDirectory, { recursive: true });
+    mkdirSync(dataDirectory, { recursive: true });
     symlinkSync("/dev/null", legacyPath);
+    symlinkSync("/dev/null", maskPath);
     writeFileSync(unitPath, readFileSync("systemd/agent-collab.service"));
-    let masked = true;
     let enabled = false;
     const calls: string[] = [];
     const systemctl: SystemctlRunner = (args) => {
@@ -264,21 +311,23 @@ describe("permanent legacy runtime quarantine", () => {
         return { status: 3, stdout: "inactive\n", stderr: "" };
       }
       if (args[0] === "is-enabled") {
+        const masked = existsSync(maskPath) && lstatSync(maskPath).isSymbolicLink();
         return { status: enabled ? 0 : 1, stdout: `${masked ? "masked" : enabled ? "enabled" : "disabled"}\n`, stderr: "" };
       }
       if (args[0] === "disable") enabled = false;
-      if (args[0] === "unmask") masked = false;
-      if (args[0] === "mask") masked = true;
+      if (args[0] === "unmask" && !args.includes("--runtime") && existsSync(maskPath)) unlinkSync(maskPath);
       if (args[0] === "show") {
         const legacy = args[1] === "agent-collab.service";
+        const masked = existsSync(maskPath) && lstatSync(maskPath).isSymbolicLink();
         return {
           status: 0,
           stdout: [
-            `FragmentPath=${legacy ? legacyPath : unitPath}`,
+            `FragmentPath=${legacy ? legacyPath : masked ? maskPath : unitPath}`,
             `ExecStart=${legacy || masked ? "" : "/repo/dist/cli.js worker"}`,
             "DropInPaths=",
             `LoadState=${legacy || masked ? "masked" : "loaded"}`,
             "ActiveState=inactive",
+            `UnitFileState=${legacy || masked ? "masked" : enabled ? "enabled" : "disabled"}`,
           ].join("\n") + "\n",
           stderr: "",
         };
@@ -291,31 +340,123 @@ describe("permanent legacy runtime quarantine", () => {
       homeDirectory: home,
       systemctl,
     })).toThrow(/exact review-only source launcher/i);
-    expect(masked).toBe(true);
+    expect(readlinkSync(maskPath)).toBe("/dev/null");
+    expect(calls).toContain("disable --now agent-collab-reviewed.service");
+    expect(calls).toContain("unmask --runtime agent-collab-reviewed.service");
     expect(calls.slice(-3)).toEqual([
-      "disable --now agent-collab-reviewed.service",
-      "mask --runtime agent-collab-reviewed.service",
-      "daemon-reload",
+      "is-active agent-collab-reviewed.service",
+      "is-enabled agent-collab-reviewed.service",
+      "show agent-collab-reviewed.service --property=FragmentPath --property=ExecStart --property=DropInPaths --property=LoadState --property=ActiveState --property=UnitFileState",
     ]);
     expect(readFileSync(legacyPath).length).toBe(0);
   });
 
-  it("runtime-masks the reviewed unit when staging fails immediately after disable", () => {
+  it("reports incomplete rollback when the manager remains active behind a filesystem mask", () => {
+    const root = temporaryRoot();
+    const home = join(root, "home");
+    const configDirectory = join(home, ".config/systemd/user");
+    const dataDirectory = join(home, ".local/share/systemd/user");
+    const legacyPath = join(configDirectory, "agent-collab.service");
+    const maskPath = join(configDirectory, "agent-collab-reviewed.service");
+    const unitPath = join(dataDirectory, "agent-collab-reviewed.service");
+    mkdirSync(configDirectory, { recursive: true });
+    mkdirSync(dataDirectory, { recursive: true });
+    symlinkSync("/dev/null", legacyPath);
+    symlinkSync("/dev/null", maskPath);
+    writeFileSync(unitPath, readFileSync("systemd/agent-collab.service"));
+    let rollbackStarted = false;
+    const systemctl: SystemctlRunner = (args) => {
+      const legacy = args[1] === "agent-collab.service";
+      const masked = existsSync(maskPath) && lstatSync(maskPath).isSymbolicLink();
+      if (args[0] === "disable") {
+        rollbackStarted = true;
+        return { status: 1, stdout: "", stderr: "stop failed" };
+      }
+      if (args[0] === "unmask" && !args.includes("--runtime") && existsSync(maskPath)) unlinkSync(maskPath);
+      if (args[0] === "is-active") {
+        const active = !legacy && rollbackStarted;
+        return { status: active ? 0 : 3, stdout: `${active ? "active" : "inactive"}\n`, stderr: "" };
+      }
+      if (args[0] === "is-enabled") {
+        return { status: 1, stdout: `${masked ? "masked" : "disabled"}\n`, stderr: "" };
+      }
+      if (args[0] === "show") {
+        return { status: 0, stdout: [
+          `FragmentPath=${legacy ? legacyPath : masked ? maskPath : unitPath}`,
+          `ExecStart=${legacy || masked ? "" : "/repo/dist/cli.js worker"}`,
+          "DropInPaths=",
+          `LoadState=${legacy || masked ? "masked" : "loaded"}`,
+          `ActiveState=${!legacy && rollbackStarted ? "active" : "inactive"}`,
+          `UnitFileState=${legacy || masked ? "masked" : "disabled"}`,
+        ].join("\n") + "\n", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    let failure: unknown;
+    try {
+      activateReviewedWorkerService({ repositoryRoot: resolve("."), homeDirectory: home, systemctl });
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(String(failure)).toMatch(/persistent activation mask could not be fully restored/i);
+    expect((failure as AggregateError).errors.map(String).join("\n")).toMatch(/must be inactive/i);
+    expect(readlinkSync(maskPath)).toBe("/dev/null");
+  });
+
+  it("compensates the post-disable pre-mask fault boundary with a verified persistent mask", () => {
+    const root = temporaryRoot();
+    const home = join(root, "home");
+    const configDirectory = join(home, ".config/systemd/user");
+    const legacyPath = join(configDirectory, "agent-collab.service");
+    const maskPath = join(configDirectory, "agent-collab-reviewed.service");
+    mkdirSync(configDirectory, { recursive: true });
+    symlinkSync("/dev/null", legacyPath);
+    const systemctl: SystemctlRunner = (args) => {
+      const legacy = args[1] === "agent-collab.service";
+      const masked = existsSync(maskPath) && lstatSync(maskPath).isSymbolicLink();
+      if (args[0] === "is-active") return { status: 3, stdout: "inactive\n", stderr: "" };
+      if (args[0] === "is-enabled") {
+        return { status: 1, stdout: `${masked ? "masked" : "disabled"}\n`, stderr: "" };
+      }
+      if (args[0] === "show") return { status: 0, stdout: [
+        `FragmentPath=${legacy ? legacyPath : masked ? maskPath : ""}`,
+        "ExecStart=",
+        "DropInPaths=",
+        `LoadState=${legacy || masked ? "masked" : "not-found"}`,
+        "ActiveState=inactive",
+        `UnitFileState=${legacy || masked ? "masked" : ""}`,
+      ].join("\n") + "\n", stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    expect(() => stageReviewedWorkerService({
+      repositoryRoot: resolve("."),
+      homeDirectory: home,
+      backupDirectory: join(root, "backup"),
+      systemctl,
+      faultInjector: (point) => {
+        if (point === "after_reviewed_disabled") throw new Error("injected post-disable fault");
+      },
+    })).toThrow(/injected post-disable fault/i);
+    expect(readlinkSync(maskPath)).toBe("/dev/null");
+  });
+
+  it("persistently masks the reviewed unit when staging fails before backup creation", () => {
     const root = temporaryRoot();
     const home = join(root, "home");
     const unitDirectory = join(home, ".config/systemd/user");
     const legacyPath = join(unitDirectory, "agent-collab.service");
+    const maskPath = join(unitDirectory, "agent-collab-reviewed.service");
     mkdirSync(unitDirectory, { recursive: true });
     symlinkSync("/dev/null", legacyPath);
-    let masked = false;
     const calls: string[] = [];
     const systemctl: SystemctlRunner = (args) => {
       calls.push(args.join(" "));
       if (args[0] === "is-active") return { status: 3, stdout: "inactive\n", stderr: "" };
       if (args[0] === "is-enabled") {
+        const masked = existsSync(maskPath) && lstatSync(maskPath).isSymbolicLink();
         return { status: 1, stdout: `${masked ? "masked" : "disabled"}\n`, stderr: "" };
       }
-      if (args[0] === "mask") masked = true;
       if (args[0] === "show") {
         return { status: 0, stdout: [
           `FragmentPath=${legacyPath}`,
@@ -323,6 +464,7 @@ describe("permanent legacy runtime quarantine", () => {
           "DropInPaths=",
           "LoadState=masked",
           "ActiveState=inactive",
+          "UnitFileState=masked",
         ].join("\n") + "\n", stderr: "" };
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -334,11 +476,13 @@ describe("permanent legacy runtime quarantine", () => {
       backupDirectory: root,
       systemctl,
     })).toThrow(/backup directory.*nonexistent/i);
-    expect(masked).toBe(true);
+    expect(readlinkSync(maskPath)).toBe("/dev/null");
+    expect(calls).toContain("disable --now agent-collab-reviewed.service");
+    expect(calls).toContain("unmask --runtime agent-collab-reviewed.service");
     expect(calls.slice(-3)).toEqual([
-      "disable --now agent-collab-reviewed.service",
-      "mask --runtime agent-collab-reviewed.service",
-      "daemon-reload",
+      "is-active agent-collab-reviewed.service",
+      "is-enabled agent-collab-reviewed.service",
+      "show agent-collab-reviewed.service --property=FragmentPath --property=ExecStart --property=DropInPaths --property=LoadState --property=ActiveState --property=UnitFileState",
     ]);
     expect(readFileSync(legacyPath).length).toBe(0);
   });

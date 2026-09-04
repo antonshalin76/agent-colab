@@ -56,7 +56,7 @@ Install and start the worker after copying and reviewing the supplied unit:
 ```bash
 systemctl --user mask agent-collab.service
 install -Dm600 systemd/agent-collab.service \
-  "$HOME/.config/systemd/user/agent-collab-reviewed.service"
+  "$HOME/.local/share/systemd/user/agent-collab-reviewed.service"
 systemctl --user daemon-reload
 systemctl --user enable --now agent-collab-reviewed.service
 systemctl --user is-active agent-collab-reviewed.service
@@ -94,7 +94,8 @@ This sequence is for an existing v3 state and v2 history database. Do not use
    repository.
 4. Stop both unit names, keep the legacy unit persistently `/dev/null`-masked,
    terminate harness-spawned MCP processes, and stage the distinct reviewed unit.
-5. Adopt, preflight and prepare while the reviewed unit remains runtime-masked.
+5. Adopt, preflight and prepare while the reviewed unit remains persistently
+   activation-masked by its higher-precedence configuration entry.
 6. Verify `PROJECTION_CURRENT`; activate only through the reviewed-unit gate.
 
 Create the signing key once and retain it outside the repository:
@@ -158,9 +159,11 @@ source or target is rejected.
 `review-service-stage` never unmasks or replaces `agent-collab.service`; that
 legacy name must remain a persistent `/dev/null` mask, including across reboot.
 It disables the separate `agent-collab-reviewed.service`, atomically installs
-the exact reviewed unit, reloads systemd, rejects a legacy effective `ExecStart`
-or any reviewed-unit drop-in, and applies a runtime mask. The reviewed unit is
-part of the signed source manifest.
+the exact reviewed unit under `~/.local/share/systemd/user`, reloads systemd,
+rejects a legacy effective `ExecStart` or any reviewed-unit drop-in, and places
+a persistent `/dev/null` activation mask under the higher-precedence
+`~/.config/systemd/user`. Both stage and activation use one exclusive cutover
+lock. The reviewed unit is part of the signed source manifest.
 
 Only after status reports `PROJECTION_CURRENT`, activate through the same gate:
 
@@ -171,8 +174,10 @@ npm start -- status
 
 The activation command repeats the source-byte, legacy persistent-mask and
 effective systemd checks, requires exact STG-04 state, removes only the reviewed
-unit's runtime mask, enables and starts that unit, and disables/remasks it if
-startup fails. Do not manually unmask or start either unit during cutover.
+unit's persistent activation mask, reloads and verifies that the effective
+fragment is exactly the lower-precedence signed unit, then enables and starts
+it. Any failure disables and persistently remasks the reviewed name. Do not
+manually unmask or start either unit during cutover.
 
 Then restart the harnesses, verify MCP discovery, and submit one bounded
 Codex-originated read-only review smoke. Do not use the paid benchmark as a

@@ -126,7 +126,9 @@ npm start -- review-worker
 
 On Linux with systemd user services, adapt `systemd/agent-collab.service` to
 your checkout path, Node path, CLI paths, and state directory, then install it
-as the `agent-collab-reviewed.service` user unit.
+as `$HOME/.local/share/systemd/user/agent-collab-reviewed.service`. Production
+migration keeps a higher-precedence persistent mask in
+`$HOME/.config/systemd/user` until the exact activation gate passes.
 
 The legacy `mcp`, `worker`, `start-normal`, and `prove-normal` runtime routes are
 permanently quarantined. They cannot be enabled through the stable dispatcher or

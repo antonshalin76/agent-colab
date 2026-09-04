@@ -133,7 +133,9 @@ npm start -- review-worker
 В Linux с пользовательскими systemd services адаптируйте
 `systemd/agent-collab.service`: задайте пути к checkout, Node, CLI и каталогу
 состояния, затем установите его как пользовательский unit
-`agent-collab-reviewed.service`.
+`$HOME/.local/share/systemd/user/agent-collab-reviewed.service`. При production
+миграции путь в `$HOME/.config/systemd/user` остается высокоприоритетной
+постоянной маской до прохождения точного activation gate.
 
 Устаревшие runtime-маршруты `mcp`, `worker`, `start-normal` и `prove-normal`
 навсегда помещены в карантин. Их нельзя включить через stable dispatcher или
