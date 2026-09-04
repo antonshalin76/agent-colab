@@ -8,6 +8,7 @@ export class ImplementationProgressProjector {
   readonly #files: ImplementationProgressProjectionFiles;
   readonly #durability: StateFileDurability;
   readonly #faultInjector: ((point: string) => void) | undefined;
+  #closed = false;
 
   constructor(input: {
     readonly store: ImplementationProgressStore;
@@ -30,6 +31,7 @@ export class ImplementationProgressProjector {
     jsonlPath: string;
     markdownPath: string;
   } {
+    if (this.#closed) throw new Error("implementation progress projector is closed");
     return this.#durability.withExclusiveLock({
       lockBasename: "implementation-progress-projection.lock",
       faultPoints: { beforeAcquire: "before_projection_lock_acquire" },
@@ -59,5 +61,11 @@ export class ImplementationProgressProjector {
         ...paths,
       };
     });
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#durability.close();
   }
 }

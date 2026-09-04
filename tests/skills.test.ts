@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { auditSharedSkills } from "../src/skills/audit.js";
+import { linkReviewHarnessSkills } from "../src/skills/setup.js";
+import { inspectReviewReadiness } from "../src/app/review-readiness-service.js";
 
 const roots: string[] = [];
 
@@ -167,5 +169,77 @@ describe("BDD-2/12 canonical shared skills", () => {
         target: missingCodexRoot,
       },
     ]);
+  });
+});
+
+describe("review harness shared-skill setup", () => {
+  it("links a Codex-only fresh home idempotently without requiring optional harnesses", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const agentRoots = {
+      grok: join(root, ".grok", "skills"),
+      claude: join(root, ".claude", "skills"),
+      codex: join(root, ".codex", "skills"),
+    };
+    mkdirSync(canonicalRoot);
+    writeSkill(canonicalRoot, "agent-collaboration", "# Collaboration\n");
+
+    expect(linkReviewHarnessSkills({ canonicalRoot, agentRoots, agents: ["codex"] }))
+      .toEqual([{ agent: "codex", path: agentRoots.codex, status: "created" }]);
+    expect(linkReviewHarnessSkills({ canonicalRoot, agentRoots, agents: ["codex"] }))
+      .toEqual([{ agent: "codex", path: agentRoots.codex, status: "already_current" }]);
+
+    const audit = auditSharedSkills({ canonicalRoot, agentRoots });
+    expect(audit.agents.codex.resolvedRoot).toBe(realpathSync(canonicalRoot));
+    expect(audit.agents.grok.resolvedRoot).toBeNull();
+    expect(audit.agents.claude.resolvedRoot).toBeNull();
+  });
+
+  it("never replaces a conflicting destination or accepts a missing required skill", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const conflict = join(root, ".codex", "skills");
+    const agentRoots = {
+      grok: join(root, ".grok", "skills"),
+      claude: join(root, ".claude", "skills"),
+      codex: conflict,
+    };
+    mkdirSync(canonicalRoot);
+    expect(() => linkReviewHarnessSkills({ canonicalRoot, agentRoots, agents: ["codex"] }))
+      .toThrow(/missing required skill/i);
+    writeSkill(canonicalRoot, "agent-collaboration", "# Collaboration\n");
+    mkdirSync(conflict, { recursive: true });
+    expect(() => linkReviewHarnessSkills({ canonicalRoot, agentRoots, agents: ["codex"] }))
+      .toThrow(/conflicts/i);
+    expect(realpathSync(conflict)).toBe(conflict);
+  });
+
+  it("reports a usable Codex-only topology while optional harnesses remain degraded", () => {
+    const root = makeRoot();
+    const canonicalRoot = join(root, "canonical");
+    const agentRoots = {
+      grok: join(root, ".grok", "skills"),
+      claude: join(root, ".claude", "skills"),
+      codex: join(root, ".codex", "skills"),
+    };
+    const codexBinary = join(root, "codex");
+    mkdirSync(canonicalRoot);
+    writeSkill(canonicalRoot, "agent-collaboration", "# Collaboration\n");
+    writeFileSync(codexBinary, "#!/bin/sh\n", { mode: 0o700 });
+    linkReviewHarnessSkills({ canonicalRoot, agentRoots, agents: ["codex"] });
+
+    expect(inspectReviewReadiness({
+      canonicalSkillRoot: canonicalRoot,
+      agentSkillRoots: agentRoots,
+      binaries: { grok: join(root, "missing-grok"), claude: join(root, "missing-claude"), codex: codexBinary },
+    })).toMatchObject({
+      readyForCodexOnly: true,
+      degradedOptionalProviders: ["grok", "claude"],
+      providers: {
+        codex: { required: true, ready: true },
+        grok: { required: false, ready: false },
+        claude: { required: false, ready: false },
+      },
+    });
   });
 });

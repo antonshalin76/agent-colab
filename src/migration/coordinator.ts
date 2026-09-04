@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   closeSync,
   chmodSync,
@@ -37,6 +37,13 @@ import {
 } from "../store/state-database-fence.js";
 import { canonicalJson } from "../workflow/flow-contract.js";
 import {
+  loadVerifiedMigrationProgressBundle,
+  type VerifiedProgressBundle,
+} from "../flow/implementation-progress-package-verifier.js";
+export {
+  bindVerifiedProgressEvents as bindRereadProgressEvents,
+} from "../flow/implementation-progress-package-verifier.js";
+import {
   assertReviewV3SchemaSignature,
   extendReviewV3SchemaOffline,
   type ReviewV3FaultPoint,
@@ -71,7 +78,6 @@ import {
   retiredStateV4Descriptors,
   writeActiveStateV4GuardDescriptor,
 } from "./state-v4-restore-authority.js";
-
 export {
   prepareRollbackBundle,
   restoreV1Bundle,
@@ -194,6 +200,7 @@ export interface MigrationCoordinatorOptions {
   faultInjector?: (point: MigrationFaultPoint) => void;
   backupDirectory?: string;
   repositoryRoot?: string;
+  gitRoot?: string;
   progressPackagePath?: string;
 }
 
@@ -674,117 +681,6 @@ const adoptablePreDescriptorArtifacts = (input: {
   if (matches.length > 1) throw new Error("multiple pre-descriptor state-v4 backups require operator reconciliation");
   const backupPath = matches[0];
   return backupPath ? { backupPath, tableDigestManifestPath: `${backupPath}.manifest.json` } : undefined;
-};
-
-interface VerifiedProgressEvent {
-  planId: string;
-  sequence: number;
-  eventId: string;
-  startSha256: string;
-  previousEventSha256: string;
-  effectivePlanSha256: string;
-  eventSha256: string;
-  recordedAt: string;
-  eventJson: string;
-}
-
-interface VerifiedProgressBundle {
-  events: VerifiedProgressEvent[];
-  lastEventSha256: string;
-}
-
-interface ProgressVerificationSummary {
-  startSha256: string;
-  progressEventCount: number;
-  lastEventSha256: string;
-  events: Array<{ stageId: string; terminalResult: string; eventSha256: string }>;
-  migrationSeedSha256?: string;
-}
-
-const STATE_V4_PROGRESS_SEED_FILE = "STATE_V4_PROGRESS_SEED.json";
-const STATE_V4_PROGRESS_SEED_SHA256 = "741d67139b3171d5e3d678e37de09385ccc7d0bd8058d9b8d8629a27a0b22cb7";
-const STATE_V4_REVIEWED_COMMIT = "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50";
-const STATE_V4_REVIEWED_TREE = "955260b898f2465b72ecaabcb43b1453a15e3ebc";
-const STATE_V4_PROGRESS_SEED_EVENTS = [
-  "000001-r2-stg-00-pass.json",
-  "000002-stg-01-pass.json",
-  "000003-stg-02-pass.json",
-] as const;
-
-export function bindRereadProgressEvents(
-  verification: ProgressVerificationSummary,
-  eventPayloads: readonly string[],
-): VerifiedProgressBundle {
-  if (eventPayloads.length !== verification.progressEventCount) {
-    throw new Error("pre-v4 progress inventory changed after verification");
-  }
-  let previousEventSha256 = verification.startSha256;
-  const events = eventPayloads.map((payload, offset) => {
-    const event = JSON.parse(payload) as VerifiedProgressEvent;
-    const digestInput = { ...event } as Record<string, unknown>;
-    delete digestInput.eventSha256;
-    const rereadDigest = sha256Bytes(canonicalJson(digestInput));
-    if (event.sequence !== offset + 1 || event.previousEventSha256 !== previousEventSha256 ||
-        event.eventSha256 !== rereadDigest || rereadDigest !== verification.events[offset]?.eventSha256) {
-      throw new Error("pre-v4 progress bytes changed after verification");
-    }
-    previousEventSha256 = rereadDigest;
-    return { ...event, eventJson: canonicalJson(event) };
-  });
-  if (previousEventSha256 !== verification.lastEventSha256 ||
-      events.at(-1)?.eventSha256 !== verification.lastEventSha256) {
-    throw new Error("pre-v4 progress terminal hash changed after verification");
-  }
-  return { events, lastEventSha256: verification.lastEventSha256 };
-}
-
-const loadVerifiedProgressBundle = (
-  repositoryRoot: string,
-  progressPackagePath: string,
-  faultInjector?: (point: MigrationFaultPoint) => void,
-): VerifiedProgressBundle => {
-  const packageRoot = resolve(repositoryRoot, progressPackagePath);
-  const packageArgument = relative(repositoryRoot, packageRoot);
-  if (packageArgument.startsWith("..")) throw new Error("progress package is outside repository root");
-  const migrationSeedPath = resolve(packageRoot, STATE_V4_PROGRESS_SEED_FILE);
-  const hasMigrationSeedManifest = existsSync(migrationSeedPath);
-  if (!hasMigrationSeedManifest) {
-    const sourceCommit = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    const sourceTree = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
-    if (sourceCommit !== STATE_V4_REVIEWED_COMMIT || sourceTree !== STATE_V4_REVIEWED_TREE) {
-      throw new Error("state-v4 progress seed manifest is missing outside the exact reviewed source");
-    }
-  }
-  const verificationArgs = [
-    resolve(repositoryRoot, "scripts/verify-implementation-progress.mjs"),
-    "--root", repositoryRoot,
-    "--git-root", repositoryRoot,
-    "--package", packageArgument,
-  ];
-  if (hasMigrationSeedManifest) {
-    verificationArgs.push("--migration-seed", relative(repositoryRoot, migrationSeedPath));
-  }
-  const verification = JSON.parse(execFileSync(process.execPath, verificationArgs, {
-    cwd: repositoryRoot,
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-  })) as ProgressVerificationSummary & {
-    status: string;
-  };
-  if (verification.status !== "verified" || verification.progressEventCount !== 3 ||
-      (hasMigrationSeedManifest
-        ? verification.migrationSeedSha256 !== STATE_V4_PROGRESS_SEED_SHA256
-        : verification.migrationSeedSha256 !== undefined) ||
-      verification.events.at(-1)?.stageId !== "STG-02" ||
-      verification.events.at(-1)?.terminalResult !== "PASS") {
-    throw new Error("verified pre-v4 progress chain must end at STG-02 PASS");
-  }
-  faultInjector?.("after_v4_progress_verify");
-  const progressRoot = resolve(packageRoot, "stage-close/pre-v4");
-  return bindRereadProgressEvents(
-    verification,
-    STATE_V4_PROGRESS_SEED_EVENTS.map((name) => readFileSync(resolve(progressRoot, name), "utf8")),
-  );
 };
 
 export function restoreStateV4Backup(input: {
@@ -1788,6 +1684,7 @@ export class MigrationCoordinator {
       ...(options.backupDirectory ? { backupDirectory: resolve(options.backupDirectory) } : {}),
       ...(options.faultInjector ? { faultInjector: options.faultInjector } : {}),
       repositoryRoot: resolve(options.repositoryRoot ?? process.cwd()),
+      gitRoot: resolve(options.gitRoot ?? options.repositoryRoot ?? process.cwd()),
       progressPackagePath: options.progressPackagePath ?? "docs/hybrid-flow-v1-r2",
     };
   }
@@ -1807,11 +1704,7 @@ export class MigrationCoordinator {
   }
 
   extendReviewV3SchemaOffline(): void {
-    const lease = this.acquireExclusiveStateRoot();
-    try {
-      this.extendReviewV3SchemaOfflineLocked(join(lease.pinnedRoot, basename(this.options.stateDatabase)));
-      lease.assertCurrent();
-    } finally { lease.release(); }
+    throw new Error("standalone review schema extension is disabled; use the reviewed v4 transition");
   }
 
   private extendReviewV3SchemaOfflineLocked(stateDatabase: string): void {
@@ -1947,13 +1840,15 @@ export class MigrationCoordinator {
     }
   }
 
-  migrateToV4(): MigrationResult {
+  /** @internal Called only by the reviewed v4 kernel composition. */
+  protected migrateReviewedV4Internal(): MigrationResult {
     const lease = this.acquireExclusiveStateRoot();
     try {
       const result = this.migrateToV4Locked(
         join(lease.pinnedRoot, basename(this.options.stateDatabase)),
         join(lease.pinnedRoot, basename(this.options.historyDatabase)),
       );
+      this.extendReviewV3SchemaOfflineLocked(join(lease.pinnedRoot, basename(this.options.stateDatabase)));
       lease.assertCurrent();
       return result;
     } finally {
@@ -1965,7 +1860,14 @@ export class MigrationCoordinator {
     const repositoryRoot = this.options.repositoryRoot!;
     const progressPackagePath = this.options.progressPackagePath!;
     const graphDdl = loadGraphV4Ddl(repositoryRoot);
-    const progress = loadVerifiedProgressBundle(repositoryRoot, progressPackagePath, this.options.faultInjector);
+    const progress = loadVerifiedMigrationProgressBundle({
+      repositoryRoot,
+      gitRoot: this.options.gitRoot!,
+      progressPackagePath,
+      ...(this.options.faultInjector
+        ? { afterVerify: () => this.options.faultInjector?.("after_v4_progress_verify") }
+        : {}),
+    });
     const state = new Database(stateDatabase);
     const history = new Database(historyDatabase, { readonly: true });
     state.pragma("foreign_keys = ON");

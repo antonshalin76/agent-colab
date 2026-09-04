@@ -32,14 +32,23 @@ export interface DomainEffectEnvelope {
 type DbRow = Record<string, unknown>;
 const parse = (value: unknown) => value == null ? undefined : JSON.parse(String(value));
 
+export type RunStoreScope = "all" | "review";
+export interface RunStoreOptions { scope?: RunStoreScope }
+
 export class RunStore {
   protected readonly db: Database.Database;
   private readonly closeAccess: () => void;
-  constructor(pathOrDatabase: StateStoreInput) {
+  private readonly scope: RunStoreScope;
+  constructor(pathOrDatabase: StateStoreInput, options: RunStoreOptions = {}) {
     const opened = openStateStoreAccess(pathOrDatabase);
     try {
       this.db = opened.access.database;
       this.closeAccess = opened.close;
+      const scope = options.scope ?? "all";
+      if (scope !== "all" && scope !== "review") {
+        throw new Error("run store scope is invalid");
+      }
+      this.scope = scope;
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("busy_timeout = 5000");
       const columns = new Set((this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((column) => column.name));
@@ -73,7 +82,48 @@ export class RunStore {
       dependsOnRunId: row.depends_on_run_id == null ? undefined : String(row.depends_on_run_id),
     };
   }
+  private exactReviewLink(runTable: "runs" | "r"): string {
+    return `EXISTS (SELECT 1 FROM runtime_review_lane_attempts scope_attempt
+          JOIN runtime_review_barriers scope_barrier
+            ON scope_barrier.review_id=scope_attempt.review_id
+          WHERE scope_attempt.run_id=${runTable}.id
+            AND ${runTable}.stage=('review:' || scope_attempt.role)
+            AND ${runTable}.approval_scope='workspace-read'
+            AND ${runTable}.approval_scope IS scope_barrier.approval_scope
+            AND ${runTable}.artifact_hash IS scope_barrier.artifact_hash
+            AND json_extract(${runTable}.payload, '$.reviewId') IS scope_attempt.review_id
+            AND json_extract(${runTable}.payload, '$.reviewRole') IS scope_attempt.role
+            AND json_extract(${runTable}.payload, '$.decision.agent') IS scope_attempt.agent
+            AND json_extract(${runTable}.payload, '$.approvalScope') IS scope_barrier.approval_scope
+            AND json_extract(${runTable}.payload, '$.artifactHash') IS scope_barrier.artifact_hash
+            AND (scope_attempt.attempt_id IS NULL OR (
+              json_extract(${runTable}.payload, '$.reviewAttemptId') IS scope_attempt.attempt_id
+              AND json_extract(${runTable}.payload, '$.reviewAttemptOrdinal') IS scope_attempt.attempt_ordinal
+              AND json_extract(${runTable}.payload, '$.reviewDispatchIdentity.attemptId') IS scope_attempt.attempt_id
+              AND json_extract(${runTable}.payload, '$.reviewDispatchIdentity.attemptOrdinal') IS scope_attempt.attempt_ordinal
+              AND json_extract(${runTable}.payload, '$.reviewDispatchIdentity.agent') IS scope_attempt.agent
+            )))`;
+  }
+  private linkedReviewPredicate(runTable: "runs" | "r"): string {
+    return this.scope === "review"
+      ? `AND ${this.exactReviewLink(runTable)}`
+      : "";
+  }
+  private assertReviewMutationTarget(id: string): void {
+    if (this.scope !== "review") return;
+    const exact = this.db.prepare(`SELECT 1 FROM runs r WHERE r.id=?
+      AND ${this.exactReviewLink("r")}`).get(id);
+    if (!exact) {
+      throw new Error("review scope cannot mutate a run outside its exact linked review tuple");
+    }
+  }
+  private rejectReviewQueueMutation(operation: string): void {
+    if (this.scope === "review") {
+      throw new Error(`review scope cannot ${operation}; review runs are created by the review authority`);
+    }
+  }
   enqueue(input: EnqueueInput): RunRecord {
+    this.rejectReviewQueueMutation("enqueue runs");
     const existing = this.db.prepare("SELECT * FROM runs WHERE idempotency_key = ?").get(input.idempotencyKey) as DbRow | undefined;
     if (existing) return this.record(existing)!;
     const now = input.now ?? Date.now(); const id = randomUUID();
@@ -102,25 +152,39 @@ export class RunStore {
     }
     return run;
   }
-  get(id: string): RunRecord | undefined { return this.record(this.db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as DbRow | undefined); }
-  getByIdempotencyKey(key: string): RunRecord | undefined {
-    return this.record(this.db.prepare("SELECT * FROM runs WHERE idempotency_key = ?").get(key) as DbRow | undefined);
+  get(id: string): RunRecord | undefined {
+    return this.record(this.db.prepare(`SELECT * FROM runs WHERE id = ?
+      ${this.linkedReviewPredicate("runs")}`).get(id) as DbRow | undefined);
   }
-  list(): RunRecord[] { return (this.db.prepare("SELECT * FROM runs ORDER BY created_at,id").all() as DbRow[]).map((row) => this.record(row)!); }
+  getByIdempotencyKey(key: string): RunRecord | undefined {
+    return this.record(this.db.prepare(`SELECT * FROM runs WHERE idempotency_key = ?
+      ${this.linkedReviewPredicate("runs")}`).get(key) as DbRow | undefined);
+  }
+  list(): RunRecord[] {
+    return (this.db.prepare(`SELECT * FROM runs WHERE 1=1
+      ${this.linkedReviewPredicate("runs")} ORDER BY created_at,id`).all() as DbRow[])
+      .map((row) => this.record(row)!);
+  }
   pendingDomainEffects(now = Date.now()): RunRecord[] {
     return (this.db.prepare(`SELECT * FROM runs
       WHERE status IN ('completed','failed')
         AND (json_extract(result, '$.domainEffect') = 'pending'
           OR (json_extract(result, '$.domainEffect') = 'applying'
             AND json_extract(result, '$.replayLease.expiresAt') <= ?))
+        ${this.linkedReviewPredicate("runs")}
       ORDER BY created_at,id`).all(now) as DbRow[]).map((row) => this.record(row)!);
   }
   needsReconciliation(): RunRecord[] {
-    return (this.db.prepare("SELECT * FROM runs WHERE status='needs_reconciliation' ORDER BY created_at,id").all() as DbRow[])
+    return (this.db.prepare(`SELECT * FROM runs WHERE status='needs_reconciliation'
+      ${this.linkedReviewPredicate("runs")} ORDER BY created_at,id`).all() as DbRow[])
       .map((row) => this.record(row)!);
   }
   claimNext(input: { workerId: string; leaseMs: number; now?: number }): RunRecord | undefined {
     const now = input.now ?? Date.now();
+    const scopePredicate = this.scope === "review"
+      ? `AND r.stage LIKE 'review:%'
+        ${this.linkedReviewPredicate("r")}`
+      : "";
     return this.db.transaction(() => {
       this.db.prepare(`UPDATE runs SET status='needs_reconciliation',lease_token=NULL,
           lease_expires_at=NULL,worker_id=NULL
@@ -156,9 +220,10 @@ export class RunStore {
               OR json_extract(runs.payload,'$.reviewDispatchIdentity.attemptId') IS NOT a.attempt_id
               OR json_extract(runs.payload,'$.reviewDispatchIdentity.attemptOrdinal') IS NOT a.attempt_ordinal
               OR json_extract(runs.payload,'$.reviewDispatchIdentity.agent') IS NOT a.agent)
-        )`).run();
+        ) ${this.linkedReviewPredicate("runs")}`).run();
       const candidate = this.db.prepare(`SELECT id FROM runs r WHERE status='queued' AND next_attempt_at <= ?
         AND (depends_on_run_id IS NULL OR EXISTS (SELECT 1 FROM runs d WHERE d.id=r.depends_on_run_id AND d.status='completed'))
+        ${scopePredicate}
         AND (stage NOT LIKE 'review:%' OR EXISTS (
           SELECT 1
             FROM runtime_review_lane_attempts a
@@ -196,6 +261,7 @@ export class RunStore {
     })();
   }
   private requireLease(id: string, token: string): RunRecord {
+    this.assertReviewMutationTarget(id);
     const row = this.get(id);
     if (!row || row.status !== "claimed" || row.leaseToken !== token) throw new Error("invalid or stale lease token");
     return row;
@@ -223,6 +289,9 @@ export class RunStore {
     if (changed !== 1) throw new Error("retry release fence rejected");
   }
   cancel(id: string, reason: string): void {
+    if (this.scope === "review") {
+      throw new Error("review scope cannot cancel runs; use an authoritative review transition");
+    }
     if (this.db.prepare("SELECT 1 FROM runtime_review_lane_attempts WHERE run_id=?").get(id)) {
       throw new Error("linked review attempt requires an authoritative review transition");
     }
@@ -285,6 +354,7 @@ export class RunStore {
     if (changed !== 1) throw new Error("execution context launch fence rejected");
   }
   renewLease(id: string, token: string, leaseExpiresAt: number): boolean {
+    this.assertReviewMutationTarget(id);
     return this.db.prepare(`UPDATE runs SET lease_expires_at=? WHERE id=? AND status='claimed' AND lease_token=?`)
       .run(leaseExpiresAt, id, token).changes === 1;
   }
@@ -326,12 +396,14 @@ export class RunStore {
           UNION ALL
           SELECT r.id FROM runs r JOIN descendants d ON r.depends_on_run_id = d.id WHERE r.status = 'queued'
         ) UPDATE runs SET status='cancelled',cancel_reason='dependency_failed'
-          WHERE id IN (SELECT id FROM descendants)`).run(input.id);
+          WHERE id IN (SELECT id FROM descendants)
+            ${this.linkedReviewPredicate("runs")}`).run(input.id);
       }
     };
     this.db.transaction(persist).immediate();
   }
   claimDomainEffect(id: string, input: { owner: string; now: number; leaseMs: number }): boolean {
+    this.assertReviewMutationTarget(id);
     if (!input.owner || !Number.isSafeInteger(input.now) || !Number.isSafeInteger(input.leaseMs) || input.leaseMs <= 0) {
       throw new Error("domain effect replay claim is invalid");
     }
@@ -352,6 +424,7 @@ export class RunStore {
             ).changes === 1;
   }
   markDomainEffectApplied(id: string, owner: string): boolean {
+    this.assertReviewMutationTarget(id);
     return this.db.prepare(`UPDATE runs
       SET result=json_remove(json_set(result, '$.domainEffect', 'applied'), '$.replayLease', '$.replayError')
       WHERE id=? AND status IN ('completed','failed')
@@ -359,6 +432,7 @@ export class RunStore {
         AND json_extract(result, '$.replayLease.owner')=?`).run(id, owner).changes === 1;
   }
   releaseDomainEffectClaim(id: string, owner: string, error: unknown): boolean {
+    this.assertReviewMutationTarget(id);
     const replayError = sanitizeResult({
       kind: "domain_effect_replay_deferred",
       error: error instanceof Error ? error.message : String(error),
@@ -376,6 +450,7 @@ export class RunStore {
         ).changes === 1;
   }
   quarantineDomainEffect(id: string, owner: string, error: unknown): boolean {
+    this.assertReviewMutationTarget(id);
     const quarantineError = sanitizeResult({
       kind: "domain_effect_quarantined",
       error: error instanceof Error ? error.message : String(error),
@@ -398,6 +473,7 @@ export class RunStore {
     effect: Record<string, unknown>;
     status: "completed" | "failed";
   }): void {
+    this.assertReviewMutationTarget(input.id);
     const envelope: DomainEffectEnvelope = { domainEffect: "pending",
       providerResult: sanitizeResult(input.providerResult), effect: sanitizeResult(input.effect) };
     const changed = this.db.prepare(`UPDATE runs SET status=?,result=?
@@ -453,7 +529,8 @@ export class RunStore {
         UNION ALL
         SELECT r.id FROM runs r JOIN descendants d ON r.depends_on_run_id = d.id WHERE r.status = 'queued'
       ) UPDATE runs SET status='cancelled',cancel_reason='dependency_failed'
-        WHERE id IN (SELECT id FROM descendants)`).run(id);
+        WHERE id IN (SELECT id FROM descendants)
+          ${this.linkedReviewPredicate("runs")}`).run(id);
     })();
   }
   recoverExpired(now = Date.now()): number {
@@ -461,14 +538,18 @@ export class RunStore {
       const linked = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',lease_token=NULL,
         lease_expires_at=NULL,worker_id=NULL
         WHERE status='claimed' AND lease_expires_at < ? AND launched=0
-          AND EXISTS (SELECT 1 FROM runtime_review_lane_attempts a WHERE a.run_id=runs.id)`)
+          AND EXISTS (SELECT 1 FROM runtime_review_lane_attempts a WHERE a.run_id=runs.id)
+          ${this.linkedReviewPredicate("runs")}`)
         .run(now).changes;
-      const before = this.db.prepare(`UPDATE runs SET status='queued',next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
-        worker_id=NULL WHERE status='claimed' AND lease_expires_at < ? AND launched=0
-          AND NOT EXISTS (SELECT 1 FROM runtime_review_lane_attempts a WHERE a.run_id=runs.id)`)
-        .run(now + 1_000, now).changes;
+      const before = this.scope === "all"
+        ? this.db.prepare(`UPDATE runs SET status='queued',next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL,
+          worker_id=NULL WHERE status='claimed' AND lease_expires_at < ? AND launched=0
+            AND NOT EXISTS (SELECT 1 FROM runtime_review_lane_attempts a WHERE a.run_id=runs.id)`)
+          .run(now + 1_000, now).changes
+        : 0;
       const after = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',lease_token=NULL,
-        lease_expires_at=NULL,worker_id=NULL WHERE status='claimed' AND lease_expires_at < ? AND launched=1 AND result IS NULL`).run(now).changes;
+        lease_expires_at=NULL,worker_id=NULL WHERE status='claimed' AND lease_expires_at < ?
+          AND launched=1 AND result IS NULL ${this.linkedReviewPredicate("runs")}`).run(now).changes;
       return linked + before + after;
     })();
   }

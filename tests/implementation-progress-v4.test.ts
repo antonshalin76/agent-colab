@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { LocalCollabService } from "../src/app/service.js";
 import { MigrationCoordinator, initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+import { AuthorizedV4TestCoordinator } from "./helpers/authorized-v4-coordinator.js";
 import { createCollabMcpServer } from "../src/mcp/server.js";
 import { GraphFlowStore } from "../src/store/graph-flow-store.js";
 import { RunStore } from "../src/store/run-store.js";
@@ -352,51 +353,11 @@ async function loadBootstrapFactory(): Promise<CreateReviewedV4Bootstrap> {
 }
 
 async function migrateFixture(fixture: ProgressFixture): Promise<void> {
-  const createBootstrap = await loadBootstrapFactory();
-  const authorityModule = await import(pathToFileURL(resolve("src/migration/reviewed-v4-migration-authority.ts")).href);
-  const migrationAuthority = authorityModule.createReviewedV4MigrationAuthority({ stateRoot: fixture.stateRoot }) as MigrationAuthorityComposition;
-  const composition = createBootstrap({
-    process: {
-      async run({ cwd }) {
-        try {
-          const coordinator = new MigrationCoordinator({
-            stateDatabase: fixture.databasePath,
-            historyDatabase: fixture.historyPath,
-            repositoryRoot: cwd,
-          });
-          const result = coordinator.migrateToV4();
-          coordinator.extendReviewV3SchemaOffline();
-          return { status: 0, stdout: JSON.stringify(result), stderr: "" };
-        } catch (error) {
-          return { status: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
-        }
-      },
-    },
-    quiescence: {
-      assertServiceInactive: () => undefined,
-      assertNoOpenDatabaseFds: () => undefined,
-      acquireExclusiveWriteFence: () => ({ assertCurrent: () => undefined, release: () => undefined }),
-    },
-    migrationAuthority: migrationAuthority.consumer,
-  });
-  const operationId = "fixture-reviewed-v4";
-  const authority = migrationAuthority.issuer.issue({
-    operationId,
-    consumer: "codex:/root:state-v4-reviewed-bootstrap",
-    scope: "reviewed-state-v4-migration",
-    sourceIdentity: { commitOid: REVIEWED_COMMIT, treeOid: REVIEWED_TREE },
+  new AuthorizedV4TestCoordinator({
     stateDatabase: fixture.databasePath,
     historyDatabase: fixture.historyPath,
-  });
-  await composition.bootstrapReviewedV4({
-    operationId,
-    gitRoot: repo,
-    reviewedWorktreeParent: join(fixture.root, "reviewed-worktrees"),
-    sourceIdentity: { commitOid: REVIEWED_COMMIT, treeOid: REVIEWED_TREE },
-    stateDatabase: fixture.databasePath,
-    historyDatabase: fixture.historyPath,
-  }, authority);
-  migrationAuthority.close();
+    repositoryRoot: fixture.repositoryRoot,
+  }).migrateToV4();
 }
 
 async function loadProgressRuntime(): Promise<ProgressRuntime> {

@@ -43,7 +43,8 @@ Agent Collab предоставляет MCP-сервер с транспорто
 - Node.js 24 или новее
 - npm
 - поддержка SQLite через `better-sqlite3`
-- локально установленные Grok CLI, Claude Code CLI и Codex CLI
+- локально установленный Codex CLI; Grok и Claude Code CLI — необязательные
+  дополнительные ревьюеры
 - клиент, способный зарегистрировать stdio MCP command
 
 ## Установка
@@ -53,13 +54,16 @@ git clone <repository-url> agent-collab
 cd agent-collab
 npm ci
 npm run build
-npm start -- doctor
+npm start -- review-skills-link
+npm start -- review-readiness
+npm start -- review-initialize
 ```
 
 Проекту не нужен серверный порт. Runtime обменивается данными с агентами через
 stdio MCP.
 
-Рабочий контракт описан в
+Production-настройка, миграция, MCP и восстановление описаны в
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md). Рабочий контракт описан в
 [`docs/evidence-gated-flow-v1/WORKFLOW.md`](docs/evidence-gated-flow-v1/WORKFLOW.md).
 
 ## Настройка
@@ -91,14 +95,26 @@ Linux/macOS и `;` в Windows.
 
 ## MCP command
 
-Зарегистрируйте собранный CLI как stdio MCP command в Grok, Claude Code и Codex:
+Зарегистрируйте изменяющий review-only профиль только в Codex:
 
 ```text
-node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs mcp
+node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs review-mcp-codex
 ```
 
-Укажите абсолютный путь к checkout. После изменения регистрации MCP или общих
-скиллов перезапустите все три harness.
+В Grok и Claude Code зарегистрируйте профиль статуса только для чтения:
+
+```text
+node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs review-mcp-status
+```
+
+Укажите абсолютный путь к checkout. Удалите прежние регистрации `review-mcp`,
+`mcp` и `worker`. После изменения MCP или общих скиллов перезапустите каждый
+harness. Помощники видят только `collab_status` и не могут создавать или
+изменять ревью.
+
+Изменяющий профиль также отклоняет MCP handshake, если имя клиента отличается
+от `codex-mcp-client`, используемого Codex CLI. Это защита от ошибки
+конфигурации, а не от вредоносного процесса с тем же OS UID.
 
 `collab_request_review` требует поле `workspaceRoot`: точный корень checkout или
 linked worktree, который должны проверять все review-провайдеры. Git-подкаталог,
@@ -108,15 +124,21 @@ linked worktree, который должны проверять все review-п
 
 ## Worker
 
-Для надежной фоновой обработки запустите worker:
+Для надежной фоновой обработки ревью запустите review-only worker:
 
 ```bash
-npm start -- worker
+npm start -- review-worker
 ```
 
 В Linux с пользовательскими systemd services адаптируйте
 `systemd/agent-collab.service`: задайте пути к checkout, Node, CLI и каталогу
-состояния, затем установите unit как пользовательский.
+состояния, затем установите его как пользовательский unit
+`agent-collab-reviewed.service`.
+
+Устаревшие runtime-маршруты `mcp`, `worker`, `start-normal` и `prove-normal`
+навсегда помещены в карантин. Их нельзя включить через stable dispatcher или
+выбором старого runtime snapshot. Линейное выполнение workflow также отключено
+на границе записи состояния.
 
 ## Команды
 
@@ -124,17 +146,29 @@ npm start -- worker
 npm run typecheck
 npm test
 npm run build
+npm start -- review-skills-link
+npm start -- review-readiness
+npm start -- review-initialize
 npm start -- doctor
 npm start -- doctor-v1
 npm start -- migrate-v2
 npm start -- migrate-v3
+npm start -- reviewed-source-promote <auditor.json> <critic.json> <output.json> <expires-at> <promotion-id>
+npm start -- reviewed-source-adopt <promotion.json>
+npm start -- review-service-stage </absolute/nonexistent/backup-directory>
+npm start -- stg04-close-preflight <source-adoption-sha256>
+npm start -- stg04-close-prepare <source-adoption-sha256>
+npm start -- stg04-close-status <source-adoption-sha256>
+npm start -- review-service-activate <source-adoption-sha256>
 npm start -- verify-bundle /absolute/rollback/bundle
 npm start -- restore-v1 /absolute/rollback/bundle
 npm start -- reconcile-run <run-id> <completed|failed>
-npm start -- index /absolute/project/root
 npm start -- status
-npm start -- approve <reference> /absolute/project/root workspace-write 900 1
 ```
+
+`status` работает только на чтение и требует существующее состояние. `doctor`
+является псевдонимом no-state проверки `review-readiness`. Trust environment и
+точный порядок reviewed-v4 операций описаны в production runbook.
 
 ## Локальный парный benchmark
 

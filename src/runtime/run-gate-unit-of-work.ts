@@ -248,7 +248,27 @@ export interface CreateReviewBarrierInput {
   sourceFingerprint?: string;
   changedFiles?: number;
   admissionReceipts?: ReviewAdmissionReceiptPair[];
+  admissionEvidence?: ReviewAdmissionEvidencePair[];
   faultInjector?: (point: string) => void;
+}
+
+export interface ReviewAdmissionEvidencePair {
+  agent: ReviewProviderId;
+  role: ReviewRole;
+  activationNonce: string;
+  sourceReceiptId: string;
+  readinessReceiptId: string;
+  source: Record<string, unknown>;
+  readiness: Record<string, unknown>;
+  observedAt: number;
+}
+
+export type ReplayReviewBarrierInput = Omit<CreateReviewBarrierInput,
+  "health" | "createdAt" | "admissionReceipts" | "admissionEvidence" | "faultInjector">;
+
+export interface CreateReviewBarrierResult {
+  review: ReviewBarrierSnapshot;
+  created: boolean;
 }
 
 export interface ReviewAdmissionReceiptPair {
@@ -496,7 +516,12 @@ export class RunGateUnitOfWork {
     `).all(reviewId) as LaneRow[];
   }
 
-  private attemptsFor(reviewId: string, agent?: ReviewProviderId, role?: ReviewRole): ReviewAttemptSnapshot[] {
+  private attemptsFor(
+    reviewId: string,
+    agent?: ReviewProviderId,
+    role?: ReviewRole,
+    reconcileCorrupt = true,
+  ): ReviewAttemptSnapshot[] {
     const links = this.db.prepare(`
       SELECT review_id,agent,role,attempt_ordinal,run_id,created_at,attempt_id,authority_id,
              base_policy_id,authority_kind,model,effort,policy_version,reasons_json,session_id,
@@ -551,6 +576,9 @@ export class RunGateUnitOfWork {
         decision?.policyVersion !== link.policy_version ||
         !isDeepStrictEqual(decision?.reasons, JSON.parse(link.reasons_json));
     });
+    if (corrupt && !reconcileCorrupt) {
+      throw new Error(`immutable review state is corrupt: ${reviewId}`);
+    }
     if (corrupt) {
       const ids = links.map(({ run_id }) => run_id);
       const mark = this.db.prepare(`UPDATE runs SET status='needs_reconciliation',
@@ -609,11 +637,18 @@ export class RunGateUnitOfWork {
         ...(typeof payload.providerAdmissionClaimedAt === "number"
           ? { providerAdmissionClaimedAt: payload.providerAdmissionClaimedAt }
           : {}),
+        ...(link.recovery_generation == null
+          ? {} : { recoveryGeneration: link.recovery_generation }),
+        ...(link.previous_ordinal == null
+          ? {} : { previousOrdinal: link.previous_ordinal }),
+        ...(link.previous_evidence_hash == null
+          ? {} : { previousEvidenceHash: link.previous_evidence_hash }),
+        ...(link.authority_id == null ? {} : { authorityId: link.authority_id }),
       };
     });
   }
 
-  private snapshot(row: ReviewRow): ReviewBarrierSnapshot {
+  private snapshot(row: ReviewRow, reconcileCorrupt = true): ReviewBarrierSnapshot {
     return {
       reviewId: row.review_id,
       stageId: row.stage_id,
@@ -625,7 +660,7 @@ export class RunGateUnitOfWork {
       createdAt: row.created_at,
       lanes: this.laneRows(row.review_id).map((lane) => laneSnapshot(
         lane,
-        this.attemptsFor(row.review_id, lane.agent, lane.role),
+        this.attemptsFor(row.review_id, lane.agent, lane.role, reconcileCorrupt),
       )),
       ...(row.project === null ? {} : { project: row.project }),
       ...(row.requester === null ? {} : { requester: row.requester }),
@@ -637,6 +672,53 @@ export class RunGateUnitOfWork {
   get(reviewId: string): ReviewBarrierSnapshot | null {
     const row = this.reviewRow(reviewId);
     return row === undefined ? null : this.snapshot(row);
+  }
+
+  private assertImmutableReview(
+    existing: ReviewRow,
+    input: ReplayReviewBarrierInput,
+    artifactHash: string,
+    snapshot: ReviewBarrierSnapshot,
+  ): void {
+    assertExactReviewTopology(snapshot.lanes);
+    const promptsMatch = snapshot.lanes.every(
+      (lane) => lane.prompt === input.prompts[lane.role],
+    );
+    if (
+      existing.stage_id !== input.stageId ||
+      existing.artifact_hash !== artifactHash ||
+      !Buffer.from(existing.artifact).equals(input.artifact) ||
+      existing.approval_scope !== input.approvalScope ||
+      existing.idempotency_key !== input.idempotencyKey ||
+      (existing.project ?? undefined) !== input.project ||
+      (existing.requester ?? undefined) !== input.requester ||
+      (existing.source_fingerprint ?? undefined) !== input.sourceFingerprint ||
+      existing.changed_files !== (input.changedFiles ?? 0) ||
+      !promptsMatch
+    ) {
+      throw new Error(`Immutable review conflict: ${input.reviewId}`);
+    }
+  }
+
+  findExact(input: ReplayReviewBarrierInput): ReviewBarrierSnapshot | null {
+    const existing = this.reviewRow(input.reviewId);
+    if (existing === undefined) return null;
+    const artifact = Buffer.from(input.artifact);
+    const artifactHash = createHash("sha256").update(artifact).digest("hex");
+    const snapshot = this.snapshot(existing, false);
+    this.assertImmutableReview(existing, { ...input, artifact }, artifactHash, snapshot);
+    return snapshot;
+  }
+
+  initialRunIds(reviewId: string): string[] {
+    if (this.reviewRow(reviewId) === undefined) throw new Error(`Unknown review: ${reviewId}`);
+    return (this.db.prepare(`
+      SELECT a.run_id
+        FROM runtime_review_lane_attempts a
+       WHERE a.review_id=? AND a.attempt_ordinal=0
+       ORDER BY CASE a.agent WHEN 'grok' THEN 0 WHEN 'claude' THEN 1 ELSE 2 END,
+                CASE a.role WHEN 'auditor' THEN 0 ELSE 1 END
+    `).pluck().all(reviewId) as string[]);
   }
 
   private captureReceiptInTransaction(input: CaptureReviewReceiptInput): ReceiptCaptureResult {
@@ -812,7 +894,7 @@ export class RunGateUnitOfWork {
     }
   }
 
-  create(input: CreateReviewBarrierInput): ReviewBarrierSnapshot {
+  createWithResult(input: CreateReviewBarrierInput): CreateReviewBarrierResult {
     if (!this.hasLaunchAuthorityVersion) {
       throw new Error("review creation requires the offline v3-to-v4 migration");
     }
@@ -821,26 +903,9 @@ export class RunGateUnitOfWork {
     const create = this.db.transaction(() => {
       const existing = this.reviewRow(input.reviewId);
       if (existing !== undefined) {
-        const snapshot = this.snapshot(existing);
-        assertExactReviewTopology(snapshot.lanes);
-        const promptsMatch = snapshot.lanes.every(
-          (lane) => lane.prompt === input.prompts[lane.role],
-        );
-        if (
-          existing.stage_id !== input.stageId ||
-          existing.artifact_hash !== artifactHash ||
-          existing.approval_scope !== input.approvalScope ||
-          existing.idempotency_key !== input.idempotencyKey ||
-          (existing.project ?? undefined) !== input.project ||
-          (existing.requester ?? undefined) !== input.requester ||
-          (existing.source_fingerprint ?? undefined) !== input.sourceFingerprint ||
-          existing.changed_files !== (input.changedFiles ?? 0) ||
-          !promptsMatch
-        ) {
-          throw new Error(`Immutable review conflict: ${input.reviewId}`);
-        }
-        this.enqueueActiveReviewRuns(existing);
-        return snapshot;
+        const snapshot = this.snapshot(existing, false);
+        this.assertImmutableReview(existing, { ...input, artifact }, artifactHash, snapshot);
+        return { review: snapshot, created: false };
       }
 
       const plan = createReviewPlan({
@@ -918,8 +983,66 @@ export class RunGateUnitOfWork {
       input.faultInjector?.("after_lane_insert");
 
       for (const lane of plan.activeLanes) {
-        const pair = input.admissionReceipts?.find((candidate) =>
+        let pair = input.admissionReceipts?.find((candidate) =>
           (candidate.agent === undefined || candidate.agent === lane.agent) && candidate.role === lane.role);
+        const evidence = input.admissionEvidence?.find((candidate) =>
+          candidate.agent === lane.agent && candidate.role === lane.role);
+        if (pair && evidence) {
+          throw new Error(`duplicate admission evidence source: ${lane.agent}/${lane.role}`);
+        }
+        if (evidence) {
+          if (evidence.source.valid !== true ||
+              evidence.source.sourceFingerprint !== input.sourceFingerprint ||
+              evidence.readiness.valid !== true || evidence.readiness.harnessReady !== true) {
+            throw new Error(`invalid admission evidence: ${lane.agent}/${lane.role}`);
+          }
+          const sourceScope = `review/${input.reviewId}/${lane.agent}/${lane.role}/source`;
+          const readinessScope = `review/${input.reviewId}/${lane.agent}/${lane.role}/readiness`;
+          const cursor = this.receiptPairCursor({ sourceScope, readinessScope });
+          if (cursor.scopeRevision !== 1 || cursor.predecessorReceiptIds.source !== null ||
+              cursor.predecessorReceiptIds.readiness !== null) {
+            throw new Error(`new review admission scope is not pristine: ${lane.agent}/${lane.role}`);
+          }
+          const expectedTuple = { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null };
+          const capturedSource = this.captureReceiptInTransaction({
+            receiptId: evidence.sourceReceiptId,
+            phase: "admission",
+            scope: sourceScope,
+            scopeRevision: cursor.scopeRevision,
+            activationNonce: evidence.activationNonce,
+            expectedTuple,
+            recoveryGeneration: null,
+            observation: evidence.source,
+            predecessorReceiptId: null,
+            createdAt: evidence.observedAt,
+            ...(input.faultInjector ? { faultInjector: input.faultInjector } : {}),
+          });
+          input.faultInjector?.("after_first_pair_envelope");
+          const capturedReadiness = this.captureReceiptInTransaction({
+            receiptId: evidence.readinessReceiptId,
+            phase: "admission",
+            scope: readinessScope,
+            scopeRevision: cursor.scopeRevision,
+            activationNonce: evidence.activationNonce,
+            expectedTuple,
+            recoveryGeneration: null,
+            observation: evidence.readiness,
+            predecessorReceiptId: null,
+            createdAt: evidence.observedAt,
+            ...(input.faultInjector ? { faultInjector: input.faultInjector } : {}),
+          });
+          if (capturedSource.lifecycle !== "pending" ||
+              capturedReadiness.lifecycle !== "pending") {
+            throw new Error(`admission receipt pair lost current head: ${lane.agent}/${lane.role}`);
+          }
+          pair = {
+            agent: lane.agent,
+            role: lane.role,
+            activationNonce: evidence.activationNonce,
+            sourceReceiptId: evidence.sourceReceiptId,
+            readinessReceiptId: evidence.readinessReceiptId,
+          };
+        }
         if (!pair) throw new Error(`active review lane lacks exact admission receipt pair: ${lane.agent}/${lane.role}`);
         const expectedTuple = { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null };
         const receiptFor = (receiptId: string, kind: "source" | "readiness") => {
@@ -1015,9 +1138,13 @@ export class RunGateUnitOfWork {
       input.faultInjector?.("before_create_commit");
       const created = this.reviewRow(input.reviewId);
       if (created === undefined) throw new Error("Review barrier was not persisted");
-      return this.snapshot(created);
+      return { review: this.snapshot(created), created: true };
     });
     return create.immediate();
+  }
+
+  create(input: CreateReviewBarrierInput): ReviewBarrierSnapshot {
+    return this.createWithResult(input).review;
   }
 
   private descriptorForAttempt(
@@ -1385,10 +1512,16 @@ export class RunGateUnitOfWork {
     const provenNoSpawn = !run.launched && launch?.phase === "proven_no_spawn" &&
       launch.pid === undefined && launch.value === undefined && exactLaunchIdentity;
     const fence = providerResult.admissionFenceReceipt as Record<string, unknown> | undefined;
+    const noSpawn = this.db.prepare(`SELECT reason,prelaunch_receipt_id,recorded_at
+      FROM runtime_review_no_spawn_effects WHERE attempt_id=?`).get(attempt.attemptId) as
+      { reason: string; prelaunch_receipt_id: string | null; recorded_at: number } | undefined;
     const admissionFenced = !run.launched && fence?.schemaVersion === "review-admission-fence/v1" &&
       fence.runId === run.id && fence.reviewId === review.review_id &&
       fence.attemptId === attempt.attemptId && fence.role === lane.role &&
       fence.agent === lane.agent &&
+      noSpawn?.reason === "provider_unavailable" &&
+      fence.prelaunchReceiptId === noSpawn.prelaunch_receipt_id &&
+      fence.observedAt === noSpawn.recorded_at &&
       typeof fence.capabilityVerified === "boolean" && typeof fence.attemptClaimed === "boolean" &&
       !(fence.observedHealth === "healthy" && fence.capabilityVerified && !fence.attemptClaimed) &&
       Number.isSafeInteger(fence.observedAt) && launch?.pid === undefined && launch?.value === undefined;
@@ -1415,6 +1548,19 @@ export class RunGateUnitOfWork {
     return (this.db.prepare(`SELECT DISTINCT review_id FROM runtime_review_lanes
       WHERE agent=? AND status='deferred' ORDER BY review_id`).all(agent) as Array<{ review_id: string }>)
       .map((row) => row.review_id);
+  }
+
+  hasUnconsumedRecoveryGeneration(agent: ReviewProviderId, generation: number): boolean {
+    if (!Number.isSafeInteger(generation) || generation <= 0) return false;
+    return this.db.prepare(`SELECT 1
+      FROM runtime_review_lanes lane
+      WHERE lane.agent=? AND lane.status='deferred'
+        AND NOT EXISTS (
+          SELECT 1 FROM runtime_review_generation_consumptions consumed
+          WHERE consumed.review_id=lane.review_id AND consumed.agent=lane.agent
+            AND consumed.role=lane.role AND consumed.generation=?
+        )
+      LIMIT 1`).get(agent, generation) !== undefined;
   }
 
   admissionTuple(reviewId: string, agent: ReviewProviderId, role: ReviewRole): {
@@ -2019,13 +2165,85 @@ export class RunGateUnitOfWork {
       input.faultInjector?.("after_prelaunch_receipt_read");
 
       const persistNoSpawn = (reason: "stale_artifact" | "provider_unavailable" |
-        "needs_reconciliation") => {
+        "needs_reconciliation", providerHealth?: {
+          health: string;
+          capability_verified: number;
+          attempt_claimed: number;
+        }) => {
         this.db.prepare(`INSERT INTO runtime_review_no_spawn_effects
           (attempt_id,reason,prelaunch_receipt_id,recorded_at) VALUES (?,?,?,?)`).run(
             input.attemptId, reason, receipt?.receipt_id ?? null, input.now);
         input.faultInjector?.("after_no_spawn_effect_insert");
         const laneStatus = reason === "stale_artifact" ? "stale_artifact"
           : reason === "provider_unavailable" ? "deferred" : "needs_reconciliation";
+        if (reason === "provider_unavailable") {
+          const providerResult = sanitizeResult({
+            kind: "model_unavailable",
+            agent: link.agent,
+            admissionFenceReceipt: {
+              schemaVersion: "review-admission-fence/v1",
+              runId: link.run_id,
+              reviewId: link.review_id,
+              attemptId: input.attemptId,
+              prelaunchReceiptId: receipt?.receipt_id ?? null,
+              role: link.role,
+              agent: link.agent,
+              observedHealth: providerHealth?.health ?? "unavailable",
+              capabilityVerified: providerHealth?.capability_verified === 1,
+              attemptClaimed: providerHealth?.attempt_claimed === 1,
+              observedAt: input.now,
+            },
+          }) as Record<string, unknown>;
+          const run = this.db.prepare(`SELECT payload,status,attempt_count,launched
+            FROM runs WHERE id=?`).get(link.run_id) as {
+              payload: string | null;
+              status: string;
+              attempt_count: number;
+              launched: number;
+            } | undefined;
+          if (!run || run.status !== "claimed" || run.attempt_count <= 0 || run.launched !== 0) {
+            throw new Error("provider-unavailable no-spawn run is not an exact active claim");
+          }
+          const payload = run.payload === null
+            ? {}
+            : JSON.parse(run.payload) as Record<string, unknown>;
+          const effect = {
+            type: "review",
+            reviewId: link.review_id,
+            attemptId: input.attemptId,
+            role: link.role,
+            agent: link.agent,
+            resultKind: providerResult.kind,
+            terminalAt: input.now,
+            ...(typeof payload.providerAdmissionClaimedAt === "number"
+              ? { providerAdmissionClaimedAt: payload.providerAdmissionClaimedAt }
+              : {}),
+          };
+          const envelope = sanitizeResult({
+            domainEffect: "applied",
+            providerResult,
+            effect,
+          });
+          const completed = this.db.prepare(`UPDATE runs SET status='completed',result=?,
+              lease_token=NULL,lease_expires_at=NULL,worker_id=NULL
+            WHERE id=? AND status='claimed' AND launched=0 AND attempt_count>0`).run(
+              JSON.stringify(envelope), link.run_id,
+            ).changes;
+          if (completed !== 1) {
+            throw new Error("provider-unavailable no-spawn queue terminalization lost its claim");
+          }
+          input.faultInjector?.("after_no_spawn_run_terminalized");
+          const deferred = this.db.prepare(`UPDATE runtime_review_lanes SET status='deferred',result=NULL,error=?,
+              terminal_at=?,lane_revision=lane_revision+1
+            WHERE review_id=? AND agent=? AND role=? AND status='queued'`).run(
+              JSON.stringify(providerResult), input.now, link.review_id, link.agent, link.role,
+            ).changes;
+          if (deferred !== 1) {
+            throw new Error("provider-unavailable no-spawn lane terminalization lost its active state");
+          }
+          if (receipt && isCurrentPending(receipt)) terminalize(receipt, "consumed");
+          return { status: "no_spawn", reason, attemptId: input.attemptId, spawnAuthority: null };
+        }
         this.db.prepare(`UPDATE runtime_review_lanes SET status=?,lane_revision=lane_revision+1,
           terminal_at=CASE WHEN ?='stale_artifact' THEN COALESCE(terminal_at,?) ELSE terminal_at END
           WHERE review_id=? AND agent=? AND role=?`).run(
@@ -2063,7 +2281,7 @@ export class RunGateUnitOfWork {
           observation.readinessObservationHash !== readinessHash) reason = "provider_unavailable";
       input.faultInjector?.("after_prelaunch_decision");
       if (reason) {
-        const result = persistNoSpawn(reason);
+        const result = persistNoSpawn(reason, providerHealth);
         input.faultInjector?.("before_prelaunch_commit");
         return result;
       }

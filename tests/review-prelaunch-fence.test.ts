@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
+import { RunStore } from "../src/store/run-store.js";
 
 const roots: string[] = [];
 const canonicalJson = (value: unknown): string => {
@@ -149,6 +150,12 @@ function preparedAttempt(path: string): {
     authority.admission_readiness_receipt_id,
   ) as Array<{ receipt_id: string; observation_hash: string }>;
   db.close();
+  const runs = new RunStore(path, { scope: "review" });
+  const claimed = runs.claimNext({ workerId: "prelaunch-fixture", leaseMs: 10_000, now: 10 });
+  runs.close();
+  if (claimed?.payload?.reviewAttemptId !== authority.attempt_id) {
+    throw new Error("prelaunch fixture did not claim the exact Codex auditor attempt");
+  }
   return {
     reviews,
     authority,
@@ -494,7 +501,28 @@ describe("authority-v3 prelaunch fence", () => {
     const after = attemptState(path, authority.attempt_id);
     expect(after.attempt).toEqual(before.attempt);
     expect(after.generationConsumptions).toEqual(before.generationConsumptions);
-    expect(after.run).toEqual(before.run);
+    if (variant === "readiness-mismatch") {
+      expect(after.run).toMatchObject({
+        status: "completed",
+        launched: 0,
+        worker_id: null,
+        lease_token: null,
+        lease_expires_at: null,
+      });
+      const envelope = JSON.parse(String((after.run as { result: string }).result)) as {
+        domainEffect: string;
+        providerResult: { kind: string; admissionFenceReceipt: { attemptClaimed: boolean } };
+      };
+      expect(envelope).toMatchObject({
+        domainEffect: "applied",
+        providerResult: {
+          kind: "model_unavailable",
+          admissionFenceReceipt: { attemptClaimed: false },
+        },
+      });
+    } else {
+      expect(after.run).toEqual(before.run);
+    }
     if (variant === "missing" || variant === "orphaned") {
       expect(after.lane).toEqual(before.lane);
     } else {

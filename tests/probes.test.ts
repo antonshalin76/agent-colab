@@ -244,6 +244,27 @@ describe("BDD-9 executable bounded review-provider capability probes", () => {
     expect(execute).toHaveBeenCalledTimes(3);
   });
 
+  it("propagates shutdown cancellation to every active probe runner", async () => {
+    const controller = new AbortController();
+    const execute = vi.fn((request: { signal?: AbortSignal }) =>
+      new Promise<ReturnType<typeof success>>((_resolve, reject) => {
+        request.signal?.addEventListener("abort", () => reject(request.signal?.reason), { once: true });
+      }));
+    const result = runCapabilityProbes({
+      providers,
+      timeoutMs: 120_000,
+      runner: { execute },
+      sessionIdFactory: () => sessionId,
+      signal: controller.signal,
+    });
+    await expect.poll(() => execute.mock.calls.length).toBe(3);
+
+    controller.abort(new Error("worker shutdown"));
+
+    await expect(result).rejects.toThrow("worker shutdown");
+    expect(execute.mock.calls.every(([request]) => request.signal === controller.signal)).toBe(true);
+  });
+
   it.each([
     ["grok malformed", "grok", "not-json"],
     [

@@ -32,6 +32,7 @@ export interface CapabilityProbeRequest {
   timeoutMs: number;
   shell: false;
   killProcessGroup: true;
+  signal?: AbortSignal;
   promptFileArgIndex?: number;
 }
 
@@ -71,6 +72,7 @@ const requestFor = (
   config: ProviderProbeConfig,
   timeoutMs: number,
   sessionId: string,
+  signal?: AbortSignal,
 ): CapabilityProbeRequest => {
   const prompt = probeInput(agent, config.effort);
   const command = agent === "grok"
@@ -110,6 +112,7 @@ const requestFor = (
     timeoutMs: command.timeoutMs,
     shell: false,
     killProcessGroup: true,
+    ...(signal ? { signal } : {}),
     ...(command.promptFileArgIndex !== undefined
       ? { promptFileArgIndex: command.promptFileArgIndex }
       : {}),
@@ -120,15 +123,24 @@ class ProbeTimeoutError extends Error {
   readonly code = "PROBE_TIMEOUT";
 }
 
-const bounded = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+const bounded = async <T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let abortHandler: (() => void) | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new ProbeTimeoutError("Capability probe timed out")), timeoutMs);
   });
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abortHandler = () => reject(signal?.reason instanceof Error
+      ? signal.reason
+      : new Error("Capability probe aborted"));
+    if (signal?.aborted) abortHandler();
+    else signal?.addEventListener("abort", abortHandler, { once: true });
+  });
   try {
-    return await Promise.race([promise, timeout]);
+    return await Promise.race([promise, timeout, aborted]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (abortHandler) signal?.removeEventListener("abort", abortHandler);
   }
 };
 
@@ -222,14 +234,16 @@ const probeOne = async (
   timeoutMs: number,
   sessionId: string,
   runner: CapabilityProbeRunner,
+  signal?: AbortSignal,
 ): Promise<StartupProbeResult> => {
   if (!config.enabled) {
     return { health: "disabled", ready: false, failures: ["provider_disabled"] };
   }
   try {
     const result = await bounded(
-      runner.execute(requestFor(agent, config, timeoutMs, sessionId)),
+      runner.execute(requestFor(agent, config, timeoutMs, sessionId, signal)),
       timeoutMs,
+      signal,
     );
     if (result.exitCode !== 0) return unavailable("cli_failure");
     const observed = parseObserved(agent, config, result, sessionId);
@@ -246,6 +260,7 @@ const probeOne = async (
       observed,
     });
   } catch (error) {
+    if (signal?.aborted) throw error;
     if (error instanceof ProbeTimeoutError) return unavailable("probe_timeout");
     if (
       error instanceof Error &&
@@ -263,12 +278,13 @@ export async function runCapabilityProbes(input: {
   timeoutMs: number;
   runner: CapabilityProbeRunner;
   sessionIdFactory?: () => string;
+  signal?: AbortSignal;
 }): Promise<{ results: Record<ReviewProviderId, StartupProbeResult> }> {
   const sessionIdFactory = input.sessionIdFactory ?? randomUUID;
   const [grok, claude, codex] = await Promise.all([
-    probeOne("grok", input.providers.grok, input.timeoutMs, sessionIdFactory(), input.runner),
-    probeOne("claude", input.providers.claude, input.timeoutMs, sessionIdFactory(), input.runner),
-    probeOne("codex", input.providers.codex, input.timeoutMs, sessionIdFactory(), input.runner),
+    probeOne("grok", input.providers.grok, input.timeoutMs, sessionIdFactory(), input.runner, input.signal),
+    probeOne("claude", input.providers.claude, input.timeoutMs, sessionIdFactory(), input.runner, input.signal),
+    probeOne("codex", input.providers.codex, input.timeoutMs, sessionIdFactory(), input.runner, input.signal),
   ]);
   return { results: { grok, claude, codex } };
 }

@@ -4,6 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import { z } from "zod";
 import { STAGES, type ActiveAgentId, type Stage } from "../domain/routing.js";
 import { sanitizeResult } from "../security/redaction.js";
+import { denyLegacyLinearDelegation } from "../runtime/legacy-linear-quarantine.js";
 
 type ApprovalScope = "workspace-read" | "workspace-write" | "external";
 export interface SearchInput { requester: ActiveAgentId; kind: "thread" | "memory"; query?: string | undefined; project?: string | undefined }
@@ -64,7 +65,7 @@ export function createCollabMcpServer(service: CollabService): McpServer {
   server.registerTool("collab_delegate", { description: "Delegate one bounded stage to an agent", inputSchema: delegateSchema },
     guarded(async (input) => {
       if (input.approvalScope === "external" && !input.approvalReference) throw new Error("external delegation requires explicit approval reference");
-      return service.delegate(input);
+      return denyLegacyLinearDelegation();
     }));
   const reviewSchema = z.object({
     requester: agent, workspaceRoot: boundedPath, stageId: boundedId.optional(),

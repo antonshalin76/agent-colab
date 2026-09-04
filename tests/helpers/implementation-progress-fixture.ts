@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -19,8 +20,8 @@ import canonicalize from "canonicalize";
 import { initializeCurrentExecutionSchema } from "../../src/migration/coordinator.js";
 import { dropGraphV4Schema, dropReviewV3Extension } from "./graph-schema.js";
 
-export const REVIEWED_COMMIT = "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50";
-export const REVIEWED_TREE = "955260b898f2465b72ecaabcb43b1453a15e3ebc";
+export const REVIEWED_COMMIT = "aa8bf948cf1d91cb39513bc0c1767c946efba4a1";
+export const REVIEWED_TREE = "e875677ffae22ba1393876a8e157439bb186a5a7";
 export const REVIEWED_LAST_EVENT_SHA256 = "924887cd4205a7b5b9a9fabad426162d32c3ec6da886eff24b8bc074ba0c5469";
 export const R2_PLAN_ID = "agent-collab-hybrid-flow-v1-r2";
 export const R2_PLAN_SHA256 = "af9191ea30d500de7f53cfdb57a890bfc7c1e55df3d3e738ed667bce7a787224";
@@ -38,17 +39,6 @@ export const AMD_AUTHORITY_RECEIPT_SHA256 = "e5a76fdbc55a8b584bebaa842a958418a89
 export const AMD_AUTHORITY_RECEIPT_FILE_SHA256 = "8d3d62db9434f3a5ae422a36b9d76fe9234287363740ba4c7a7994ca930c2562";
 export const AMD_FILE_SHA256 = "5ea6ba681c0b0d7567d248441924e6e602982fca283d0fbaea27bf7a0c92c685";
 export const AMD_EFFECTIVE_PLAN_SHA256 = "910df47ec6d48ce31424b9935816c0a180b4a9ae1539bf9d052f788dea922102";
-
-export const REVIEWED_FILES = [
-  "docs/hybrid-flow-v1-r2/IMPLEMENTATION_START.json",
-  "docs/hybrid-flow-v1-r2/PLAN_LOCK.json",
-  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000001-r2-stg-00-pass.json",
-  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000002-stg-01-pass.json",
-  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000003-stg-02-pass.json",
-  "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql",
-  "scripts/verify-implementation-progress.mjs",
-  "src/migration/coordinator.ts",
-] as const;
 
 export const AMD_CONTRACT_DELTA = {
   "STG-04": {
@@ -265,7 +255,16 @@ export function createProgressFixture(): ProgressFixture {
   mkdirSync(repositoryRoot);
   mkdirSync(stateRoot);
   cpSync(resolve("docs"), join(repositoryRoot, "docs"), { recursive: true });
+  cpSync(resolve("evals"), join(repositoryRoot, "evals"), { recursive: true });
   cpSync(resolve("repo-c4.json"), join(repositoryRoot, "repo-c4.json"));
+  execFileSync("git", ["init", "--quiet", repositoryRoot]);
+  const sourceObjects = resolve(execFileSync("git", ["rev-parse", "--git-path", "objects"], {
+    cwd: resolve("."),
+    encoding: "utf8",
+  }).trim());
+  const alternatesPath = join(repositoryRoot, ".git", "objects", "info", "alternates");
+  mkdirSync(dirname(alternatesPath), { recursive: true });
+  writeFileSync(alternatesPath, `${sourceObjects}\n`);
   const databasePath = join(stateRoot, "collaboration.db");
   const historyPath = join(stateRoot, "history.db");
   downgradeFreshStateToV3(databasePath);

@@ -1,9 +1,31 @@
-import { computeBytesSha256 } from "../domain/canonical-json.js";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+} from "node:fs";
+import { join, relative, resolve } from "node:path";
+
+import { canonicalJson } from "../domain/canonical-json.js";
 
 export interface ReviewedV4File {
   readonly path: string;
+  readonly mode: "100644" | "100755";
   readonly blobOid: string;
   readonly bytes: Buffer;
+}
+
+export interface ReviewedV4SourceIdentity {
+  readonly commitOid: string;
+  readonly treeOid: string;
+  readonly manifestSha256: string;
+  readonly lastProgressEventSha256: string;
 }
 
 export interface ReviewedV4SourceInput {
@@ -12,53 +34,274 @@ export interface ReviewedV4SourceInput {
   readonly files: readonly ReviewedV4File[];
 }
 
+export interface ReviewedV4RemoteTrust {
+  readonly url: string;
+  readonly ref: string;
+}
+
+export interface ReviewedV4PromotionSourceSnapshot {
+  readonly sourceIdentity: ReviewedV4SourceIdentity;
+  readonly execution: {
+    readonly mode: "tsx-source";
+    readonly entrypoint: "scripts/agent-collab-launcher.mjs";
+    readonly entrypointBlobOid: string;
+    readonly entrypointSha256: string;
+    readonly sourceRoot: "src";
+    readonly distAllowed: false;
+  };
+}
+
 export interface VerifiedReviewedV4Source {
   readonly status: "verified";
   readonly commitOid: string;
   readonly treeOid: string;
+  readonly manifestSha256: string;
   readonly progressEventCount: 3;
   readonly lastProgressEventSha256: string;
 }
 
-export const REVIEWED_V4_COMMIT = "cf0f1801cd21f3368a0572a6dcd6937f9fc3fb50" as const;
-export const REVIEWED_V4_TREE = "955260b898f2465b72ecaabcb43b1453a15e3ebc" as const;
-export const REVIEWED_V4_LAST_EVENT_SHA256 = "924887cd4205a7b5b9a9fabad426162d32c3ec6da886eff24b8bc074ba0c5469" as const;
+const REQUIRED_ARTIFACTS = new Set([
+  "package.json",
+  "package-lock.json",
+  "scripts/agent-collab-launcher.mjs",
+  "systemd/agent-collab.service",
+  "docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql",
+  "docs/hybrid-flow-v1-r2/IMPLEMENTATION_START.json",
+  "docs/hybrid-flow-v1-r2/PLAN_LOCK.json",
+  "docs/hybrid-flow-v1-r2/STATE_V4_PROGRESS_SEED.json",
+  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000001-r2-stg-00-pass.json",
+  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000002-stg-01-pass.json",
+  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000003-stg-02-pass.json",
+  "docs/hybrid-flow-v1-r2/stage-close/pre-v4/000004-stg-03-pass.json",
+  "docs/hybrid-flow-v1-r2/amendments/AMD-0001.json",
+  "docs/hybrid-flow-v1-r2/amendments/AMD-0001-authority.json",
+  "docs/hybrid-flow-v1-r2/amendments/evidence/architecture-slice.md",
+  "docs/hybrid-flow-v1-r2/stage-close/STG-03-source-manifest.json",
+]);
 
-const REVIEWED_FILES = [
-  ["docs/hybrid-flow-v1-r2/IMPLEMENTATION_START.json", "57a66c90e854c8d12cfb9e32949fce358533e04c", "be79f9058a683313645f7353d6775fac76d0a72ca8b6a9457c88889f792e379e"],
-  ["docs/hybrid-flow-v1-r2/PLAN_LOCK.json", "36a24097052d432eefb72f29fd7dc28659901de1", "c18672426c68c1699d9658654f611868d33a96ac4021992cce548ebc6e969cdf"],
-  ["docs/hybrid-flow-v1-r2/stage-close/pre-v4/000001-r2-stg-00-pass.json", "0a304ee2bd66fe9cfc0e9117168d989775a437b1", "45c8482fe8b52d76d7b623220fe9c41c93e0973fe843c31b24c0578e7f309561"],
-  ["docs/hybrid-flow-v1-r2/stage-close/pre-v4/000002-stg-01-pass.json", "4d8e38c999d9502e6f7309baaf5d147b1e9acc95", "4793eb7b2978ea9842a3b5001936ac136be57f9484679a246f18606d4c6ef750"],
-  ["docs/hybrid-flow-v1-r2/stage-close/pre-v4/000003-stg-02-pass.json", "a84543b45ce338da84b1146f87693841fd8d23fe", "2142a5f506cc8e4379f5c566b09c5b6579f5eb85ce809cc55e265869540a0137"],
-  ["docs/hybrid-flow-v1/STATE_V4_SCHEMA.sql", "96cd79e6eff7762a8473152fccfaa71ae21f66ca", "43ae43d139ac44f25d2132439600a5405c1082a8278aca60cffeab5e479ead8b"],
-  ["scripts/verify-implementation-progress.mjs", "50b753ccc6004764d8f1b6961b7788b5ee8fe89a", "2fcb105a59163b1b65658da1aaf3d57f4171f6bc9c40d12d2f1bf5103b0c4006"],
-  ["src/migration/coordinator.ts", "8fc885377c0da77d8a0ee8c45e1149fc5470f966", "448f8a55531ee72602cbaedc93be38b7fdb08ce113f84168d0b41622f9e04ffc"],
-] as const;
+const included = (path: string): boolean =>
+  (path.startsWith("src/") && path.endsWith(".ts")) || REQUIRED_ARTIFACTS.has(path);
 
-export function verifyReviewedV4Source(input: ReviewedV4SourceInput): VerifiedReviewedV4Source {
-  if (input.commitOid !== REVIEWED_V4_COMMIT || input.treeOid !== REVIEWED_V4_TREE) {
-    throw new Error("reviewed v4 source identity does not match the accepted commit and tree");
+const gitBlobOid = (bytes: Buffer): string => createHash("sha1")
+  .update(Buffer.from(`blob ${bytes.length}\0`))
+  .update(bytes)
+  .digest("hex");
+
+export function reviewedV4ManifestSha256(files: readonly ReviewedV4File[]): string {
+  const manifest = [...files]
+    .map(({ path, mode, blobOid, bytes }) => ({
+      path,
+      mode,
+      blobOid,
+      bytesSha256: createHash("sha256").update(bytes).digest("hex"),
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  return createHash("sha256").update(canonicalJson(manifest)).digest("hex");
+}
+
+export function verifyReviewedV4Source(
+  input: ReviewedV4SourceInput,
+  expected: ReviewedV4SourceIdentity,
+): VerifiedReviewedV4Source {
+  if (input.commitOid !== expected.commitOid || input.treeOid !== expected.treeOid) {
+    throw new Error("reviewed v4 source identity does not match the externally accepted commit and tree");
   }
-  if (!Array.isArray(input.files) || input.files.length !== REVIEWED_FILES.length) {
+  if (!Array.isArray(input.files) || input.files.length < 100) {
     throw new Error("reviewed v4 source inventory is incomplete or contains an unexpected event");
   }
   const seen = new Set<string>();
-  for (const [index, [path, blobOid, bytesSha256]] of REVIEWED_FILES.entries()) {
-    const file = input.files[index];
-    if (!file || seen.has(file.path) || file.path !== path) {
+  for (const file of input.files) {
+    if (!file || seen.has(file.path) || !included(file.path) ||
+        (file.mode !== "100644" && file.mode !== "100755")) {
       throw new Error("reviewed v4 source manifest path inventory is not exact");
     }
     seen.add(file.path);
-    if (file.blobOid !== blobOid) throw new Error(`reviewed v4 source blob identity mismatch: ${path}`);
-    if (!Buffer.isBuffer(file.bytes) || computeBytesSha256(file.bytes) !== bytesSha256) {
-      throw new Error(`reviewed v4 source bytes mismatch: ${path}`);
+    if (!Buffer.isBuffer(file.bytes) || gitBlobOid(file.bytes) !== file.blobOid) {
+      throw new Error(`reviewed v4 source bytes mismatch: ${file.path}`);
     }
+  }
+  for (const required of REQUIRED_ARTIFACTS) {
+    if (!seen.has(required)) throw new Error(`reviewed v4 source manifest is missing ${required}`);
+  }
+  const manifestSha256 = reviewedV4ManifestSha256(input.files);
+  if (manifestSha256 !== expected.manifestSha256) {
+    throw new Error("reviewed v4 source manifest identity does not match the external acceptance");
   }
   return Object.freeze({
     status: "verified",
-    commitOid: REVIEWED_V4_COMMIT,
-    treeOid: REVIEWED_V4_TREE,
+    commitOid: expected.commitOid,
+    treeOid: expected.treeOid,
+    manifestSha256,
     progressEventCount: 3,
-    lastProgressEventSha256: REVIEWED_V4_LAST_EVENT_SHA256,
+    lastProgressEventSha256: expected.lastProgressEventSha256,
+  });
+}
+
+function sourceFiles(root: string): string[] {
+  const paths: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) throw new Error("executing reviewed v4 source contains a symbolic link");
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && path.endsWith(".ts")) {
+        paths.push(relative(root, path).split("\\").join("/"));
+      }
+    }
+  };
+  visit(join(root, "src"));
+  return paths;
+}
+
+function assertSafeRemote(remote: ReviewedV4RemoteTrust): void {
+  if (!remote.url || remote.url.startsWith("-") || /[\0\r\n]/.test(remote.url) ||
+      !/^refs\/(heads|tags)\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(remote.ref) ||
+      remote.ref.includes("..") || remote.ref.endsWith("/") || remote.ref.includes("//")) {
+    throw new Error("reviewed v4 remote URL or exact ref is invalid");
+  }
+}
+
+function assertRemoteAdvertises(remote: ReviewedV4RemoteTrust, commitOid: string): void {
+  assertSafeRemote(remote);
+  let output: string;
+  try {
+    output = execFileSync("git", ["ls-remote", "--exit-code", "--refs", remote.url, remote.ref], {
+      encoding: "utf8",
+    });
+  } catch (error) {
+    throw new Error("reviewed v4 commit is not advertised by the allowlisted remote ref", { cause: error });
+  }
+  const rows = output.trim().split("\n").filter(Boolean);
+  if (rows.length !== 1 || rows[0] !== `${commitOid}\t${remote.ref}`) {
+    throw new Error("reviewed v4 commit is not the exact allowlisted remote ref target");
+  }
+}
+
+function readCanonicalWorktreeFile(
+  repositoryRoot: string,
+  path: string,
+  mode: ReviewedV4File["mode"],
+): Buffer {
+  const target = resolve(repositoryRoot, path);
+  const descriptor = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    const current = lstatSync(target);
+    const executable = (opened.mode & 0o111) !== 0;
+    if (!opened.isFile() || !current.isFile() || current.isSymbolicLink() ||
+        opened.nlink !== 1 || current.nlink !== 1 || realpathSync(target) !== target ||
+        opened.dev !== current.dev || opened.ino !== current.ino ||
+        executable !== (mode === "100755")) {
+      throw new Error(`reviewed v4 source path mode or canonical identity is invalid: ${path}`);
+    }
+    return readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+export function inspectReviewedV4ExecutionSource(input: {
+  readonly repositoryRoot: string;
+  readonly expected: ReviewedV4SourceIdentity;
+  readonly remote: ReviewedV4RemoteTrust;
+}): ReviewedV4SourceInput {
+  const repositoryRoot = resolve(input.repositoryRoot);
+  if (realpathSync(repositoryRoot) !== repositoryRoot) {
+    throw new Error("reviewed v4 repository root must be canonical");
+  }
+  const treeOid = execFileSync("git", ["-C", repositoryRoot, "rev-parse", `${input.expected.commitOid}^{tree}`], {
+    encoding: "utf8",
+  }).trim();
+  if (treeOid !== input.expected.treeOid) {
+    throw new Error("externally accepted reviewed v4 commit tree identity is invalid");
+  }
+  assertRemoteAdvertises(input.remote, input.expected.commitOid);
+  const rows = execFileSync("git", ["-C", repositoryRoot, "ls-tree", "-r", input.expected.commitOid], {
+    encoding: "utf8",
+  }).trim().split("\n").map((row) => {
+    const match = row.match(/^(100644|100755)\s+blob\s+([a-f0-9]{40})\t(.+)$/);
+    if (!match) throw new Error("externally accepted reviewed v4 tree inventory is malformed");
+    return { mode: match[1] as ReviewedV4File["mode"], blobOid: match[2]!, path: match[3]! };
+  }).filter(({ path }) => included(path));
+  const acceptedPaths = new Set(rows.map(({ path }) => path));
+  const currentPaths = new Set([
+    ...sourceFiles(repositoryRoot),
+    ...[...REQUIRED_ARTIFACTS].filter((path) => {
+      try { readFileSync(resolve(repositoryRoot, path)); return true; } catch { return false; }
+    }),
+  ]);
+  if (acceptedPaths.size !== currentPaths.size ||
+      [...acceptedPaths].some((path) => !currentPaths.has(path))) {
+    throw new Error("executing reviewed v4 source inventory differs from the externally accepted tree");
+  }
+  return {
+    commitOid: input.expected.commitOid,
+    treeOid,
+    files: rows.map(({ path, mode, blobOid }) => ({
+      path,
+      blobOid,
+      mode,
+      bytes: readCanonicalWorktreeFile(repositoryRoot, path, mode),
+    })),
+  };
+}
+
+export function captureReviewedV4PromotionSource(input: {
+  readonly repositoryRoot: string;
+  readonly remote: ReviewedV4RemoteTrust;
+}): ReviewedV4PromotionSourceSnapshot {
+  const repositoryRoot = resolve(input.repositoryRoot);
+  if (realpathSync(repositoryRoot) !== repositoryRoot) {
+    throw new Error("reviewed v4 repository root must be canonical");
+  }
+  const commitOid = execFileSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD^{commit}"], {
+    encoding: "utf8",
+  }).trim();
+  const treeOid = execFileSync("git", ["-C", repositoryRoot, "rev-parse", `${commitOid}^{tree}`], {
+    encoding: "utf8",
+  }).trim();
+  const rows = execFileSync("git", ["-C", repositoryRoot, "ls-tree", "-r", commitOid], {
+    encoding: "utf8",
+  }).trim().split("\n").map((row) => {
+    const match = row.match(/^(100644|100755)\s+blob\s+([a-f0-9]{40})\t(.+)$/);
+    if (!match) throw new Error("reviewed v4 promotion source tree inventory is malformed");
+    return { mode: match[1] as ReviewedV4File["mode"], blobOid: match[2]!, path: match[3]! };
+  }).filter(({ path }) => included(path));
+  const seedBytes = execFileSync("git", ["-C", repositoryRoot, "show",
+    `${commitOid}:docs/hybrid-flow-v1-r2/STATE_V4_PROGRESS_SEED.json`]);
+  const seed = JSON.parse(seedBytes.toString("utf8")) as { lastEventSha256?: unknown };
+  if (typeof seed.lastEventSha256 !== "string" || !/^[a-f0-9]{64}$/.test(seed.lastEventSha256)) {
+    throw new Error("reviewed v4 progress seed has no terminal event identity");
+  }
+  const currentFiles = rows.map(({ path, mode, blobOid }) => ({
+    path,
+    mode,
+    blobOid,
+    bytes: readCanonicalWorktreeFile(repositoryRoot, path, mode),
+  }));
+  const sourceIdentity = {
+    commitOid,
+    treeOid,
+    manifestSha256: reviewedV4ManifestSha256(currentFiles),
+    lastProgressEventSha256: seed.lastEventSha256,
+  };
+  verifyReviewedV4Source(inspectReviewedV4ExecutionSource({
+    repositoryRoot,
+    expected: sourceIdentity,
+    remote: input.remote,
+  }), sourceIdentity);
+  const entrypoint = rows.find(({ path }) => path === "scripts/agent-collab-launcher.mjs");
+  if (!entrypoint) throw new Error("reviewed v4 promotion source has no launcher entrypoint");
+  const entrypointBytes = execFileSync("git", ["-C", repositoryRoot, "show", `${commitOid}:${entrypoint.path}`]);
+  return Object.freeze({
+    sourceIdentity: Object.freeze(sourceIdentity),
+    execution: Object.freeze({
+      mode: "tsx-source" as const,
+      entrypoint: "scripts/agent-collab-launcher.mjs" as const,
+      entrypointBlobOid: entrypoint.blobOid,
+      entrypointSha256: createHash("sha256").update(entrypointBytes).digest("hex"),
+      sourceRoot: "src" as const,
+      distAllowed: false as const,
+    }),
   });
 }

@@ -93,7 +93,26 @@ describe("review launch JIT admission", () => {
       WHERE attempt_id=?`).pluck().get(claimed.payload?.reviewAttemptId)).toBe(1);
     expect(proof.prepare(`SELECT COUNT(*) FROM runtime_review_spawn_authorities
       WHERE attempt_id=?`).pluck().get(claimed.payload?.reviewAttemptId)).toBe(0);
+    expect(proof.prepare("SELECT status FROM runs WHERE id=?").pluck().get(claimed.id))
+      .toBe("completed");
     proof.close();
+
+    const lane = gate.get("jit-review")!.lanes.find((candidate) =>
+      candidate.agent === "codex" && candidate.role === "auditor")!;
+    expect(lane).toMatchObject({ status: "deferred", terminalAt: 3 });
+    expect(lane.attempts.at(-1)).toMatchObject({
+      status: "provider_unavailable",
+      terminalAt: 3,
+      error: { kind: "model_unavailable", agent: "codex" },
+    });
+    expect(() => gate.recordProviderUnavailable({
+      reviewId: "jit-review",
+      agent: "codex",
+      role: "auditor",
+      attemptId: String(claimed.payload?.reviewAttemptId),
+      error: lane.attempts.at(-1)!.error,
+      terminalAt: 3,
+    })).not.toThrow();
 
     runs.close();
     gate.close();

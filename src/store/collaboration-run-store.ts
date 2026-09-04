@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { isDeepStrictEqual } from "node:util";
 import { sanitizeResult } from "../security/redaction.js";
 import { openStateStoreAccess, type StateStoreInput } from "./state-database-fence.js";
+import { denyLegacyLinearDelegation } from "../runtime/legacy-linear-quarantine.js";
 import {
   restoreCollaborationRun,
   serializeCollaborationRun,
@@ -138,6 +139,7 @@ export class CollaborationRunStore {
   }
 
   createStartedIfAbsent(workflowId: string, run: CollaborationRun, event: WorkflowEvent, now = Date.now()): CollaborationRun {
+    denyLegacyLinearDelegation();
     return this.db.transaction(() => {
       const existing = this.assertReplayCompatible(workflowId, run);
       if (existing) return existing;

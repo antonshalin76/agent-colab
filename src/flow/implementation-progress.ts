@@ -888,10 +888,23 @@ export function verifyAcceptedAmendmentEvents(input: {
 
 export function renderImplementationProgressProjection(events: readonly JsonObject[]): ProgressProjection {
   const jsonlBytes = Buffer.from(events.length === 0 ? "" : `${events.map(canonicalJson).join("\n")}\n`, "utf8");
-  const lines = events.map((event) => {
-    const marker = event.eventType === "step_completed" ? "x" : " ";
-    const subject = event.stageId ?? event.amendmentId ?? event.eventId;
-    return `- [${marker}] ${String(subject)} (${String(event.eventType)})`;
+  const stages = [...BASELINE_STAGES, ...POST_AMENDMENT_STAGES];
+  const stageStatus = new Map<string, "completed" | "eligible" | "pending">(
+    stages.map((stageId) => [stageId, "pending"]),
+  );
+  for (const event of events) {
+    const stageId = typeof event.stageId === "string" ? event.stageId : undefined;
+    if (!stageId || !stageStatus.has(stageId)) continue;
+    if (event.eventType === "step_completed") stageStatus.set(stageId, "completed");
+    else if (event.eventType === "step_eligible" && stageStatus.get(stageId) !== "completed") {
+      stageStatus.set(stageId, "eligible");
+    }
+  }
+  const amendmentLines = events.filter((event) => event.eventType === "amendment_accepted")
+    .map((event) => `- [x] ${String(event.amendmentId)} (accepted)`);
+  const stageLines = stages.map((stageId) => {
+    const status = stageStatus.get(stageId)!;
+    return `- [${status === "completed" ? "x" : " "}] ${stageId} (${status})`;
   });
   const markdownBytes = Buffer.from([
     "# Verified implementation progress",
@@ -901,7 +914,11 @@ export function renderImplementationProgressProjection(events: readonly JsonObje
     "Historical certification receipt: 40/40 launches.",
     "Active immutable post-start authority: 24 launches.",
     "",
-    ...lines,
+    "Accepted amendments:",
+    ...(amendmentLines.length > 0 ? amendmentLines : ["- none"]),
+    "",
+    "Fixed stage inventory:",
+    ...stageLines,
     "",
   ].join("\n"), "utf8");
   return { jsonlBytes, markdownBytes };

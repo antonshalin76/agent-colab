@@ -1,21 +1,23 @@
 import {
   chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { MigrationCoordinator, verifyCompatibilityRuntime } from "../src/migration/coordinator.js";
-import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
+import { verifyCompatibilityRuntime } from "../src/migration/coordinator.js";
+import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
+import { HistoryIndex } from "../src/history/index.js";
+import { HistoryVisibilityPolicy } from "../src/history/visibility-policy.js";
+import { MapControlPlane } from "../src/flow/map-admin.js";
+import { AuthorizedV4TestCoordinator } from "./helpers/authorized-v4-coordinator.js";
 import {
   GRAPH_EXECUTION_MODE,
   openExistingStateLayout,
 } from "../src/store/state-layout.js";
-import { RunStore } from "../src/store/run-store.js";
 import { dropGraphV4Schema } from "./helpers/graph-schema.js";
 
 const launcher = resolve("scripts/agent-collab-launcher.mjs");
@@ -30,6 +32,16 @@ const fixture = () => {
   const systemctl = join(bin, "systemctl");
   writeFileSync(systemctl, "#!/bin/sh\nprintf 'inactive\\n'\nexit 3\n");
   chmodSync(systemctl, 0o755);
+  mkdirSync(stateRoot);
+  initializeCurrentExecutionSchema(join(stateRoot, "collaboration.db"));
+  const map = new MapControlPlane(join(stateRoot, "collaboration.db"));
+  map.close();
+  const history = new HistoryIndex(join(stateRoot, "history.db"), {
+    visibilityPolicy: new HistoryVisibilityPolicy(),
+  });
+  history.close();
+  const historyDatabase = new Database(join(stateRoot, "history.db"));
+  try { historyDatabase.pragma("user_version = 2"); } finally { historyDatabase.close(); }
   const env = {
     ...process.env,
     PATH: `${bin}:${process.env.PATH ?? ""}`,
@@ -122,54 +134,11 @@ const downgradeToV3 = (path: string): void => {
   }
 };
 
-const legacyStoreContractBytes = (statePath: string, historyPath: string): string => {
-  const runs = new RunStore(statePath);
-  try {
-    const input = {
-      idempotencyKey: "legacy-write-key",
-      stage: "testing",
-      priority: 3,
-      now: 100,
-      payload: { value: 1 },
-    } as const;
-    const first = runs.enqueueExact(input);
-    const replay = runs.enqueueExact(input);
-    expect(replay.id).toBe(first.id);
-    expect(() => runs.enqueueExact({ ...input, stage: "implementation" })).toThrow(/conflicts/i);
-  } finally {
-    runs.close();
-  }
-  const providers = new ProviderHealthStore(statePath, { cooldownMs: 60_000 });
-  const providerSnapshot = providers.snapshot();
-  providers.close();
-  const history = new Database(historyPath);
-  try {
-    history.prepare(`INSERT INTO history_issues(project,source_path,code,source_line,details)
-      VALUES ('/legacy','/legacy/source','write',2,'same bytes')`).run();
-  } finally {
-    history.close();
-  }
-  const stateRead = new Database(statePath, { readonly: true });
-  const historyRead = new Database(historyPath, { readonly: true });
-  try {
-    return JSON.stringify({
-      run: stateRead.prepare(`SELECT id,idempotency_key,stage,priority,status,created_at,
-        next_attempt_at,launched,attempt_count,payload FROM runs WHERE idempotency_key='legacy-write-key'`).get(),
-      providers: providerSnapshot,
-      history: historyRead.prepare(`SELECT project,source_path,code,source_line,details
-        FROM history_issues WHERE project='/legacy'`).get(),
-    }, (_key, value) => typeof value === "string" && /^[0-9a-f-]{36}$/.test(value) ? "<generated-id>" : value);
-  } finally {
-    historyRead.close();
-    stateRead.close();
-  }
-};
-
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe("deployed v3/v4 compatibility runtime", () => {
+describe("read-only v3/v4 compatibility verification", () => {
   it.each([3, 4] as const)("reopens a populated v%s/2 pair read-only with graph execution disabled", (version) => {
     const fx = fixture();
     expect(fx.run("status").status).toBe(0);
@@ -205,11 +174,11 @@ describe("deployed v3/v4 compatibility runtime", () => {
     expect(physicalInventory(fx.stateRoot)).toEqual(inventoryBefore);
   });
 
-  it("accepts the migration-owned routing-v5 v4 profile before the offline review extension", () => {
+  it("accepts the migration-owned reviewed-v4 profile", () => {
     const fx = fixture();
     expect(fx.run("status").status).toBe(0);
     downgradeToV3(fx.state);
-    expect(new MigrationCoordinator({
+    expect(new AuthorizedV4TestCoordinator({
       stateDatabase: fx.state,
       historyDatabase: fx.history,
     }).migrateToV4()).toMatchObject({
@@ -218,7 +187,7 @@ describe("deployed v3/v4 compatibility runtime", () => {
     expect(verifyCompatibilityRuntime({
       stateDatabase: fx.state,
       historyDatabase: fx.history,
-    })).toMatchObject({ stateProfile: "v4_routing_v5", reviewSchema: "routing_v5" });
+    })).toMatchObject({ stateProfile: "v4_review_v3", reviewSchema: "review_v3" });
   });
 
   it.each([
@@ -422,20 +391,6 @@ describe("deployed v3/v4 compatibility runtime", () => {
     expect(schemaAndRows(partial.state)).toEqual(partialBefore);
   });
 
-  it("keeps deterministic legacy writes byte-compatible across verified v3/2 and v4/2", () => {
-    const v3 = fixture();
-    const v4 = fixture();
-    expect(v3.run("status").status).toBe(0);
-    expect(v4.run("status").status).toBe(0);
-    downgradeToV3(v3.state);
-    expect(verifyCompatibilityRuntime({ stateDatabase: v3.state, historyDatabase: v3.history }).stateVersion).toBe(3);
-    expect(verifyCompatibilityRuntime({ stateDatabase: v4.state, historyDatabase: v4.history }).stateVersion).toBe(4);
-
-    expect(legacyStoreContractBytes(v3.state, v3.history)).toBe(legacyStoreContractBytes(v4.state, v4.history));
-    expect(verifyCompatibilityRuntime({ stateDatabase: v3.state, historyDatabase: v3.history }).graphSchema).toBe("absent");
-    expect(verifyCompatibilityRuntime({ stateDatabase: v4.state, historyDatabase: v4.history }).graphSchema).toBe("complete_disabled");
-  });
-
   it("exposes a deterministic CLI reopen receipt and never honors an environment enable switch", () => {
     const fx = fixture();
     expect(fx.run("status").status).toBe(0);
@@ -459,43 +414,5 @@ describe("deployed v3/v4 compatibility runtime", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/existing state root/i);
     expect(() => readFileSync(fx.state)).toThrow();
-  });
-
-  it("launches a compatibility-only process that cannot claim work or serve MCP", async () => {
-    const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
-    const child = spawn(process.execPath, [launcher, "compatibility-runtime"], {
-      cwd: resolve("."),
-      env: { ...fx.env, AGENT_COLLAB_GRAPH_EXECUTION: "enabled" },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-    const deadline = new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error(`compatibility runtime did not become ready: ${stderr}`)), 10_000).unref();
-    });
-    await Promise.race([
-      new Promise<void>((resolveReady) => {
-        child.stdout.on("data", () => { if (stdout.includes("\n")) resolveReady(); });
-      }),
-      deadline,
-    ]);
-    const observation = JSON.parse(stdout.trim());
-    expect(observation).toMatchObject({
-      schemaVersion: "compatibility-runtime-process-observation/v1",
-      graphExecution: "disabled",
-      serviceSurface: "compatibility_only",
-      queueClaim: "disabled",
-      providerLaunch: "disabled",
-      mcpServing: "disabled",
-    });
-    expect(child.exitCode).toBeNull();
-    child.kill("SIGTERM");
-    const [exitCode, signal] = await once(child, "exit") as [number | null, NodeJS.Signals | null];
-    expect([exitCode, signal]).toEqual([0, null]);
   });
 });

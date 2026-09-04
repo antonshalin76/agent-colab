@@ -44,15 +44,43 @@ const deferredReviews = () => {
       deferred = false;
       return { status: "activated", lanes: [{}, {}] };
     }),
+    hasUnconsumedRecoveryGeneration: vi.fn(() => deferred),
   };
   return reviews;
+};
+
+const recoveryDemand = (...agents: Array<"grok" | "claude" | "codex">) => {
+  const demanded = new Set(agents);
+  return {
+    deferredReviewIds: vi.fn((agent: "grok" | "claude" | "codex") =>
+      demanded.has(agent) ? [`${agent}-review`] : []),
+    get: vi.fn((reviewId: string) => {
+      const agent = reviewId.replace("-review", "") as "grok" | "claude" | "codex";
+      return { project: "/repo", lanes: [
+        { agent, role: "auditor", status: "deferred" },
+        { agent, role: "critic", status: "deferred" },
+      ] };
+    }),
+    barrier: vi.fn(() => ({ satisfied: false })),
+    receiptPairCursor: vi.fn(() => ({ scopeRevision: 1,
+      predecessorReceiptIds: { source: null, readiness: null } })),
+    admissionTuple: vi.fn(() => ({ laneRevision: 0, latestOrdinal: null,
+      latestEvidenceHash: null })),
+    captureReviewReceiptPair: vi.fn(() => ({ lifecycle: "pending" })),
+    activateDeferred: vi.fn((input: { agent: "grok" | "claude" | "codex" }) => {
+      demanded.delete(input.agent);
+      return { status: "activated", lanes: [{}, {}] };
+    }),
+    hasUnconsumedRecoveryGeneration: vi.fn((agent: "grok" | "claude" | "codex") =>
+      demanded.has(agent)),
+  };
 };
 
 describe("automatic provider recovery loop", () => {
   it("recovers each harness independently and never reprobes a healthy harness", async () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    const reviews = { deferredReviewIds: vi.fn(() => []) };
+    const reviews = recoveryDemand("grok", "claude");
     const probe = vi.fn(async (agent: "grok" | "claude" | "codex") => agent === "grok"
       ? { ready: true }
       : { ready: false, failure: { kind: "quota" as const } });
@@ -61,7 +89,7 @@ describe("automatic provider recovery loop", () => {
       reviews: reviews as never, evidenceCapture, probe, agents: ["grok", "claude"] });
     expect(first).toEqual([
       { agent: "grok", status: "recovered", generation: 1,
-        rejoin: { activated: 0, stale: 0, skippedUnreadableProject: 0,
+        rejoin: { activated: 2, stale: 0, skippedUnreadableProject: 0,
           skippedSatisfied: 0, skippedHarnessUnavailable: 0 } },
       { agent: "claude", status: "unavailable", generation: 0 },
     ]);
@@ -79,7 +107,7 @@ describe("automatic provider recovery loop", () => {
   it("resumes a due failed harness after restart with exactly one new generation", async () => {
     const path = database();
     const first = new ProviderHealthStore(path, { cooldownMs: 1_000 });
-    const reviews = { deferredReviewIds: vi.fn(() => []) };
+    const reviews = recoveryDemand("claude");
     await runAutomaticProviderRecovery({ now: 10, health: first, reviews: reviews as never,
       evidenceCapture, agents: ["claude"], probe: async () => ({ ready: false,
         failure: { kind: "network_timeout" } }) });
@@ -90,7 +118,7 @@ describe("automatic provider recovery loop", () => {
       reviews: reviews as never, evidenceCapture, agents: ["claude"],
       probe: async () => ({ ready: true }) });
     expect(recovered).toEqual([{ agent: "claude", status: "recovered", generation: 1,
-      rejoin: { activated: 0, stale: 0, skippedUnreadableProject: 0,
+      rejoin: { activated: 2, stale: 0, skippedUnreadableProject: 0,
         skippedSatisfied: 0, skippedHarnessUnavailable: 0 } }]);
     expect(reopened.latestRecoveryGeneration("claude")).toBe(1);
     reopened.close();
@@ -122,6 +150,29 @@ describe("automatic provider recovery loop", () => {
     afterRestart.close();
   });
 
+  it("mints a fresh generation for healthy provider state with durable deferred demand", async () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    health.recordSuccess("grok", 1);
+    const reviews = recoveryDemand("grok");
+    const probe = vi.fn(async () => ({ ready: true as const }));
+
+    const result = await runAutomaticProviderRecovery({
+      now: 10,
+      health,
+      reviews: reviews as never,
+      evidenceCapture,
+      agents: ["grok"],
+      probe,
+    });
+
+    expect(result).toMatchObject([{ status: "recovered", generation: 1,
+      rejoin: { activated: 2 } }]);
+    expect(probe).toHaveBeenCalledOnce();
+    expect(health.latestRecoveryGeneration("grok")).toBe(1);
+    health.close();
+  });
+
   it("retries rejoin after transient evidence-capture infrastructure failure", async () => {
     const path = database();
     const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
@@ -140,16 +191,73 @@ describe("automatic provider recovery loop", () => {
     const probe = vi.fn(async () => ({ ready: true }));
     const first = await runAutomaticProviderRecovery({ now: 12, health,
       reviews: reviews as never, evidenceCapture: capture, agents: ["claude"], probe });
-    expect(first[0]).toMatchObject({ status: "rejoined",
+    expect(first[0]).toMatchObject({ status: "unavailable", generation: 1,
       rejoin: { activated: 0, skippedHarnessUnavailable: 0 } });
     expect(reviews.activateDeferred).not.toHaveBeenCalled();
+    expect(health.get("claude")).toMatchObject({ health: "unavailable", retryAt: 1_012 });
 
     captureReady = true;
     const second = await runAutomaticProviderRecovery({ now: 13, health,
       reviews: reviews as never, evidenceCapture: capture, agents: ["claude"], probe });
-    expect(second[0]).toMatchObject({ status: "rejoined", rejoin: { activated: 2 } });
+    expect(second[0]).toMatchObject({ status: "not_due", generation: 1 });
+    const third = await runAutomaticProviderRecovery({ now: 1_012, health,
+      reviews: reviews as never, evidenceCapture: capture, agents: ["claude"], probe });
+    expect(third[0]).toMatchObject({ status: "recovered", generation: 2,
+      rejoin: { activated: 2 } });
     expect(reviews.activateDeferred).toHaveBeenCalledTimes(1);
+    expect(probe).toHaveBeenCalledOnce();
+    health.close();
+  });
+
+  it("does not probe or mutate provider state when no deferred barrier demands recovery", async () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    const before = health.snapshot();
+    const probe = vi.fn(async () => ({ ready: true as const }));
+
+    const result = await runAutomaticProviderRecovery({
+      now: 10,
+      health,
+      reviews: { deferredReviewIds: vi.fn(() => []) } as never,
+      evidenceCapture,
+      agents: ["grok", "claude", "codex"],
+      probe,
+    });
+
+    expect(result.map(({ status }) => status)).toEqual(["not_due", "not_due", "not_due"]);
     expect(probe).not.toHaveBeenCalled();
+    expect(health.snapshot()).toEqual(before);
+    health.close();
+  });
+
+  it("releases the durable probe claim instead of recording provider failure on worker shutdown", async () => {
+    const path = database();
+    const health = new ProviderHealthStore(path, { cooldownMs: 1_000 });
+    const reviews = recoveryDemand("claude");
+    const controller = new AbortController();
+    const probe = vi.fn((_agent: "grok" | "claude" | "codex", signal?: AbortSignal) =>
+      new Promise<{ ready: true }>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }));
+    const recovering = runAutomaticProviderRecovery({
+      now: 10,
+      health,
+      reviews: reviews as never,
+      evidenceCapture,
+      agents: ["claude"],
+      probe,
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce());
+
+    controller.abort(new Error("worker shutdown"));
+
+    await expect(recovering).rejects.toThrow("worker shutdown");
+    expect(health.get("claude")).toMatchObject({
+      health: "probing",
+      attemptClaimed: false,
+      failureCount: 0,
+    });
     health.close();
   });
 });

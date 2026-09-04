@@ -13,10 +13,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   bindRereadProgressEvents,
   initializeCurrentExecutionSchema,
-  MigrationCoordinator,
   restoreStateV4Backup,
   type V4MigrationReceipt,
 } from "../src/migration/coordinator.js";
+import { AuthorizedV4TestCoordinator as MigrationCoordinator } from "./helpers/authorized-v4-coordinator.js";
 import { appendStateV4GuardEvent, assertPhysicalRestoreAllowed } from "../src/migration/state-v4-restore-authority.js";
 import { StateV4RestoreGuard } from "../src/migration/operational-restore.js";
 import {
@@ -468,7 +468,7 @@ describe("launch authority state schema v4 migration", () => {
       (review_id,stage_id,artifact,artifact_hash,approval_scope,idempotency_key,
        run_state,created_at,launch_authority_version)
       VALUES ('bad','stage',X'03','bad','workspace-read','bad',
-        'FULL_CROSS_PROVIDER',30,3)`).run()).toThrow(/check constraint/i);
+        'FULL_CROSS_PROVIDER',30,4)`).run()).toThrow(/check constraint/i);
     db.close();
   });
 

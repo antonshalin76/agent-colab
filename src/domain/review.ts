@@ -176,8 +176,8 @@ export function createReviewPlan(input: ReviewInput): ReviewPlan {
   if (AGENTS.every((agent) => input.health[agent] === "disabled")) {
     throw new Error("No enabled provider is available for review");
   }
-  if (input.health.codex !== "healthy") {
-    throw new Error("mandatory Codex auditor/critic pair is unavailable");
+  if (input.health.codex === "disabled") {
+    throw new Error("mandatory Codex auditor/critic pair is disabled");
   }
   if (healthy.length === AGENTS.length) {
     return {

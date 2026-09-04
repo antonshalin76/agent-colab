@@ -30,7 +30,9 @@ describe("source launchers", () => {
       });
 
       expect(launched.status, launched.stderr).toBe(0);
-      expect(JSON.parse(launched.stdout)).toMatchObject({ protocol: "agent-collab/v2" });
+      expect(JSON.parse(launched.stdout)).toMatchObject({
+        protocol: "agent-collab-review-readiness/v1",
+      });
       expect(readFileSync(compiledCli, "utf8")).toContain("STALE_DIST_EXECUTED");
     } finally {
       rmSync(stateRoot, { recursive: true, force: true });
@@ -82,7 +84,7 @@ describe("source launchers", () => {
     expect(packageJson.scripts["runtime:verify"]).toBeUndefined();
     expect(packageJson.dependencies.tsx).toBe("4.22.3");
     expect(readFileSync("systemd/agent-collab.service", "utf8"))
-      .toContain("scripts/agent-collab-launcher.mjs worker");
+      .toContain("scripts/agent-collab-launcher.mjs review-worker");
     for (const path of [
       "scripts/agent-collab-launcher.mjs",
       "scripts/agent-collab-eval-launcher.mjs",

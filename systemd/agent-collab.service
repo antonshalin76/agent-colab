@@ -1,16 +1,26 @@
 [Unit]
-Description=Codex, Grok, and Claude collaboration worker
+Description=Codex, Grok, and Claude review-only collaboration worker
 After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/agent-collab
-ExecStart=/usr/bin/env node %h/agent-collab/scripts/agent-collab-launcher.mjs worker
-Restart=on-failure
+WorkingDirectory=%h/Source/agent-collab
+ExecStartPre=/usr/bin/env node %h/Source/agent-collab/scripts/agent-collab-launcher.mjs review-readiness
+ExecStart=/usr/bin/env node %h/Source/agent-collab/scripts/agent-collab-launcher.mjs review-worker
+Restart=always
 RestartSec=3
+TimeoutStopSec=35
+KillMode=mixed
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 Environment=AGENT_COLLAB_STATE_DIR=%h/.local/share/agent-collab
 Environment=AGENT_COLLAB_GROK_BIN=%h/.local/bin/grok
 Environment=AGENT_COLLAB_CLAUDE_BIN=%h/.local/bin/claude

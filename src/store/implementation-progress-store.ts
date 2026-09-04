@@ -1,7 +1,11 @@
 import Database from "better-sqlite3";
 import { canonicalJson, computeJsonSha256 } from "../domain/canonical-json.js";
 import { assertGraphV4PersistenceSchema } from "../migration/graph-v4-schema.js";
-import { openStateStoreAccess, type StateDatabaseAccess } from "./state-database-fence.js";
+import {
+  openStateStoreAccess,
+  type StateDatabaseAccess,
+  type StateStoreInput,
+} from "./state-database-fence.js";
 import {
   BASELINE_PLAN_SHA256,
   IMPLEMENTATION_PLAN_ID,
@@ -78,12 +82,12 @@ export class ImplementationProgressStore {
   readonly #activeAccess = new WeakSet<object>();
   #closed = false;
 
-  constructor(databasePath: string, options: {
+  constructor(database: StateStoreInput, options: {
     faultInjector?: (point: string) => void;
     progressAuthority?: ProgressEventCommitPort;
     amendmentAuthority?: AmendmentCommitPort;
   } = {}) {
-    const opened = openStateStoreAccess(databasePath);
+    const opened = openStateStoreAccess(database);
     this.#lease = opened.access;
     this.#closeLease = opened.close;
     this.#database = opened.access.database;

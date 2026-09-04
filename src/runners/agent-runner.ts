@@ -14,7 +14,11 @@ import {
   type ReviewProviderId,
   type Stage,
 } from "../domain/routing.js";
-import { classifyProviderFailure, classifyProviderFailureDetail } from "../domain/outcomes.js";
+import {
+  classifyProviderFailure,
+  classifyProviderFailureDetail,
+  ProviderTransportFailure,
+} from "../domain/outcomes.js";
 import { redactSensitive } from "../security/redaction.js";
 import { ApprovalLedger } from "../security/approval-ledger.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
@@ -475,6 +479,7 @@ export class AgentRunner {
     onLaunch: (info: Record<string, unknown>) => void = NOOP_LAUNCH_INFO,
     onLaunchIntent: (info: Record<string, unknown>) => void = NOOP_LAUNCH_INFO,
     onProvenNoSpawn: () => void = NOOP_NO_SPAWN,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     let payload: TaskPayload;
     let command: CommandSpec;
@@ -617,20 +622,40 @@ export class AgentRunner {
 
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(async () => {
-        timedOut = true;
+    let interrupted = false;
+    let terminating: Promise<void> | undefined;
+    const terminate = (): Promise<void> => {
+      terminating ??= (async () => {
         await terminateProcess(launched, "SIGTERM");
         await delay(2_000);
         await terminateProcess(launched, "SIGKILL");
+      })();
+      return terminating;
+    };
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(async () => {
+        timedOut = true;
+        await terminate();
         reject(new Error("agent process group timeout"));
       }, command.timeoutMs);
       timer.unref();
     });
+    let abortHandler: (() => void) | undefined;
+    const interruptedByShutdown = new Promise<never>((_resolve, reject) => {
+      abortHandler = () => {
+        interrupted = true;
+        void terminate().then(() => reject(new ProviderTransportFailure(
+          "agent process group interrupted by worker shutdown",
+          "network_timeout",
+        )));
+      };
+      if (signal?.aborted) abortHandler();
+      else signal?.addEventListener("abort", abortHandler, { once: true });
+    });
     let terminalOutcome: Exclude<ProviderTelemetryOutcome, "succeeded" | "pre_session_failure"> =
       "provider_failure";
     try {
-      const result = await Promise.race([launched.result, timeout]);
+      const result = await Promise.race([launched.result, timeout, interruptedByShutdown]);
       if (timedOut) await timeout;
       if (result.exitCode !== 0) {
         throw Object.assign(new Error(`agent exited ${result.exitCode}`), { stderr: result.stderr });
@@ -697,11 +722,12 @@ export class AgentRunner {
       }, mapProviderTelemetryOutcome({
         provider: payload.decision.agent,
         providerSessionRef: commandPinnedProviderSession(payload),
-        outcome: timedOut ? "timeout" : terminalOutcome,
+        outcome: timedOut || interrupted ? "timeout" : terminalOutcome,
         usageReport: null,
       }));
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      if (abortHandler) signal?.removeEventListener("abort", abortHandler);
     }
   }
 }

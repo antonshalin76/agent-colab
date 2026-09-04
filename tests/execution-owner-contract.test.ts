@@ -1,34 +1,27 @@
 import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
-const source = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
+const source = (path: string): string => readFileSync(new URL(path, import.meta.url), "utf8");
 
-describe("execution admission ownership", () => {
-  it("keeps snapshot and admission decisions out of service, runtime and runner adapters", () => {
-    const service = source("../src/app/service.ts");
-    const runtime = source("../src/runtime/collaboration-runtime.ts");
-    const runner = source("../src/runners/agent-runner.ts");
+describe("review-only execution ownership", () => {
+  it("keeps review admission, review persistence and provider recovery in their dedicated owners", () => {
+    const composition = source("../src/app/review-runtime-composition.ts");
+    const application = source("../src/app/review-application-service.ts");
+    const worker = source("../src/app/review-worker-runtime.ts");
 
-    expect(service).toContain("this.runtime.prepareCandidate");
-    expect(service).toContain("this.runtime.reviewTarget");
-    expect(service).not.toMatch(/createExecutionSnapshot|validateAndConsume|mapAdmissionTargetBytes/);
-    expect(runtime).toContain("new ExecutionAdmission");
-    expect(runtime).not.toMatch(/verifyCurrentMapProfile|delegatedAuthorityConsumerKey|mapAdmissionReviewExpectation/);
-    expect(runner).toContain("new ExecutionAdmission");
-    expect(runner).not.toMatch(/mapAdmissionGates|delegatedAuthorityConsumerKey|mapAdmissionTargetBytes/);
+    expect(composition).toContain("ReviewApplicationService");
+    expect(composition).toContain("RunGateUnitOfWork");
+    expect(application).toContain("captureAdmission");
+    expect(worker).toContain("runAutomaticProviderRecovery");
+    expect(`${composition}\n${application}\n${worker}`)
+      .not.toMatch(/ExecutionAdmission|CollaborationRuntime|CollaborationRunStore/);
   });
 
-  it("has no runtime cross-provider workflow fallback surface", () => {
-    const production = [
-      source("../src/workflow/workflow.ts"),
-      source("../src/runtime/collaboration-runtime.ts"),
-      source("../src/store/collaboration-run-store.ts"),
-      source("../src/worker/durable-worker.ts"),
-      source("../src/worktree/lease-store.ts"),
-      source("../src/cli.ts"),
-    ].join("\n");
-    expect(production).not.toMatch(
-      /HANDOFF_TRANSFER_CONFLICT|handoff_dispatched|cross-provider-replay|deferredReplay|transferImmediate/,
+  it("publishes no cross-provider workflow fallback from the review worker", () => {
+    const worker = source("../src/app/review-worker-runtime.ts");
+    expect(worker).not.toMatch(
+      /HANDOFF_TRANSFER_CONFLICT|handoff_dispatched|cross-provider-replay|transferImmediate|allowFallback/,
     );
   });
 });

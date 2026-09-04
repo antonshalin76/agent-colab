@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { appendStateV4GuardEvent, inspectStateV4OpenAdmission } from "../migration/state-v4-restore-authority.js";
 import { acquireStateRootLease } from "./state-layout.js";
+import { acquireStateOpenAdmission } from "./state-open-admission.js";
 
 export type StateDatabaseAdmissionMode = "offline_observation" | "service_runtime" | "mutating_service";
 
@@ -316,8 +317,10 @@ export function openStateDatabaseLease(
       ownerClosed: false, released: false }, issuanceToken);
   }
   const canonical = canonicalStateDatabaseIdentity(databasePath);
-  const rootLease = acquireStateRootLease(canonical.root, "shared");
+  const openAdmission = acquireStateOpenAdmission(canonical.root, "shared");
+  let rootLease: ReturnType<typeof acquireStateRootLease> | undefined;
   try {
+    rootLease = acquireStateRootLease(canonical.root, "shared");
     faultInjector?.("after_root_fence");
     const current = statSync(canonical.path);
     if (current.dev !== canonical.databaseIdentity.dev || current.ino !== canonical.databaseIdentity.ino || current.nlink !== 1) {
@@ -331,9 +334,13 @@ export function openStateDatabaseLease(
       throw new Error("pinned state database identity changed during admission");
     }
     const database = new Database(pinnedDatabase, options);
+    const releaseFences = (): void => {
+      try { rootLease?.release(); }
+      finally { openAdmission.release(); }
+    };
     const state: LeaseState = { database, canonicalPath: canonical.path,
       databaseIdentity: canonical.databaseIdentity, rootIdentity: canonical.rootIdentity,
-      generation: randomUUID(), releaseRoot: rootLease.release,
+      generation: randomUUID(), releaseRoot: releaseFences,
       borrows: 0, ownerClosed: false, released: false };
     try {
       rootLease.assertCurrent();
@@ -342,7 +349,8 @@ export function openStateDatabaseLease(
     catch (error) { database.close(); throw error; }
     return new IssuedStateDatabaseLease(state, issuanceToken);
   } catch (error) {
-    rootLease.release();
+    try { rootLease?.release(); }
+    finally { openAdmission.release(); }
     throw error;
   }
 }

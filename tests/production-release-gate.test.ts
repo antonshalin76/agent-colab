@@ -43,11 +43,11 @@ describe("production runtime quarantine", () => {
       timeout: 30_000,
     });
     expect(launched.status).not.toBe(0);
-    expect(`${launched.stdout}\n${launched.stderr}`).toMatch(/production runtime is quarantined/);
+    expect(`${launched.stdout}\n${launched.stderr}`).toMatch(/permanently quarantined/);
     expect(existsSync(stateRoot)).toBe(false);
   });
 
-  it("keeps offline diagnostics available without a release", () => {
+  it("keeps read-only status fail-closed and side-effect free without existing state", () => {
     const root = fixture();
     const stateRoot = join(root, "state");
     const launched = spawnSync(process.execPath, ["scripts/agent-collab-launcher.mjs", "status"], {
@@ -56,7 +56,7 @@ describe("production runtime quarantine", () => {
       env: { ...process.env, AGENT_COLLAB_STATE_DIR: stateRoot },
       timeout: 30_000,
     });
-    expect(launched.status).toBe(0);
-    expect(existsSync(stateRoot)).toBe(true);
+    expect(launched.status).not.toBe(0);
+    expect(existsSync(stateRoot)).toBe(false);
   });
 });

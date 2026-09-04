@@ -10,13 +10,9 @@ import { buildCodexCommand, normalizeCodexResult } from "../src/runners/codex.js
 import { buildProviderCommand, type CommandSpec } from "../src/runners/provider-command.js";
 import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 import { assertCurrentControlMapLearningLaunchBinding, projectMapLearning } from "../src/flow/map-admin.js";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.js";
-import { CollaborationRuntime } from "../src/runtime/collaboration-runtime.js";
-import { RunStore } from "../src/store/run-store.js";
-import { createCollaborationRun } from "../src/workflow/workflow.js";
 import { normalizeReviewProviderResult } from "../src/domain/review-verdict.js";
 import { classifyProviderFailureDetail, ProviderTransportFailure } from "../src/domain/outcomes.js";
 
@@ -911,44 +907,6 @@ describe("process-only AgentRunner", () => {
     expect(launch).not.toHaveBeenCalled();
   });
 
-  it("rejects a coherently tampered queued assignment before launch", async () => {
-    const root = mkdtempSync(join(tmpdir(), "agent-collab-runner-assignment-"));
-    const project = join(root, "project");
-    const database = join(root, "state.db");
-    mkdirSync(project);
-    try {
-      initializeCurrentExecutionSchema(database);
-      const workspace = captureWorkspaceFingerprint(project);
-      const run = createCollaborationRun({ taskId: "tampered-assignment", origin: "codex",
-        health: { grok: "healthy", codex: "healthy" }, stages: [{
-          id: "coordination", kind: "coordination", role: "coordinator",
-          artifactRef: `artifact:${"a".repeat(64)}`, artifactHash: "a".repeat(64),
-          artifactBytes: 1, changedFiles: workspace.changedFiles.length,
-          approvalScope: "workspace-read", idempotencyKey: "coordination", project,
-          prompt: `${codexLearningContext}\n\ncoordinate`, requester: "codex",
-          sourceFingerprint: workspace.fingerprint, mapLearning: codexLearningBinding,
-        }] });
-      const runtime = new CollaborationRuntime(database);
-      runtime.createAndStart("workflow", run, [], 1);
-      const runs = new RunStore(database);
-      runtime.drainDispatchOutbox(runs, 1);
-      const queued = runs.getByIdempotencyKey("workflow:dispatch:0")!;
-      const forged = structuredClone(queued) as ProcessTask;
-      const identity = forged.payload!.workflowDispatchIdentity as Record<string, unknown>;
-      const forgedSession = "123e4567-e89b-42d3-a456-426614174999";
-      forged.payload!.sessionId = forgedSession;
-      forged.payload!.workflowDispatchIdentity = { ...identity, sessionId: forgedSession };
-      const launch = vi.fn(); const onLaunch = vi.fn();
-      const runner = new AgentRunner({ binaries: { grok: "/bin/grok", claude: "/bin/claude", codex: "/bin/codex" },
-        timeoutMs: 90_000, authorizationDatabasePath: database, launcher: { launch } });
-      await expect(runner.run(forged, onLaunch)).resolves.toMatchObject({
-        kind: "invalid_request", error: expect.stringMatching(/assignment|durable dispatch/i),
-      });
-      expect(launch).not.toHaveBeenCalled(); expect(onLaunch).not.toHaveBeenCalled();
-      runs.close(); runtime.close();
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
-
   it("terminates the one launched process group when the saved timeout expires", async () => {
     vi.useFakeTimers();
     const terminate = vi.fn();
@@ -961,6 +919,29 @@ describe("process-only AgentRunner", () => {
     const result = runner.run(task());
     await vi.advanceTimersByTimeAsync(2_250);
     await expect(result).resolves.toMatchObject({ kind: "network_timeout", agent: "codex" });
+    expect(terminate.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
+  });
+
+  it("terminates the one launched process group and returns retryable evidence on worker shutdown", async () => {
+    vi.useFakeTimers();
+    const terminate = vi.fn();
+    const never = new Promise<ProcessResult>(() => undefined);
+    const controller = new AbortController();
+    const runner = new AgentRunner({
+      binaries: { grok: "/home/anton/.local/bin/grok", claude: "/home/anton/.local/bin/claude", codex: "/opt/codex" },
+      timeoutMs: 90_000,
+      launcher: { launch: () => ({ pid: 4321, result: never, terminate }) },
+    });
+    const result = runner.run(task(), undefined, undefined, undefined, controller.signal);
+    await vi.waitFor(() => expect(terminate).not.toHaveBeenCalled());
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    await expect(result).resolves.toMatchObject({
+      kind: "network_timeout",
+      agent: "codex",
+      error: expect.stringMatching(/worker shutdown/i),
+    });
     expect(terminate.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
   });
 

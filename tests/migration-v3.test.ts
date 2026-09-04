@@ -8,6 +8,7 @@ import {
   MigrationBlockedError,
   MigrationCoordinator,
 } from "../src/migration/coordinator.js";
+import { AuthorizedV4TestCoordinator } from "./helpers/authorized-v4-coordinator.js";
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { RunGateUnitOfWork } from "../src/runtime/run-gate-unit-of-work.js";
 
@@ -280,12 +281,11 @@ describe("routing-v5 state schema v3 migration", () => {
       stateDatabase: paths.state,
       historyDatabase: paths.history,
     }).migrateToV3()).toEqual({ status: "already_current", fromVersion: 3, toVersion: 3 });
-    const v4Coordinator = new MigrationCoordinator({
+    const v4Coordinator = new AuthorizedV4TestCoordinator({
       stateDatabase: paths.state,
       historyDatabase: paths.history,
     });
     expect(v4Coordinator.migrateToV4()).toMatchObject({ status: "migrated", fromVersion: 3, toVersion: 4 });
-    v4Coordinator.extendReviewV3SchemaOffline();
     const reviews = new RunGateUnitOfWork(paths.state);
     reviews.close();
     const reopenedProviders = new ProviderHealthStore(paths.state, { cooldownMs: 1_000 });

@@ -36,6 +36,7 @@ export class ImplementationProgressProjectionFiles {
   readonly #durability: StateFileDurability;
   readonly #faultInjector: StateFileFaultInjector | undefined;
   #pins: ProjectionPins | undefined;
+  #closed = false;
 
   constructor(input: {
     readonly packageRoot: string;
@@ -58,6 +59,7 @@ export class ImplementationProgressProjectionFiles {
     readonly watermarkSequence: number;
     readonly watermarkEventSha256: string;
   }): { jsonlPath: string; markdownPath: string } {
+    this.#assertOpen();
     this.#assertWatermark(input);
     if (!Buffer.isBuffer(input.jsonlBytes) || !Buffer.isBuffer(input.markdownBytes)) {
       throw new Error("progress projection publication requires Buffer bytes");
@@ -89,6 +91,7 @@ export class ImplementationProgressProjectionFiles {
   }
 
   verify(input: { readonly watermarkSequence: number; readonly watermarkEventSha256: string }): void {
+    this.#assertOpen();
     this.#assertWatermark(input);
     this.#faultInjector?.("before_projection_reread");
     const temporary = this.#pins === undefined;
@@ -133,6 +136,7 @@ export class ImplementationProgressProjectionFiles {
   }
 
   assertCurrent(): void {
+    this.#assertOpen();
     if (!this.#pins) throw new Error("progress projection files have no pinned publication to revalidate");
     try {
       this.#pins.jsonl.assertCurrent();
@@ -142,6 +146,17 @@ export class ImplementationProgressProjectionFiles {
         cause: error,
       });
     }
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#closePins();
+    this.#durability.close();
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("progress projection files are closed");
   }
 
   #assertWatermark(input: { readonly watermarkSequence: number; readonly watermarkEventSha256: string }): void {

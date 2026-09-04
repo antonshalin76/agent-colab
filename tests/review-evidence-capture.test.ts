@@ -11,6 +11,7 @@ import { initializeCurrentExecutionSchema } from "../src/migration/coordinator.j
 import { ProviderHealthStore } from "../src/runtime/provider-health-store.js";
 import { executeReviewLaunchWithFence } from "../src/runtime/review-launch-admission.js";
 import { activateRecoveredReviewLanes } from "../src/runtime/review-rejoin.js";
+import { captureWorkspaceFingerprint } from "../src/runtime/workspace-fingerprint.js";
 import {
   ReviewEvidenceCapture,
   type ReviewEvidenceCaptureEntryPoint,
@@ -33,7 +34,6 @@ afterEach(() => {
 
 const entryPoints: readonly ReviewEvidenceCaptureEntryPoint[] = [
   "request_review",
-  "map_admission",
   "recovery_rejoin",
   "prelaunch",
 ];
@@ -48,19 +48,27 @@ const reviewInput = {
   changedFiles: 1,
 };
 
-const unavailableOutcome = (agent: "grok" | "claude" | "codex", observedAt = 103) => ({
+const unavailableOutcome = (
+  agent: "grok" | "claude" | "codex",
+  observedAt = 103,
+  sourceFingerprint = "source-v1",
+) => ({
   kind: "provider_unavailable" as const,
   agent,
   observedAt,
-  source: { sourceFingerprint: "source-v1", valid: true },
+  source: { sourceFingerprint, valid: true },
   readiness: { harnessReady: false, state: "provider_unavailable" as const, valid: false },
 });
 
-const readyOutcome = (agent: "grok" | "claude" | "codex", observedAt = 103) => ({
+const readyOutcome = (
+  agent: "grok" | "claude" | "codex",
+  observedAt = 103,
+  sourceFingerprint = "source-v1",
+) => ({
   kind: "ready" as const,
   agent,
   observedAt,
-  source: { sourceFingerprint: "source-v1", valid: true },
+  source: { sourceFingerprint, valid: true },
   readiness: { harnessReady: true, state: "ready" as const, valid: true },
 });
 
@@ -71,7 +79,12 @@ const serviceFixture = () => {
   mkdirSync(project);
   const stateDatabase = join(root, "state.db");
   initializeCurrentExecutionSchema(stateDatabase);
-  return { root, project, stateDatabase };
+  return {
+    root,
+    project,
+    stateDatabase,
+    sourceFingerprint: captureWorkspaceFingerprint(project).fingerprint,
+  };
 };
 
 describe("ReviewEvidenceCapture typed boundary", () => {
@@ -197,7 +210,7 @@ describe("ReviewEvidenceCapture typed boundary", () => {
       store.close();
     });
 
-  it("maps the same unavailable health fact to optional Grok defer and mandatory Codex failure", () => {
+  it("maps unavailable enabled providers, including Codex, to durable deferred lanes", () => {
     const optionalPlan = createReviewPlan({
       ...reviewInput,
       health: { grok: "unavailable", claude: "disabled", codex: "healthy" },
@@ -208,18 +221,30 @@ describe("ReviewEvidenceCapture typed boundary", () => {
     ]);
     expect(optionalPlan.deferredLanes.filter(({ agent }) => agent === "grok")).toHaveLength(2);
 
-    expect(() => createReviewPlan({
+    const codexDeferredPlan = createReviewPlan({
       ...reviewInput,
       health: { grok: "healthy", claude: "disabled", codex: "unavailable" },
-    })).toThrow(/mandatory.*codex|codex.*mandatory/i);
+    });
+    expect(codexDeferredPlan.activeLanes.map(({ agent, role }) => `${agent}:${role}`)).toEqual([
+      "grok:auditor",
+      "grok:critic",
+    ]);
+    expect(codexDeferredPlan.deferredLanes.filter(({ agent }) => agent === "codex")).toHaveLength(2);
+  });
+
+  it("rejects a disabled mandatory Codex provider", () => {
+    expect(() => createReviewPlan({
+      ...reviewInput,
+      health: { grok: "healthy", claude: "healthy", codex: "disabled" },
+    })).toThrow(/mandatory Codex auditor\/critic pair is disabled/i);
   });
 });
 
 describe("ReviewEvidenceCapture production entry wiring", () => {
   it("uses typed ready evidence instead of conflicting legacy skill/readiness fields", async () => {
-    const { root, project, stateDatabase } = serviceFixture();
+    const { root, project, stateDatabase, sourceFingerprint } = serviceFixture();
     const evidenceCapture = { capture: vi.fn((input: { agent: "grok" | "claude" | "codex" }) =>
-      readyOutcome(input.agent, 200)) } as unknown as ReviewEvidenceCapture;
+      readyOutcome(input.agent, 200, sourceFingerprint)) } as unknown as ReviewEvidenceCapture;
     const service = new LocalCollabService(stateDatabase, {
       allowedRoots: [root],
       agentSkillRoots: {
@@ -258,10 +283,10 @@ describe("ReviewEvidenceCapture production entry wiring", () => {
   });
 
   it("transports the requestReview capture outcome unchanged to ProviderHealthStore", async () => {
-    const { root, project, stateDatabase } = serviceFixture();
-    const unavailable = unavailableOutcome("grok", 201);
+    const { root, project, stateDatabase, sourceFingerprint } = serviceFixture();
+    const unavailable = unavailableOutcome("grok", 201, sourceFingerprint);
     const evidenceCapture = { capture: vi.fn((input: { agent: "grok" | "claude" | "codex" }) =>
-      input.agent === "grok" ? unavailable : readyOutcome(input.agent, 201)) } as unknown as ReviewEvidenceCapture;
+      input.agent === "grok" ? unavailable : readyOutcome(input.agent, 201, sourceFingerprint)) } as unknown as ReviewEvidenceCapture;
     const service = new LocalCollabService(stateDatabase, {
       allowedRoots: [root],
       agentSkillRoots: {
@@ -297,12 +322,12 @@ describe("ReviewEvidenceCapture production entry wiring", () => {
     { agent: "claude", unavailableRole: "critic" },
   ] as const)("degrades an asymmetric optional $agent/$unavailableRole pair without blocking Codex",
     async ({ agent, unavailableRole }) => {
-      const { root, project, stateDatabase } = serviceFixture();
+      const { root, project, stateDatabase, sourceFingerprint } = serviceFixture();
       const evidenceCapture = { capture: vi.fn((input: {
         agent: "grok" | "claude" | "codex"; role: "auditor" | "critic";
       }) => input.agent === agent && input.role === unavailableRole
-        ? unavailableOutcome(input.agent, 211)
-        : readyOutcome(input.agent, 211)) } as unknown as ReviewEvidenceCapture;
+        ? unavailableOutcome(input.agent, 211, sourceFingerprint)
+        : readyOutcome(input.agent, 211, sourceFingerprint)) } as unknown as ReviewEvidenceCapture;
       const service = new LocalCollabService(stateDatabase, {
         allowedRoots: [root], evidenceCapture,
         agentSkillRoots: {
@@ -327,57 +352,57 @@ describe("ReviewEvidenceCapture production entry wiring", () => {
     });
 
   it.each(["auditor", "critic"] as const)(
-    "fails closed when the mandatory Codex %s lane is unavailable",
+    "persists deferred demand when the mandatory Codex %s lane is unavailable",
     async (unavailableRole) => {
-      const { root, project, stateDatabase } = serviceFixture();
+      const { root, project, stateDatabase, sourceFingerprint } = serviceFixture();
       const evidenceCapture = { capture: vi.fn((input: {
         agent: "grok" | "claude" | "codex"; role: "auditor" | "critic";
       }) => input.agent === "codex" && input.role === unavailableRole
-        ? unavailableOutcome("codex", 212)
-        : readyOutcome(input.agent, 212)) } as unknown as ReviewEvidenceCapture;
+        ? unavailableOutcome("codex", 212, sourceFingerprint)
+        : readyOutcome(input.agent, 212, sourceFingerprint)) } as unknown as ReviewEvidenceCapture;
       const service = new LocalCollabService(stateDatabase, { allowedRoots: [root], evidenceCapture });
       for (const provider of ["grok", "claude", "codex"] as const) {
         service.providers.recordSuccess(provider, 1);
       }
       const artifactContent = `mandatory asymmetric ${unavailableRole}`;
       try {
-        await expect(service.requestReview({ requester: "codex", workspaceRoot: project,
+        const result = await service.requestReview({ requester: "codex", workspaceRoot: project,
           artifactContent, artifactHash: createHash("sha256").update(artifactContent).digest("hex"),
           prompt: "review", approvalScope: "workspace-read",
-          idempotencyKey: `mandatory-asymmetric-${unavailableRole}` }))
-          .rejects.toThrow(/mandatory Codex.*unavailable|mandatory Codex.*divergent/i);
+          idempotencyKey: `mandatory-asymmetric-${unavailableRole}` });
+        expect(result).toMatchObject({ activeLaneCount: 4, laneCount: 6,
+          runState: "DEGRADED_REVIEW_SET" });
+        expect(service.reviews.deferredReviewIds("codex")).toEqual([result.reviewId]);
+        expect(service.reviews.get(result.reviewId)?.lanes.filter(({ agent }) => agent === "codex"))
+          .toEqual(expect.arrayContaining([
+            expect.objectContaining({ role: "auditor", status: "deferred" }),
+            expect.objectContaining({ role: "critic", status: "deferred" }),
+          ]));
+        expect(service.reviews.barrier(result.reviewId).satisfied).toBe(false);
       } finally {
         service.close();
       }
     });
 
-  it("transports the MAP-admission capture outcome through the same boundary", async () => {
-    const { root, project, stateDatabase } = serviceFixture();
-    const unavailable = unavailableOutcome("grok", 202);
-    const evidenceCapture = { capture: vi.fn((input: { agent: "grok" | "claude" | "codex" }) =>
-      input.agent === "grok" ? unavailable : readyOutcome(input.agent, 202)) } as unknown as ReviewEvidenceCapture;
-    const service = new LocalCollabService(stateDatabase, {
-      allowedRoots: [root],
-      agentSkillRoots: {
-        grok: join(homedir(), ".agents", "skills"),
-        claude: join(homedir(), ".agents", "skills"),
-        codex: join(homedir(), ".agents", "skills"),
-      },
-      evidenceCapture,
-    });
-    for (const agent of ["grok", "claude", "codex"] as const) service.providers.recordSuccess(agent, 1);
-    const apply = vi.spyOn(service.providers, "applyCaptureOutcome");
-    const artifactContent = "MAP evidence";
+  it("persists Codex probing as deferred demand without launching an implicit probe", async () => {
+    const { root, project, stateDatabase, sourceFingerprint } = serviceFixture();
+    const evidenceCapture = { capture: vi.fn((input: {
+      agent: "grok" | "claude" | "codex";
+    }) => readyOutcome(input.agent, 213, sourceFingerprint)) } as unknown as ReviewEvidenceCapture;
+    const service = new LocalCollabService(stateDatabase, { allowedRoots: [root], evidenceCapture });
+    service.providers.recordSuccess("grok", 1);
+    service.providers.recordSuccess("claude", 1);
+    const artifactContent = "codex probing demand";
 
     try {
-      await expect(service.delegate({ requester: "codex", stage: "planning", project,
+      expect(service.providers.snapshot().codex.health).toBe("probing");
+      const result = await service.requestReview({ requester: "codex", workspaceRoot: project,
         artifactContent, artifactHash: createHash("sha256").update(artifactContent).digest("hex"),
-        prompt: "plan", approvalScope: "workspace-read", idempotencyKey: "b8-map" }))
-        .resolves.toMatchObject({ status: "blocked_map_admission" });
-      expect(evidenceCapture.capture).toHaveBeenCalledWith(expect.objectContaining({
-        entryPoint: "map_admission", agent: "grok",
-      }));
-      expect(apply.mock.calls.find(([outcome]) => outcome === unavailable)?.[0]).toBe(unavailable);
+        prompt: "review", approvalScope: "workspace-read", idempotencyKey: "codex-probing" });
+      expect(result).toMatchObject({ activeLaneCount: 4, laneCount: 6,
+        runState: "DEGRADED_REVIEW_SET" });
+      expect(service.reviews.deferredReviewIds("codex")).toEqual([result.reviewId]);
+      expect(service.providers.snapshot().codex.health).toBe("probing");
     } finally {
       service.close();
     }

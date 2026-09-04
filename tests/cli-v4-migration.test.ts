@@ -1,11 +1,16 @@
-import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { dropGraphV4Schema } from "./helpers/graph-schema.js";
+import {
+  createTestReviewedV4Promotion,
+  removeTestReviewedV4RemoteRef,
+} from "./helpers/reviewed-v4-source-acceptance-fixture.js";
 
 const launcher = resolve("scripts/agent-collab-launcher.mjs");
 const roots: string[] = [];
@@ -19,14 +24,38 @@ const fixture = () => {
   const systemctl = join(bin, "systemctl");
   writeFileSync(systemctl, "#!/bin/sh\nprintf 'inactive\\n'\nexit 3\n");
   chmodSync(systemctl, 0o755);
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, AGENT_COLLAB_STATE_DIR: state };
+  const harness = join(bin, "review-harness");
+  writeFileSync(harness, "#!/bin/sh\nprintf 'review-harness 1.0.0\\n'\n");
+  chmodSync(harness, 0o755);
+  const skill = join(root, ".agents", "skills", "agent-collaboration");
+  mkdirSync(skill, { recursive: true });
+  writeFileSync(join(skill, "SKILL.md"), "# Agent collaboration\n");
+  const env = {
+    ...process.env,
+    HOME: root,
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    AGENT_COLLAB_STATE_DIR: state,
+    AGENT_COLLAB_GROK_BIN: harness,
+    AGENT_COLLAB_CLAUDE_BIN: harness,
+    AGENT_COLLAB_CODEX_BIN: harness,
+  };
   const run = (command: string) => spawnSync(process.execPath, [launcher, command], {
     cwd: resolve("."), encoding: "utf8", env, timeout: 30_000,
   });
+  const runWith = (command: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}) =>
+    spawnSync(process.execPath, [launcher, command, ...args], {
+      cwd: resolve("."), encoding: "utf8", env: { ...env, ...extraEnv }, timeout: 120_000,
+    });
   const start = (command: string) => spawn(process.execPath, [launcher, command], {
     cwd: resolve("."), env, stdio: ["ignore", "pipe", "pipe"],
   });
-  return { state, systemctl, run, start };
+  const initialize = () => {
+    const linked = run("review-skills-link");
+    if (linked.status !== 0) throw new Error(linked.stderr);
+    const initialized = run("review-initialize");
+    if (initialized.status !== 0) throw new Error(initialized.stderr);
+  };
+  return { root, state, systemctl, run, runWith, start, initialize };
 };
 
 const statePath = (root: string) => join(root, "collaboration.db");
@@ -42,6 +71,23 @@ const schemaSnapshot = (path: string): unknown[] => {
     return db.prepare(`SELECT type,name,tbl_name,sql FROM sqlite_schema
       WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`).all();
   } finally { db.close(); }
+};
+
+const durableTreeSnapshot = (root: string): Array<{ path: string; sha256: string }> => {
+  const files: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.name.endsWith("-shm") || entry.name.endsWith("-wal")) continue;
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push(path);
+    }
+  };
+  visit(root);
+  return files.sort().map((path) => ({
+    path: relative(root, path),
+    sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
+  }));
 };
 
 const removeAuthorityExtension = (path: string): void => {
@@ -84,18 +130,78 @@ const downgradeEmptyFixtureToV3 = (path: string): void => {
       ALTER TABLE runtime_review_barriers DROP COLUMN launch_authority_version;
       PRAGMA user_version = 3;
     `);
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    db.pragma("journal_mode = DELETE");
+    db.exec("VACUUM");
+  } finally { db.close(); }
+};
+
+const stabilizeDatabaseFile = (path: string): void => {
+  const db = new Database(path);
+  try {
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    db.pragma("journal_mode = DELETE");
+    db.exec("VACUUM");
   } finally { db.close(); }
 };
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+afterAll(removeTestReviewedV4RemoteRef);
 
 describe("CLI v4 startup and offline authority extension", () => {
-  it("creates and reopens a fresh complete v4/v2 pair without changing schema markers", () => {
+  it.each([
+    "worker",
+    "mcp",
+    "review-mcp",
+    "mcp-verify-session",
+    "start-normal",
+    "prove-normal",
+    "verify-unit",
+    "compatibility-runtime",
+    "migrate-v4",
+    "extend-review-v3-schema",
+  ])("permanently rejects %s before creating the state root", (command) => {
     const fx = fixture();
-    const created = fx.run("status");
-    expect(created.status, created.stderr).toBe(0);
+
+    const rejected = fx.run(command);
+
+    expect(rejected.status).not.toBe(0);
+    expect(`${rejected.stdout}\n${rejected.stderr}`).toMatch(/permanently quarantined/i);
+    expect(existsSync(fx.state)).toBe(false);
+  });
+
+  it.each(["index", "approve"])("removes obsolete command %s before creating the state root", (command) => {
+    const fx = fixture();
+
+    const rejected = fx.run(command);
+
+    expect(rejected.status).not.toBe(0);
+    expect(`${rejected.stdout}\n${rejected.stderr}`).toMatch(/unknown command/i);
+    expect(existsSync(fx.state)).toBe(false);
+  });
+
+  it("contains no executable legacy runtime composition", () => {
+    const source = readFileSync("src/cli.ts", "utf8");
+    for (const forbidden of [
+      "LocalCollabService",
+      "startStdioCollabServer",
+      "CollaborationRuntime",
+      "RunGateUnitOfWork",
+      "WorktreeLeaseStore",
+      "workflowDispatchIdentity",
+      "workflow_reconciliation_block",
+    ]) expect(source).not.toContain(forbidden);
+    expect(source).not.toMatch(/command === ["'](?:mcp|worker|review-mcp)["']/u);
+  });
+
+  it("requires explicit readiness-gated initialization and reopens a complete v4/v2 pair read-only", () => {
+    const fx = fixture();
+    const absent = fx.run("status");
+    expect(absent.status).not.toBe(0);
+    expect(existsSync(fx.state)).toBe(false);
+    fx.initialize();
     expect(version(statePath(fx.state))).toBe(4);
     expect(version(join(fx.state, "history.db"))).toBe(2);
     const before = schemaSnapshot(statePath(fx.state));
@@ -109,7 +215,7 @@ describe("CLI v4 startup and offline authority extension", () => {
 
   it("fails closed without online repair when an existing v4 lacks authority ownership", () => {
     const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
+    fx.initialize();
     removeAuthorityExtension(statePath(fx.state));
     const before = schemaSnapshot(statePath(fx.state));
 
@@ -120,90 +226,89 @@ describe("CLI v4 startup and offline authority extension", () => {
     expect(schemaSnapshot(statePath(fx.state))).toEqual(before);
   });
 
-  it("extends an existing v4 only through the stopped-service command and preserves user_version", () => {
+  it.each(["extend-review-v3-schema", "migrate-v4", "compatibility-runtime"])(
+    "permanently rejects legacy mutator/runtime command %s without changing state",
+    (command) => {
     const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
-    removeAuthorityExtension(statePath(fx.state));
-
-    const extended = fx.run("extend-review-v3-schema");
-    expect(extended.status, extended.stderr).toBe(0);
-    expect(JSON.parse(extended.stdout)).toMatchObject({ status: "extended", stateVersion: 4 });
-    expect(version(statePath(fx.state))).toBe(4);
-
-    const reopened = fx.run("status");
-    expect(reopened.status, reopened.stderr).toBe(0);
-    expect(version(statePath(fx.state))).toBe(4);
-  });
-
-  it("does not extend an existing v4 while the managed service is active", () => {
-    const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
-    removeAuthorityExtension(statePath(fx.state));
+    fx.initialize();
     const before = schemaSnapshot(statePath(fx.state));
-    writeFileSync(fx.systemctl, "#!/bin/sh\nprintf 'active\\n'\nexit 0\n");
-    chmodSync(fx.systemctl, 0o755);
-
-    const rejected = fx.run("extend-review-v3-schema");
+    const rejected = fx.run(command);
     expect(rejected.status).not.toBe(0);
-    expect(rejected.stderr).toMatch(/must be confirmed inactive/i);
-    expect(version(statePath(fx.state))).toBe(4);
+    expect(rejected.stderr).toMatch(/permanently quarantined/i);
     expect(schemaSnapshot(statePath(fx.state))).toEqual(before);
   });
 
-  it("keeps migrate-v4 idempotent after the authority extension is present", () => {
+  it("wires signed source adoption, preflight, prepare, and read-only close status end to end", () => {
     const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
-    const before = schemaSnapshot(statePath(fx.state));
-
-    const migrated = fx.run("migrate-v4");
-    expect(migrated.status, migrated.stderr).toBe(0);
-    expect(JSON.parse(migrated.stdout)).toEqual({ status: "already_current", fromVersion: 4, toVersion: 4 });
-    expect(version(statePath(fx.state))).toBe(4);
-    expect(schemaSnapshot(statePath(fx.state))).toEqual(before);
-  });
-
-  it("migrates v3 to v4 and installs the authority extension in the same stopped-service operation", () => {
-    const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
+    fx.initialize();
     downgradeEmptyFixtureToV3(statePath(fx.state));
+    stabilizeDatabaseFile(join(fx.state, "history.db"));
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    const trustEnv = {
+      AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+      AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+      AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+    };
+    try {
+      const adopted = fx.runWith("reviewed-source-adopt", [packet.promotionPath], trustEnv);
+      expect(adopted.status, adopted.stderr).toBe(0);
+      const adoptionSha = (JSON.parse(adopted.stdout) as { receiptSha256: string }).receiptSha256;
 
-    const migrated = fx.run("migrate-v4");
-    expect(migrated.status, migrated.stderr).toBe(0);
-    expect(JSON.parse(migrated.stdout)).toMatchObject({
-      status: "migrated", fromVersion: 3, toVersion: 4, importedProgressEvents: 3,
-    });
-    expect(version(statePath(fx.state))).toBe(4);
-    expect(fx.run("status").status).toBe(0);
-  });
+      const preflight = fx.runWith("stg04-close-preflight", [adoptionSha], trustEnv);
+      expect(preflight.status, preflight.stderr).toBe(0);
+      expect(JSON.parse(preflight.stdout)).toMatchObject({ ready: true, state: { phase: "PRE_V4" } });
 
-  it("fsyncs service_reopened before the compatibility runtime reports itself started", async () => {
+      const prepared = fx.runWith("stg04-close-prepare", [adoptionSha], trustEnv);
+      expect(prepared.status, prepared.stderr).toBe(0);
+      expect(JSON.parse(prepared.stdout)).toMatchObject({ phase: "PROJECTION_CURRENT" });
+
+      const beforeStatus = durableTreeSnapshot(fx.state);
+      const status = fx.runWith("stg04-close-status", [adoptionSha], trustEnv);
+      expect(status.status, status.stderr).toBe(0);
+      expect(JSON.parse(status.stdout)).toMatchObject({
+        ready: true,
+        state: { phase: "PROJECTION_CURRENT", contradictionCodes: [] },
+      });
+      expect(durableTreeSnapshot(fx.state)).toEqual(beforeStatus);
+    } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("drains the production review-worker command on SIGTERM", async () => {
     const fx = fixture();
-    expect(fx.run("status").status).toBe(0);
-    downgradeEmptyFixtureToV3(statePath(fx.state));
-    expect(fx.run("migrate-v4").status).toBe(0);
-    const guardPath = join(fx.state, "migration-guard",
-      readdirSync(join(fx.state, "migration-guard")).find((name) => name.endsWith(".jsonl"))!);
-    expect(readFileSync(guardPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event))
-      .toEqual(["backup_created"]);
-
-    const child = fx.start("compatibility-runtime");
-    let stdout = "";
-    await new Promise<void>((resolveReady, reject) => {
-      const timeout = setTimeout(() => reject(new Error("compatibility runtime did not start")), 10_000);
-      child.stdout.on("data", (chunk) => {
-        stdout += String(chunk);
-        if (!stdout.includes("compatibility-runtime-process-observation/v1")) return;
-        clearTimeout(timeout);
-        resolveReady();
+    fx.initialize();
+    const child = fx.start("review-worker");
+    let stderr = "";
+    child.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    try {
+      await new Promise<void>((resolveStarted, rejectStarted) => {
+        const timeout = setTimeout(() => rejectStarted(new Error("review worker did not start")), 10_000);
+        const observe = () => {
+          if (!stderr.includes('"event":"review_worker_started"')) return;
+          clearTimeout(timeout);
+          child.stderr!.off("data", observe);
+          resolveStarted();
+        };
+        child.stderr!.on("data", observe);
+        observe();
       });
-      child.once("exit", (code) => {
-        clearTimeout(timeout);
-        reject(new Error(`compatibility runtime exited before observation: ${String(code)}`));
+      child.kill("SIGTERM");
+      let exitTimeout: ReturnType<typeof setTimeout> | undefined;
+      const [code, signal] = await Promise.race([
+        once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>,
+        new Promise<never>((_resolve, reject) => {
+          exitTimeout = setTimeout(() => reject(new Error("review worker did not stop")), 10_000);
+        }),
+      ]).finally(() => {
+        if (exitTimeout) clearTimeout(exitTimeout);
       });
-    });
-    expect(readFileSync(guardPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event))
-      .toEqual(["backup_created", "service_reopened"]);
-    child.kill("SIGTERM");
-    await once(child, "exit");
-  }, 15_000);
+      expect({ code, signal }).toEqual({ code: 0, signal: null });
+      expect(stderr).toContain('"event":"review_worker_stopped"');
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  }, 30_000);
 });

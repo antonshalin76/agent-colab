@@ -1,80 +1,94 @@
 #!/usr/bin/env node
-import { accessSync, constants, mkdirSync, readFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { accessSync, chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { execa } from "execa";
-import { LocalCollabService } from "./app/service.js";
-import { isFailoverOutcome } from "./domain/outcomes.js";
-import {
-  normalizeReviewProviderResult,
-} from "./domain/review-verdict.js";
+import { createReviewRuntimeComposition } from "./app/review-runtime-composition.js";
+import { inspectReviewReadiness } from "./app/review-readiness-service.js";
+import { ReviewStatusQuery } from "./app/review-status-query.js";
+import { createReviewWorkerRuntime } from "./app/review-worker-runtime.js";
+import { ReviewWorkerService } from "./app/review-worker-service.js";
+import { createStg04CloseService } from "./app/stg04-close-service.js";
 import {
   REVIEW_PROVIDER_IDS,
-  type ProviderHealthSnapshot,
   type ReviewProviderId,
 } from "./domain/routing.js";
+import { MapControlPlane } from "./flow/map-admin.js";
+import { HistoryIndex } from "./history/index.js";
+import { HistoryVisibilityPolicy } from "./history/visibility-policy.js";
 import { doctorV1, doctorV1Databases, initializeCurrentExecutionSchemaDatabase, MigrationCoordinator, prepareRollbackBundle, restoreV1Bundle, verifyBundle, verifyCompatibilityRuntime } from "./migration/coordinator.js";
+import {
+  adoptProductionReviewedV4Source,
+  createProductionReviewedV4MigrationProcess,
+  resolveReviewedV4ProductionSourceRoot,
+} from "./migration/reviewed-v4-production-process.js";
+import { buildReviewedV4Promotion } from "./migration/reviewed-v4-promotion-builder.js";
 import { openStateDatabaseLease, type StateDatabaseAdmissionMode, type StateDatabaseLease } from "./store/state-database-fence.js";
 import { assertReviewV3SchemaSignature } from "./migration/review-v3-schema.js";
-import { startStdioCollabServer } from "./mcp/server.js";
-import { AgentRunner, type ProcessTask } from "./runners/agent-runner.js";
+import { AgentRunner } from "./runners/agent-runner.js";
 import { captureWorkspaceFingerprint } from "./runtime/workspace-fingerprint.js";
-import { assertProductionRuntimeReleased } from "./runtime/production-release-gate.js";
-import { activateRecoveredReviewLanes } from "./runtime/review-rejoin.js";
-import { runAutomaticProviderRecovery } from "./runtime/provider-recovery-loop.js";
 import {
-  CollaborationRuntime,
-  RunnerOutcomeEvidenceError,
-} from "./runtime/collaboration-runtime.js";
+  activateReviewedWorkerService,
+  stageReviewedWorkerService,
+} from "./runtime/review-service-unit.js";
+import { runUserSystemctl } from "./runtime/systemd-user.js";
 import { ProviderHealthStore } from "./runtime/provider-health-store.js";
-import { RunGateUnitOfWork } from "./runtime/run-gate-unit-of-work.js";
-import { executeReviewLaunchWithFence } from "./runtime/review-launch-admission.js";
 import { ReviewEvidenceCapture } from "./runtime/review-evidence-capture.js";
-import { matchesExactPrelaunchCliMissing } from "./runtime/prelaunch-evidence.js";
-import { defaultAllowedProjectRoots, ProjectPolicy } from "./security/project-policy.js";
 import { runCapabilityProbes, type CapabilityProbeRunner } from "./probes/capability-probe.js";
-import { acquireStateRootLease, ensureStateLayout, GRAPH_EXECUTION_MODE, openExistingStateLayout } from "./store/state-layout.js";
-import { RunStore, type RunRecord } from "./store/run-store.js";
-import { DurableWorker } from "./worker/durable-worker.js";
-import { WorktreeLeaseStore, type WorktreeLease } from "./worktree/lease-store.js";
-import type { AttemptAssignment } from "./workflow/workflow.js";
+import { acquireStateRootLease, ensureStateLayout, openExistingStateLayout } from "./store/state-layout.js";
+import { RunStore } from "./store/run-store.js";
 import { prepareCommandInput } from "./runners/provider-command.js";
 import { discoverProviderVersion, normalizeProviderVersion } from "./probes/provider-version.js";
 import { buildCapabilityProbeProviders } from "./probes/provider-probe-config.js";
 import { auditSharedSkills, sharedSkillReadiness } from "./skills/audit.js";
-import {
-  parsePersistedDomainEffect,
-  assertPersistedDomainEffectMatchesRun,
-  isTransientSqliteError,
-  type PersistedDomainEffect,
-} from "./worker/domain-effect.js";
-
+import { linkReviewHarnessSkills, type ReviewHarnessId } from "./skills/setup.js";
+import { startStdioReviewOnlyMcpServer } from "./mcp/review-only-server.js";
+import { startStdioReviewStatusOnlyMcpServer } from "./mcp/review-status-only-server.js";
 const command = process.argv[2] ?? "status";
-type CliStateAdmissionMode = StateDatabaseAdmissionMode | "exclusive_migration";
+const PERMANENTLY_QUARANTINED_COMMANDS = new Set([
+  "worker",
+  "mcp",
+  "review-mcp",
+  "mcp-verify-session",
+  "start-normal",
+  "prove-normal",
+  "verify-unit",
+  "compatibility-runtime",
+  "migrate-v4",
+  "extend-review-v3-schema",
+]);
+if (PERMANENTLY_QUARANTINED_COMMANDS.has(command)) {
+  throw new Error(`legacy runtime command ${command} is permanently quarantined`);
+}
+type CliStateAdmissionMode = StateDatabaseAdmissionMode | "exclusive_migration" | "no_state";
 const CLI_STATE_ADMISSION = {
+  "review-readiness": "no_state",
+  "review-skills-link": "no_state",
+  "reviewed-source-promote": "no_state",
+  "review-service-stage": "no_state",
   "compatibility-status": "offline_observation",
-  "compatibility-runtime": "service_runtime",
   "doctor-v1": "offline_observation",
   "verify-bundle": "offline_observation",
   "restore-v1": "exclusive_migration",
   "migrate-v2": "exclusive_migration",
   "migrate-v3": "exclusive_migration",
-  "migrate-v4": "exclusive_migration",
-  "extend-review-v3-schema": "exclusive_migration",
+  "reviewed-source-adopt": "exclusive_migration",
+  "stg04-close-preflight": "offline_observation",
+  "stg04-close-status": "offline_observation",
+  "stg04-close-prepare": "exclusive_migration",
+  "review-service-activate": "offline_observation",
+  "review-mcp-status": "offline_observation",
+  "review-initialize": "mutating_service",
+  "review-mcp-codex": "mutating_service",
+  "review-worker": "mutating_service",
   "map-learn-close": "mutating_service",
   "map-evidence-record": "mutating_service",
   "reconcile-run": "mutating_service",
-  mcp: "mutating_service",
-  worker: "mutating_service",
-  index: "mutating_service",
   probe: "mutating_service",
-  approve: "mutating_service",
-  status: "mutating_service",
-  doctor: "mutating_service",
+  status: "offline_observation",
+  doctor: "no_state",
 } as const satisfies Record<string, CliStateAdmissionMode>;
 const commandAdmission = CLI_STATE_ADMISSION[command as keyof typeof CLI_STATE_ADMISSION];
 if (!commandAdmission) throw new Error(`unknown command: ${command}`);
@@ -82,62 +96,140 @@ if (command === "verify-bundle") {
   console.log(JSON.stringify(verifyBundle(resolve(process.argv[3] ?? "")), null, 2));
   process.exit(0);
 }
-const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local", "share", "agent-collab");
-if (command === "mcp" || command === "worker") {
-  assertProductionRuntimeReleased();
+const grokBinary = process.env.AGENT_COLLAB_GROK_BIN ?? join(homedir(), ".local", "bin", "grok");
+const claudeBinary = process.env.AGENT_COLLAB_CLAUDE_BIN ?? join(homedir(), ".local", "bin", "claude");
+const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".local", "bin", "codex");
+const canonicalSkillRoot = join(homedir(), ".agents", "skills");
+const agentSkillRoots = {
+  grok: join(homedir(), ".grok", "skills"),
+  claude: join(homedir(), ".claude", "skills"),
+  codex: join(homedir(), ".codex", "skills"),
+} as const;
+const reviewBinaries = { grok: grokBinary, claude: claudeBinary, codex: codexBinary } as const;
+const inspectReadiness = () => inspectReviewReadiness({
+  canonicalSkillRoot,
+  agentSkillRoots,
+  binaries: reviewBinaries,
+});
+const waitForStdioShutdown = (): Promise<void> => new Promise((resolveShutdown) => {
+  let resolved = false;
+  const finish = () => {
+    if (resolved) return;
+    resolved = true;
+    process.off("SIGINT", finish);
+    process.off("SIGTERM", finish);
+    process.stdin.off("end", finish);
+    process.stdin.off("close", finish);
+    resolveShutdown();
+  };
+  process.once("SIGINT", finish);
+  process.once("SIGTERM", finish);
+  process.stdin.once("end", finish);
+  process.stdin.once("close", finish);
+});
+const writeOperationalEvent = (event: string, details: Record<string, unknown> = {}): void => {
+  process.stderr.write(`${JSON.stringify({
+    protocol: "agent-collab-operational-event/v1",
+    event,
+    recordedAt: Date.now(),
+    ...details,
+  })}\n`);
+};
+if (command === "review-readiness" || command === "doctor") {
+  if (process.argv.length !== 3) throw new Error(`Usage: agent-collab ${command}`);
+  const readiness = inspectReadiness();
+  console.log(JSON.stringify(readiness, null, 2));
+  if (!readiness.readyForCodexOnly) process.exitCode = 1;
+  process.exit(process.exitCode ?? 0);
 }
-const compatibilityOnly = command === "compatibility-status" || command === "compatibility-runtime";
-const existingStateOnly = compatibilityOnly || command === "doctor-v1" || command === "restore-v1";
+if (command === "review-skills-link") {
+  const requested = process.argv.slice(3);
+  const agents = (requested.length === 0 ? ["codex", "grok", "claude"] : requested) as ReviewHarnessId[];
+  if (agents.some((agent) => !["grok", "claude", "codex"].includes(agent))) {
+    throw new Error("Usage: agent-collab review-skills-link [codex] [grok] [claude]");
+  }
+  console.log(JSON.stringify(linkReviewHarnessSkills({
+    canonicalRoot: canonicalSkillRoot,
+    agentRoots: agentSkillRoots,
+    agents,
+  }), null, 2));
+  process.exit(0);
+}
+if (command === "reviewed-source-promote") {
+  const [auditorReceiptPath, criticReceiptPath, outputPath, expiresAt, promotionId] = process.argv.slice(3);
+  const privateKeyPath = process.env.AGENT_COLLAB_REVIEWED_SOURCE_PRIVATE_KEY_FILE;
+  const remoteUrl = process.env.AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL;
+  const remoteRef = process.env.AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF;
+  if (!auditorReceiptPath || !criticReceiptPath || !outputPath || !expiresAt || !promotionId ||
+      process.argv.length !== 8 || !privateKeyPath || !remoteUrl || !remoteRef) {
+    throw new Error("Usage: agent-collab reviewed-source-promote <auditor-receipt.json> <critic-receipt.json> <output.json> <expires-at> <promotion-id>; configure private-key file and remote trust env");
+  }
+  console.log(JSON.stringify(buildReviewedV4Promotion({
+    repositoryRoot: resolveReviewedV4ProductionSourceRoot(),
+    remote: { url: remoteUrl, ref: remoteRef },
+    privateKeyPath,
+    auditorReceiptPath,
+    criticReceiptPath,
+    outputPath,
+    expiresAt,
+    promotionId,
+  }), null, 2));
+  process.exit(0);
+}
+if (command === "review-service-stage") {
+  const backupDirectory = process.argv[3];
+  if (!backupDirectory || !isAbsolute(backupDirectory) || process.argv.length !== 4) {
+    throw new Error("Usage: agent-collab review-service-stage </absolute/nonexistent/backup-directory>");
+  }
+  console.log(JSON.stringify(stageReviewedWorkerService({
+    repositoryRoot: resolveReviewedV4ProductionSourceRoot(),
+    homeDirectory: homedir(),
+    backupDirectory: resolve(backupDirectory),
+  }), null, 2));
+  process.exit(0);
+}
+if (command === "review-worker" || command === "review-mcp-codex" || command === "review-initialize") {
+  const readiness = inspectReadiness();
+  if (!readiness.readyForCodexOnly) {
+    throw new Error("Codex review harness is not ready; run review-skills-link and review-readiness before starting runtime services");
+  }
+}
+const stateRoot = process.env.AGENT_COLLAB_STATE_DIR ?? join(homedir(), ".local", "share", "agent-collab");
+const compatibilityOnly = command === "compatibility-status";
+const existingStateOnly = compatibilityOnly || command === "doctor-v1" || command === "restore-v1" ||
+  command === "reviewed-source-adopt" || command === "stg04-close-preflight" ||
+  command === "stg04-close-status" || command === "stg04-close-prepare" ||
+  command === "review-service-activate" ||
+  command === "review-mcp-status" || command === "status";
 const layout = existingStateOnly ? openExistingStateLayout(stateRoot) : ensureStateLayout(stateRoot);
 
 if (compatibilityOnly) {
   const lease = openStateDatabaseLease(layout.database,
     commandAdmission as StateDatabaseAdmissionMode, { readonly: true });
   const compatibility = verifyCompatibilityRuntime({ stateDatabase: layout.database, historyDatabase: layout.historyDatabase });
-  if (command === "compatibility-status") {
-    lease.close();
-    console.log(JSON.stringify(compatibility, null, 2));
-    process.exit(0);
-  }
-  const stopped = new Promise<void>((resolveStop) => {
-    const stop = () => resolveStop();
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-  });
-  console.log(JSON.stringify({
-    schemaVersion: "compatibility-runtime-process-observation/v1",
-    processId: process.pid,
-    startedAt: new Date().toISOString(),
-    graphExecution: GRAPH_EXECUTION_MODE,
-    serviceSurface: "compatibility_only",
-    queueClaim: "disabled",
-    providerLaunch: "disabled",
-    mcpServing: "disabled",
-    compatibility,
-  }));
-  const keepAlive = setInterval(() => {}, 60_000);
-  try {
-    await stopped;
-  } finally {
-    clearInterval(keepAlive);
-    lease.close();
-  }
+  lease.close();
+  console.log(JSON.stringify(compatibility, null, 2));
   process.exit(0);
 }
-const grokBinary = process.env.AGENT_COLLAB_GROK_BIN ?? join(homedir(), ".local", "bin", "grok");
-const claudeBinary = process.env.AGENT_COLLAB_CLAUDE_BIN ?? join(homedir(), ".local", "bin", "claude");
-const codexBinary = process.env.AGENT_COLLAB_CODEX_BIN ?? join(homedir(), ".local", "bin", "codex");
-const allowedProjectRoots = defaultAllowedProjectRoots();
+if (command === "status" || command === "review-mcp-status") {
+  const lease = openStateDatabaseLease(layout.database, "offline_observation", { readonly: true });
+  const status = new ReviewStatusQuery(lease);
+  if (command === "status") {
+    try { console.log(JSON.stringify(await status.status(), null, 2)); }
+    finally { status.close(); }
+    process.exit(0);
+  }
+  const server = await startStdioReviewStatusOnlyMcpServer(status);
+  try { await waitForStdioShutdown(); }
+  finally { await server.close(); }
+  process.exit(0);
+}
 const REVIEW_PROVIDERS = REVIEW_PROVIDER_IDS;
 const reviewSkillReadiness = (): Readonly<Record<ReviewProviderId, boolean>> => {
   try {
     return sharedSkillReadiness(auditSharedSkills({
-      canonicalRoot: join(homedir(), ".agents", "skills"),
-      agentRoots: {
-        grok: join(homedir(), ".grok", "skills"),
-        claude: join(homedir(), ".claude", "skills"),
-        codex: join(homedir(), ".codex", "skills"),
-      },
+      canonicalRoot: canonicalSkillRoot,
+      agentRoots: agentSkillRoots,
     }));
   } catch {
     return { grok: false, claude: false, codex: false };
@@ -153,8 +245,12 @@ const reviewEvidenceCapture = new ReviewEvidenceCapture({
 });
 const capabilityProbeRunner: CapabilityProbeRunner = {
   execute: async (request) => {
-    const version = spawnSync(request.file, ["--version"], { encoding: "utf8", timeout: 10_000, shell: false });
-    if (version.status !== 0) throw version.error ?? new Error(version.stderr || "version probe failed");
+    const version = await execa(request.file, ["--version"], {
+      encoding: "utf8", timeout: 10_000, shell: false, reject: false,
+      ...(request.signal ? { cancelSignal: request.signal } : {}),
+      forceKillAfterDelay: 2_000,
+    });
+    if (version.exitCode !== 0) throw new Error(version.stderr || "version probe failed");
     const prepared = prepareCommandInput(request);
     try {
       const processResult = await execa(request.file, prepared.args, {
@@ -164,6 +260,8 @@ const capabilityProbeRunner: CapabilityProbeRunner = {
         reject: false,
         timeout: request.timeoutMs,
         cleanup: true,
+        ...(request.signal ? { cancelSignal: request.signal } : {}),
+        forceKillAfterDelay: 2_000,
         env: { AGENT_COLLAB_RUN: "1" },
       });
       return { exitCode: processResult.exitCode ?? -1, version: normalizeProviderVersion(version.stdout),
@@ -231,8 +329,11 @@ const prepareDatabases = (mode: StateDatabaseAdmissionMode = "mutating_service")
     throw new Error(`offline migration required: state=${compatibility.stateVersion}, history=${compatibility.historyVersion}; run migrate-v4 while the service is stopped`);
   }
   initializeCurrentExecutionSchemaDatabase(state);
-  const service = new LocalCollabService(lease.borrow(), { historyDatabase: layout.historyDatabase });
-  service.close();
+  const map = new MapControlPlane(lease.borrow());
+  map.close();
+  const history = new HistoryIndex(layout.historyDatabase, { visibilityPolicy: new HistoryVisibilityPolicy() });
+  history.close();
+  chmodSync(layout.historyDatabase, 0o600);
   markFreshHistoryV2(layout.historyDatabase);
   if (Number(state.pragma("user_version", { simple: true })) !== 4 || historySchemaVersion(layout.historyDatabase) !== 2) {
     throw new Error("fresh database initialization did not produce the required state=4, history=2 schema pair");
@@ -253,15 +354,15 @@ if (command === "map-learn-close") {
     throw new Error("Usage: agent-collab map-learn-close <task-packet> <handoff> <candidate>");
   }
   const lease = prepareDatabases();
-  const service = new LocalCollabService(lease, { historyDatabase: layout.historyDatabase });
+  const map = new MapControlPlane(lease);
   try {
-    console.log(JSON.stringify(service.closeMapLearning({
+    console.log(JSON.stringify(map.closeLearning({
       taskPacketBytes: readFileSync(taskPacketPath),
       handoffBytes: readFileSync(handoffPath),
       candidateBytes: readFileSync(candidatePath),
     }), null, 2));
   } finally {
-    service.close();
+    map.close();
   }
   process.exit(0);
 }
@@ -279,9 +380,9 @@ if (command === "map-evidence-record") {
     throw new Error("Usage: agent-collab map-evidence-record <finding-lifecycle.json> <code_or_artifact_fix|old_code_sensitive_regression|sibling_surface_scan> <evidence-id> <candidate-sha256>");
   }
   const lease = prepareDatabases();
-  const service = new LocalCollabService(lease, { historyDatabase: layout.historyDatabase });
+  const map = new MapControlPlane(lease);
   try {
-    const receipt = service.recordMapLearningEvidence({
+    const receipt = map.recordLearningEvidence({
       purpose: purpose as "code_or_artifact_fix" | "old_code_sensitive_regression" | "sibling_surface_scan",
       id: evidenceId,
       artifactHash,
@@ -290,19 +391,92 @@ if (command === "map-evidence-record") {
     console.log(JSON.stringify(receipt, null, 2));
     if (receipt.result !== "PASS") process.exitCode = 1;
   } finally {
-    service.close();
+    map.close();
   }
   process.exit(process.exitCode ?? 0);
 }
 
 const assertServiceInactive = (): void => {
-  const state = spawnSync("systemctl", ["--user", "is-active", "agent-collab.service"], {
-    encoding: "utf8", timeout: 10_000, shell: false,
-  });
-  if (state.status !== 3 || state.stdout.trim() !== "inactive") {
-    throw new Error(`agent-collab.service must be confirmed inactive; status=${String(state.status)} state=${state.stdout.trim() || "unknown"}`);
+  for (const unit of ["agent-collab.service", "agent-collab-reviewed.service"]) {
+    const state = runUserSystemctl(["is-active", unit]);
+    const observed = state.stdout.trim();
+    if ((state.status !== 3 && state.status !== 4) ||
+        (observed !== "inactive" && observed !== "unknown")) {
+      throw new Error(`${unit} must be confirmed inactive; status=${String(state.status)} state=${observed || "empty"}`);
+    }
   }
 };
+
+const exactSha256Argument = (name: string): string => {
+  const value = process.argv[3];
+  if (!value || !/^[a-f0-9]{64}$/.test(value) || process.argv.length !== 4) {
+    throw new Error(`Usage: agent-collab ${name} <source-adoption-sha256>`);
+  }
+  return value;
+};
+
+if (command === "reviewed-source-adopt") {
+  if (!process.argv[3] || !isAbsolute(process.argv[3]) || process.argv.length !== 4) {
+    throw new Error("Usage: agent-collab reviewed-source-adopt </absolute/path/reviewed-v4-promotion.json>");
+  }
+  assertServiceInactive();
+  console.log(JSON.stringify(adoptProductionReviewedV4Source({
+    stateRoot: layout.root,
+    externalPromotionPath: resolve(process.argv[3]),
+  }), null, 2));
+  process.exit(0);
+}
+
+if (command === "stg04-close-preflight" || command === "stg04-close-status" ||
+    command === "review-service-activate") {
+  const sourceAcceptanceReceiptSha256 = exactSha256Argument(command);
+  if (command === "stg04-close-preflight" || command === "review-service-activate") assertServiceInactive();
+  const stateAccess = openStateDatabaseLease(layout.database, "offline_observation", { readonly: true });
+  const migration = createProductionReviewedV4MigrationProcess({
+    stateRoot: layout.root,
+    sourceAcceptanceReceiptSha256,
+  });
+  try {
+    const close = createStg04CloseService({
+      stateRoot: layout.root,
+      repositoryRoot: resolveReviewedV4ProductionSourceRoot(),
+      migration,
+      openStateDatabaseAccess: () => stateAccess.borrow(),
+    });
+    try {
+      const state = close.status();
+      const readiness = command === "stg04-close-preflight" ? inspectReadiness() : undefined;
+      if (state.contradictionCodes.length > 0 ||
+          (readiness !== undefined && !readiness.readyForCodexOnly)) {
+        process.exitCode = 1;
+      }
+      if (command === "review-service-activate") {
+        if (state.phase !== "PROJECTION_CURRENT" || state.contradictionCodes.length > 0) {
+          throw new Error("review service activation requires exact STG-04 PROJECTION_CURRENT state");
+        }
+      } else {
+        console.log(JSON.stringify({
+          protocol: command === "stg04-close-preflight"
+            ? "agent-collab-stg04-close-preflight/v1"
+            : "agent-collab-stg04-close-status/v1",
+          ready: state.contradictionCodes.length === 0,
+          state,
+          ...(readiness ? { readiness } : {}),
+        }, null, 2));
+      }
+    } finally { close.close(); }
+  } finally {
+    migration.close();
+    stateAccess.close();
+  }
+  if (command === "review-service-activate") {
+    console.log(JSON.stringify(activateReviewedWorkerService({
+      repositoryRoot: resolveReviewedV4ProductionSourceRoot(),
+      homeDirectory: homedir(),
+    }), null, 2));
+  }
+  process.exit(process.exitCode ?? 0);
+}
 
 if (command === "doctor-v1") {
   console.log(JSON.stringify(doctorV1({ stateDatabase: layout.database, historyDatabase: layout.historyDatabase }), null, 2));
@@ -362,76 +536,51 @@ if (command === "migrate-v3") {
   process.exit(0);
 }
 
-if (command === "migrate-v4") {
+if (command === "stg04-close-prepare") {
+  const sourceAcceptanceReceiptSha256 = exactSha256Argument(command);
   assertServiceInactive();
-  const coordinator = new MigrationCoordinator({
-    stateDatabase: layout.database,
-    historyDatabase: layout.historyDatabase,
+  const migration = createProductionReviewedV4MigrationProcess({
+    stateRoot: layout.root,
+    sourceAcceptanceReceiptSha256,
   });
-  const result = coordinator.migrateToV4();
-  coordinator.extendReviewV3SchemaOffline();
-  console.log(JSON.stringify(result, null, 2));
+  const close = createStg04CloseService({
+    stateRoot: layout.root,
+    repositoryRoot: resolveReviewedV4ProductionSourceRoot(),
+    migration,
+    openStateDatabaseAccess: () => openStateDatabaseLease(layout.database, "mutating_service"),
+  });
+  try {
+    const result = await close.prepare({
+      acceptedAt: Date.parse("2026-09-04T17:10:00+08:00"),
+      publishedAt: Date.now(),
+    });
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    close.close();
+    migration.close();
+  }
   process.exit(0);
 }
 
-if (command === "extend-review-v3-schema") {
-  assertServiceInactive();
-  new MigrationCoordinator({
-    stateDatabase: layout.database,
-    historyDatabase: layout.historyDatabase,
-  }).extendReviewV3SchemaOffline();
-  console.log(JSON.stringify({ status: "extended", stateVersion: 4 }, null, 2));
-  process.exit(0);
-}
-
-if (commandAdmission === "exclusive_migration" || commandAdmission === "offline_observation") {
+if (commandAdmission === "exclusive_migration" || commandAdmission === "offline_observation" ||
+    commandAdmission === "no_state") {
   throw new Error(`command ${command} did not terminate in its exclusive/offline branch`);
 }
 const runtimeAdmissionMode: StateDatabaseAdmissionMode = commandAdmission;
 const runtimeLease = prepareDatabases(runtimeAdmissionMode);
 
-const requireUserApproval = (reference: string, project: string, scope: string): void => {
-  const expected = `APPROVE ${reference}`;
-  const message = `Agent collaboration requests ${scope} for ${project}. Type exactly: ${expected}`;
-  const result = spawnSync("/usr/bin/systemd-ask-password", ["--no-tty", "--timeout=120", "--echo=yes", message],
-    { encoding: "utf8", timeout: 125_000, shell: false, env: { PATH: "/usr/bin:/bin" } });
-  if (result.status === 0 && result.stdout.trim() === expected) return;
-  const graphical = spawnSync("/usr/bin/zenity", ["--entry", "--title=Agent collaboration approval", `--text=${message}`, "--hide-text"],
-    { encoding: "utf8", timeout: 125_000, shell: false,
-      env: { PATH: "/usr/bin:/bin", ...(process.env.DISPLAY ? { DISPLAY: process.env.DISPLAY } : {}),
-        ...(process.env.WAYLAND_DISPLAY ? { WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY } : {}),
-        ...(process.env.XDG_RUNTIME_DIR ? { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR } : {}) } });
-  if (graphical.status !== 0 || graphical.stdout.trim() !== expected) {
-    throw new Error("approval was not confirmed through a user-bound system prompt");
-  }
-};
-
-const routingHealth = (health: ProviderHealthStore, now: number): ProviderHealthSnapshot => {
-  const snapshot = health.snapshot();
-  return {
-    grok: snapshot.grok.health,
-    codex: snapshot.codex.health,
-  };
-};
+if (command === "review-initialize") {
+  console.log(JSON.stringify({
+    protocol: "agent-collab-review-initialize/v1",
+    stateVersion: Number(runtimeLease.database.pragma("user_version", { simple: true })),
+    historyVersion: historySchemaVersion(layout.historyDatabase),
+  }, null, 2));
+  runtimeLease.close();
+  process.exit(0);
+}
 
 const asObject = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
-
-const assignmentFrom = (value: unknown): AttemptAssignment | null => {
-  const input = asObject(value);
-  if (!input || (input.agent !== "grok" && input.agent !== "codex") ||
-      typeof input.attemptId !== "string" || typeof input.attemptOrdinal !== "number") return null;
-  return input as unknown as AttemptAssignment;
-};
-
-const processTask = (run: RunRecord): ProcessTask => ({
-  id: run.id,
-  stage: run.stage,
-  ...(run.artifactHash === undefined ? {} : { artifactHash: run.artifactHash }),
-  idempotencyKey: run.idempotencyKey,
-  ...(run.approvalScope === undefined ? {} : { approvalScope: run.approvalScope }),
-  ...(run.payload === undefined ? {} : { payload: run.payload }),
-});
 
 if (command === "reconcile-run") {
   const runId = process.argv[3] ?? "";
@@ -439,7 +588,7 @@ if (command === "reconcile-run") {
   if (resolution !== "completed" && resolution !== "failed") {
     throw new Error("reconcile-run requires <run-id> <completed|failed>");
   }
-  const store = new RunStore(runtimeLease.borrow());
+  const store = new RunStore(runtimeLease.borrow(), { scope: "review" });
   const run = store.get(runId);
   if (!run || run.status !== "needs_reconciliation") throw new Error("run is not awaiting reconciliation");
   const decision = asObject(run.payload?.decision);
@@ -447,492 +596,112 @@ if (command === "reconcile-run") {
   const reviewId = typeof run.payload?.reviewId === "string" ? run.payload.reviewId : null;
   const reviewAttemptId = typeof run.payload?.reviewAttemptId === "string" ? run.payload.reviewAttemptId : null;
   const role = run.payload?.reviewRole;
-  const workflowId = typeof run.payload?.workflowId === "string" ? run.payload.workflowId : null;
-  const stageId = typeof run.payload?.workflowStageId === "string" ? run.payload.workflowStageId : null;
-  const assignment = assignmentFrom(run.payload?.workflowDispatchIdentity);
-  let effect: Record<string, unknown>;
-  if (reviewId && reviewAttemptId && (role === "auditor" || role === "critic") &&
-      isReviewProviderId(agent)) {
-    if (resolution === "completed") {
-      store.close();
-      throw new Error("review reconciliation cannot synthesize completed evidence; resolve as failed and replay a new lane");
-    }
-    effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
-      resultKind: "task_failure",
-      ...(typeof run.payload?.providerAdmissionClaimedAt === "number"
-        ? { providerAdmissionClaimedAt: run.payload.providerAdmissionClaimedAt }
-        : {}) };
-  } else if (workflowId && stageId && assignment && agent === "codex") {
-    if (resolution === "completed") {
-      store.close();
-      throw new Error("workflow reconciliation cannot synthesize completed runner evidence; resolve as failed and start a fresh workflow identity");
-    }
-    const executionContext = asObject(asObject(run.launchInfo)?.executionContext);
-    const lease = asObject(executionContext?.lease);
-    effect = { type: "workflow_reconciliation_block", workflowId, stageId, runId: run.id,
-      ...(lease ? { lease } : {}), terminalAt: Date.now() };
-  } else {
+  if (!reviewId || !reviewAttemptId || (role !== "auditor" && role !== "critic") ||
+      !isReviewProviderId(agent)) {
     store.close(); throw new Error("reconciliation payload has no supported domain identity");
   }
+  if (resolution === "completed") {
+    store.close();
+    throw new Error("review reconciliation cannot synthesize completed evidence; resolve as failed and replay a new lane");
+  }
+  const effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
+    resultKind: "task_failure",
+    ...(typeof run.payload?.providerAdmissionClaimedAt === "number"
+      ? { providerAdmissionClaimedAt: run.payload.providerAdmissionClaimedAt }
+      : {}) };
   store.resolveReconciliation({ id: run.id,
     providerResult: { kind: "task_failure", ...(isReviewProviderId(agent) ? { agent } : {}),
       reconciledByOperator: true, reconciledAt: Date.now() },
     effect: { terminalAt: Date.now(), ...effect }, status: resolution });
   console.log(JSON.stringify({ runId, resolution, domainEffect: "pending_worker_replay" }, null, 2));
-  store.close(); process.exit(0);
+  store.close(); runtimeLease.close(); process.exit(0);
 }
 
-if (command === "mcp") {
-  const service = new LocalCollabService(runtimeLease, { historyDatabase: layout.historyDatabase });
-  await startStdioCollabServer(service);
-} else if (command === "worker") {
-  const recovery = new RunStore(runtimeLease.borrow());
-  recovery.recoverExpired(); recovery.close();
-  const health = new ProviderHealthStore(runtimeLease.borrow(), { cooldownMs: 60_000 });
-  const reviews = new RunGateUnitOfWork(runtimeLease.borrow());
-  const collaborationRuntime = new CollaborationRuntime(runtimeLease.borrow());
-  const markStartupReconciliation = (at: number): void => {
-    const store = new RunStore(runtimeLease.borrow());
-    for (const run of store.needsReconciliation()) {
-      const decision = asObject(run.payload?.decision);
-      const agent = decision?.agent;
-      const workflowId = typeof run.payload?.workflowId === "string" ? run.payload.workflowId : null;
-      const workflowStageId = typeof run.payload?.workflowStageId === "string"
-        ? run.payload.workflowStageId
-        : null;
-      if (workflowId && workflowStageId && agent === "codex") {
-        collaborationRuntime.blockRunnerReconciliation(
-          workflowId,
-          workflowStageId,
-          run.id,
-          at,
-        );
-      }
-    }
-    store.close();
-  };
-  markStartupReconciliation(Date.now());
-  const worktreeLeases = new WorktreeLeaseStore(runtimeLease.borrow());
-  const startupOutbox = new RunStore(runtimeLease.borrow());
-  collaborationRuntime.drainDispatchOutbox(startupOutbox); startupOutbox.close();
-
-  const runner = new AgentRunner({ binaries: {
-    grok: grokBinary,
-    claude: claudeBinary,
-    codex: codexBinary,
-  },
-    timeoutMs: 30 * 60_000, authorizationDatabasePath: layout.database });
-  const effectStore = new RunStore(runtimeLease.borrow());
-  const domainReplayOwner = `domain-replay:${process.pid}:${randomUUID()}`;
-  class PersistedDomainEffectError extends Error {}
-  function poison(message: string): never { throw new PersistedDomainEffectError(message); }
-  const releaseRecordedLease = async (value: unknown): Promise<void> => {
-    const lease = asObject(value) as unknown as WorktreeLease | null;
-    if (!lease) return;
-    await worktreeLeases.release({ worktreePath: lease.worktreePath, leaseId: lease.leaseId,
-      fencingToken: lease.fencingToken, holder: lease.holder });
-  };
-  const applyDomainEffect = async (
-    run: RunRecord,
-    providerResult: Record<string, unknown>,
-    effect: PersistedDomainEffect,
-  ): Promise<void> => {
-    const type = effect.type;
-    const terminalAt = Number(effect.terminalAt);
-    if (!Number.isSafeInteger(terminalAt) || terminalAt < 0) poison("invalid persisted domain-effect time");
-    if (type === "workflow_reconciliation_block") {
-      const workflowId = String(effect.workflowId);
-      const stageId = String(effect.stageId);
-      const runId = String(effect.runId);
-      try {
-        collaborationRuntime.blockRunnerReconciliation(workflowId, stageId, runId, terminalAt);
-      } catch (error) {
-        if (isTransientSqliteError(error)) throw error;
-        poison(error instanceof Error ? error.message : String(error));
-      }
-      await releaseRecordedLease(effect.lease);
-      return;
-    }
-    if (type === "workflow_dispatch_rejected") {
-      const workflowId = String(effect.workflowId);
-      const stageId = String(effect.stageId);
-      const runId = String(effect.runId);
-      const reason = String(effect.reason);
-      try {
-        collaborationRuntime.recordPrelaunchOutcome(workflowId, effect.prelaunchReceipt, terminalAt);
-      } catch (error) {
-        if (error instanceof RunnerOutcomeEvidenceError) poison(error.message);
-        throw error;
-      }
-      await releaseRecordedLease(effect.lease);
-      return;
-    }
-    if (type === "workflow") {
-      const workflowId = String(effect.workflowId);
-      const stageId = String(effect.stageId);
-      const assignment = assignmentFrom(effect.assignment);
-      const agent = effect.agent;
-      const resultKind = String(effect.resultKind);
-      if (!assignment || agent !== "codex") poison("invalid persisted workflow effect");
-      const disposition = collaborationRuntime.dispatchDisposition(workflowId, stageId, assignment);
-      if (disposition === "execute") {
-        try {
-          collaborationRuntime.recordRunnerOutcome(workflowId, effect.runnerReceipt, terminalAt);
-        } catch (error) {
-          if (error instanceof RunnerOutcomeEvidenceError) poison(error.message);
-          throw error;
-        }
-      }
-      const queue = new RunStore(runtimeLease.borrow());
-      collaborationRuntime.drainDispatchOutbox(queue); queue.close();
-      await releaseRecordedLease(effect.lease);
-      return;
-    }
-    if (type === "review") {
-      const reviewId = String(effect.reviewId);
-      const attemptId = String(effect.attemptId);
-      const role = effect.role;
-      const agent = effect.agent;
-      const resultKind = String(effect.resultKind);
-      if ((role !== "auditor" && role !== "critic") || !isReviewProviderId(agent)) {
-        poison("invalid persisted review effect");
-      }
-      const attempt = reviews.attempts(reviewId, agent, role).find((item) => item.attemptId === attemptId);
-      if (!attempt) poison("unknown persisted review attempt");
-      if (resultKind === "success") {
-        reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "completed",
-          result: providerResult, terminalAt });
-      } else if (isFailoverOutcome(resultKind)) {
-        reviews.recordProviderUnavailable({ reviewId, agent, role, attemptId,
-          error: providerResult, terminalAt });
-      } else {
-        reviews.recordTerminal({ reviewId, agent, role, attemptId, status: "failed",
-          error: providerResult, terminalAt });
-      }
-      const admissionClaimedAt = effect.providerAdmissionClaimedAt;
-      if (resultKind === "success") {
-        health.recordSuccess(agent, terminalAt, admissionClaimedAt);
-        activateRecoveredReviewLanes({ agent, now: terminalAt, reviews, health,
-          evidenceCapture: reviewEvidenceCapture });
-      } else if (isFailoverOutcome(resultKind)) {
-        const retryAt = typeof providerResult.retryAt === "number" ? providerResult.retryAt : undefined;
-        health.recordFailoverFailure(agent, { kind: resultKind, ...(retryAt ? { retryAt } : {}) }, terminalAt, admissionClaimedAt);
-      } else if (admissionClaimedAt !== undefined) {
-        health.releaseAttempt(agent, terminalAt, admissionClaimedAt);
-      }
-      return;
-    }
-    poison("unknown persisted domain effect");
-  };
-  const replayClaimedDomainEffect = async (
-    pending: RunRecord,
-    providerResult: Record<string, unknown>,
-    effectInput: unknown,
-  ): Promise<void> => {
-    try {
-      let effect: PersistedDomainEffect;
-      try {
-        effect = parsePersistedDomainEffect(effectInput);
-      } catch (error) {
-        poison(error instanceof Error ? error.message : String(error));
-      }
-      try {
-        assertPersistedDomainEffectMatchesRun(pending, providerResult, effect);
-      } catch (error) {
-        poison(error instanceof Error ? error.message : String(error));
-      }
-      await applyDomainEffect(pending, providerResult, effect);
-      if (!effectStore.markDomainEffectApplied(pending.id, domainReplayOwner)) {
-        const latest = effectStore.get(pending.id)?.result as { domainEffect?: unknown } | undefined;
-        if (latest?.domainEffect !== "applied") {
-          throw new Error(`domain effect lost its replay claim: ${pending.id}`);
-        }
-      }
-    } catch (error) {
-      if (error instanceof PersistedDomainEffectError) {
-        effectStore.quarantineDomainEffect(pending.id, domainReplayOwner, error);
-      } else {
-        effectStore.releaseDomainEffectClaim(pending.id, domainReplayOwner, error);
-      }
-      throw error;
-    }
-  };
-  const replayPendingDomainEffects = async (): Promise<void> => {
-    const now = Date.now();
-    for (const pending of effectStore.pendingDomainEffects(now)) {
-      if (!effectStore.claimDomainEffect(pending.id, {
-        owner: domainReplayOwner,
-        now,
-        leaseMs: 30_000,
-      })) continue;
-      try {
-        const envelope = asObject(pending.result);
-        const providerResult = asObject(envelope?.providerResult);
-        const effect = envelope?.effect;
-        if (!providerResult || effect === undefined) {
-          poison(`invalid pending domain effect: ${pending.id}`);
-        }
-        await replayClaimedDomainEffect(pending, providerResult, effect);
-      } catch (error) {
-        if (error instanceof PersistedDomainEffectError) {
-          effectStore.quarantineDomainEffect(pending.id, domainReplayOwner, error);
-        } else {
-          effectStore.releaseDomainEffectClaim(pending.id, domainReplayOwner, error);
-        }
-      }
-    }
-  };
-  await replayPendingDomainEffects();
-  const workers = Array.from({ length: 4 }, (_unused, index) => new DurableWorker({
-    store: new RunStore(runtimeLease.borrow()), workerId: `worker:${process.pid}:${index}`,
-    runner: async (
-      run,
-      onLaunch,
-      commitDomainEffect,
-      persistExecutionContext,
-      onLaunchIntent,
-      onProvenNoSpawn,
-    ) => {
-      const reviewId = typeof run.payload?.reviewId === "string" ? run.payload.reviewId : null;
-      const reviewAttemptId = typeof run.payload?.reviewAttemptId === "string" ? run.payload.reviewAttemptId : null;
-      const role = run.payload?.reviewRole;
-      const decision = asObject(run.payload?.decision);
-      const agent = decision?.agent;
-      if (reviewId && (role === "auditor" || role === "critic") && isReviewProviderId(agent)) {
-        const existing = reviews.get(reviewId)?.lanes.find((lane) => lane.agent === agent && lane.role === role);
-        if (existing && ["completed", "failed", "timed_out", "stale_artifact"].includes(existing.status)) {
-          return { kind: "success", reconciledTerminalLane: true, priorStatus: existing.status, result: existing.result };
-        }
-      }
-
-      const workflowId = typeof run.payload?.workflowId === "string" ? run.payload.workflowId : null;
-      const workflowStageId = typeof run.payload?.workflowStageId === "string" ? run.payload.workflowStageId : null;
-      const queuedAssignment = assignmentFrom(run.payload?.workflowDispatchIdentity);
-      const now = Date.now();
-      if (workflowId && workflowStageId && queuedAssignment) {
-        const current = collaborationRuntime.workflows.get(workflowId);
-        if (current?.status === "blocked_no_provider" && current.recovery !== null &&
-            current.recovery.nextRetryAt !== null && current.recovery.nextRetryAt <= now) {
-          const available = routingHealth(health, now);
-          collaborationRuntime.recordProviderHealth(workflowId, "grok", available.grok, now);
-          collaborationRuntime.recordProviderHealth(workflowId, "codex", available.codex, now);
-          collaborationRuntime.retryBlockedStage(workflowId, now);
-          const queue = new RunStore(runtimeLease.borrow());
-          collaborationRuntime.drainDispatchOutbox(queue, now); queue.close();
-        }
-        const disposition = collaborationRuntime.dispatchDisposition(workflowId, workflowStageId, queuedAssignment);
-        if (disposition !== "execute") {
-          return disposition === "terminal"
-            ? { kind: "task_failure", reconciledDispatch: disposition }
-            : { kind: "success", reconciledDispatch: disposition };
-        }
-      }
-
-      let lease: WorktreeLease | null = null;
-      const project = typeof run.payload?.project === "string" ? run.payload.project : null;
-      if (workflowId && project && agent === "codex") {
-        const priorContext = asObject(asObject(run.launchInfo)?.executionContext);
-        const priorLease = asObject(priorContext?.lease) as unknown as WorktreeLease | null;
-        if (priorLease) {
-          const reused = await worktreeLeases.reuse({ lease: priorLease, taskId: workflowId,
-            holder: agent, now, ttlMs: 31 * 60_000 });
-          if (reused.status !== "acquired") return { kind: "task_failure", error: "persisted worktree lease is fenced" };
-          lease = reused.lease;
-        } else {
-          const acquired = await worktreeLeases.acquire({ worktreePath: project, taskId: workflowId,
-            holder: agent, now, ttlMs: 31 * 60_000 });
-          if (acquired.status !== "acquired") return { kind: "task_failure", error: "worktree lease is contended" };
-          lease = acquired.lease;
-        }
-        persistExecutionContext({ lease });
-      }
-
-      const launchDecision = await executeReviewLaunchWithFence({
-        run,
-        health,
-        observedAt: Date.now(),
-        evidenceCapture: reviewEvidenceCapture,
-        reviews,
-        reconcile: (reason) => effectStore.reconcileClaimedReviewIdentity(
-          run.id, run.leaseToken!, reason),
-        launch: () => runner.run(
-          processTask(run),
-          onLaunch,
-          onLaunchIntent,
-          onProvenNoSpawn,
-        ),
-      });
-      const rawResult = asObject(launchDecision.providerResult) ?? {
-        kind: "task_failure",
-        error: "review launch fence returned no provider result",
-      };
-      if (rawResult.agent !== undefined && rawResult.agent !== agent) {
-        throw new Error("runner result agent does not match the durable assignment");
-      }
-      let result = isReviewProviderId(agent)
-        ? { ...rawResult, agent }
-        : rawResult;
-      if (
-        reviewId &&
-        (role === "auditor" || role === "critic") &&
-        result.kind === "success"
-      ) {
-        try {
-          result = normalizeReviewProviderResult(result);
-        } catch (error) {
-          result = {
-            kind: "task_failure",
-            agent,
-            reviewOutputInvalid: true,
-            error: error instanceof Error ? error.message : String(error),
-          };
-        }
-      }
-      let resultKind = typeof result.kind === "string" ? result.kind : "task_failure";
-      const durableLaunch = effectStore.get(run.id);
-      const durableLaunchInfo = asObject(durableLaunch?.launchInfo);
-      if (durableLaunch?.launched && durableLaunchInfo?.phase !== "started") {
-        return result;
-      }
-      let effect: Record<string, unknown> | null = null;
-      if (workflowId && workflowStageId && queuedAssignment && agent === "codex") {
-        const terminalAt = Date.now();
-        const launched = effectStore.get(run.id)?.launched === true;
-        if (!launched && isFailoverOutcome(resultKind) && !matchesExactPrelaunchCliMissing(
-          effectStore.get(run.id)!,
-          queuedAssignment as unknown as Readonly<Record<string, unknown>>,
-          resultKind,
-        )) {
-          result = { kind: "task_failure", agent, rejectedPrelaunchOutcome: resultKind };
-          resultKind = "task_failure";
-        }
-        const runnerReceipt = !launched ? null : {
-          schemaVersion: "runner-outcome/v1",
-          runId: run.id,
-          runAttemptCount: run.attemptCount,
-          dispatchId: run.idempotencyKey,
-          workflowId,
-          stageId: workflowStageId,
-          attemptId: queuedAssignment.attemptId,
-          attemptOrdinal: queuedAssignment.attemptOrdinal,
-          agent: queuedAssignment.agent,
-          model: queuedAssignment.model,
-          policyVersion: queuedAssignment.policyVersion,
-          sessionId: queuedAssignment.sessionId,
-          resultKind,
-        };
-        const prelaunchReceipt = launched ? null : {
-          schemaVersion: "prelaunch-outcome/v1",
-          runId: run.id,
-          runAttemptCount: run.attemptCount,
-          dispatchId: run.idempotencyKey,
-          workflowId,
-          stageId: workflowStageId,
-          attemptId: queuedAssignment.attemptId,
-          attemptOrdinal: queuedAssignment.attemptOrdinal,
-          agent: queuedAssignment.agent,
-          model: queuedAssignment.model,
-          policyVersion: queuedAssignment.policyVersion,
-          sessionId: queuedAssignment.sessionId,
-          resultKind,
-        };
-        effect = launched
-          ? { type: "workflow", workflowId, stageId: workflowStageId,
-              assignment: queuedAssignment, agent, resultKind, terminalAt,
-              ...(runnerReceipt ? { runnerReceipt } : {}), ...(lease ? { lease } : {}) }
-          : { type: "workflow_dispatch_rejected", workflowId, stageId: workflowStageId,
-              runId: run.id, reason: resultKind, prelaunchReceipt, terminalAt,
-              ...(lease ? { lease } : {}) };
-      } else if (reviewId && reviewAttemptId && (role === "auditor" || role === "critic") &&
-          isReviewProviderId(agent)) {
-        effect = { type: "review", reviewId, attemptId: reviewAttemptId, role, agent,
-          resultKind, terminalAt: Date.now(),
-          ...(typeof run.payload?.providerAdmissionClaimedAt === "number"
-            ? { providerAdmissionClaimedAt: run.payload.providerAdmissionClaimedAt }
-            : {}) };
-      }
-      if (!effect) {
-        return result;
-      }
-      commitDomainEffect({ providerResult: result, effect,
-        status: resultKind === "success" || isFailoverOutcome(resultKind) ? "completed" : "failed" });
-      const committed = effectStore.get(run.id)!;
-      if (!effectStore.claimDomainEffect(run.id, {
-        owner: domainReplayOwner,
-        now: Date.now(),
-        leaseMs: 30_000,
-      })) throw new Error("committed domain effect could not be claimed");
-      await replayClaimedDomainEffect(committed, result, effect);
-      return result;
-    }, leaseMs: 31 * 60_000,
-  }));
-
-  let stopping = false;
-  process.once("SIGTERM", () => { stopping = true; });
-  const workerLoops = workers.map(async (worker) => {
-    while (!stopping) {
-      const run = await worker.runOnce(Date.now());
-      if (run === undefined) await delay(500);
-    }
+if (command === "review-mcp-codex") {
+  const service = createReviewRuntimeComposition(runtimeLease);
+  const server = await startStdioReviewOnlyMcpServer(service);
+  try { await waitForStdioShutdown(); }
+  finally { await server.close(); }
+} else if (command === "review-worker") {
+  const runner = new AgentRunner({
+    binaries: { grok: grokBinary, claude: claudeBinary, codex: codexBinary },
+    timeoutMs: 30 * 60_000,
+    authorizationDatabasePath: layout.database,
   });
-  let lastRecovery = 0;
-  while (!stopping) {
-    const now = Date.now();
-    if (now - lastRecovery >= 30_000) {
-      const store = new RunStore(runtimeLease.borrow());
-      store.recoverExpired(now); store.close();
-      await replayPendingDomainEffects();
-      markStartupReconciliation(now);
-      await replayPendingDomainEffects();
-      const outboxQueue = new RunStore(runtimeLease.borrow());
-      collaborationRuntime.drainDispatchOutbox(outboxQueue, now); outboxQueue.close();
-      const available = routingHealth(health, now);
-      for (const recoverable of collaborationRuntime.workflows.recoverable()) {
-        const recovery = recoverable.state.recovery;
-        collaborationRuntime.recordProviderHealth(recoverable.workflowId, "grok", available.grok, now);
-        collaborationRuntime.recordProviderHealth(recoverable.workflowId, "codex", available.codex, now);
-        if (recovery?.nextRetryAt !== null && recovery?.nextRetryAt !== undefined && recovery.nextRetryAt <= now) {
-          collaborationRuntime.retryBlockedStage(recoverable.workflowId, now);
-        }
+  const probe = async (agent: ReviewProviderId, signal?: AbortSignal) => {
+    const result = (await runCapabilityProbes({
+      providers: capabilityProbeProviders(agent),
+      timeoutMs: 120_000,
+      runner: capabilityProbeRunner,
+      ...(signal ? { signal } : {}),
+    })).results[agent];
+    const failures = new Set(result.failures);
+    const kind = failures.has("cli_missing") ? "cli_missing" as const
+      : failures.has("probe_timeout") ? "network_timeout" as const
+        : failures.has("authentication_failed") ? "auth" as const
+          : "model_unavailable" as const;
+    return result.ready ? { ready: true as const } : { ready: false as const, failure: { kind } };
+  };
+  const runtime = (workerId: string) => createReviewWorkerRuntime({
+    stateDatabase: runtimeLease,
+    workerId,
+    runner,
+    evidenceCapture: reviewEvidenceCapture,
+    probe,
+  });
+  const workers = Array.from({ length: 4 }, (_unused, index) =>
+    runtime(`review-worker:${process.pid}:${index}`));
+  const service = new ReviewWorkerService({
+    workers,
+    control: runtime(`review-control:${process.pid}`),
+    onRecovery({ expired, replay, providers }) {
+      const replayCount = replay.applied + replay.deferred + replay.quarantined;
+      const transitions = providers.filter((result) => result.status !== "not_due");
+      if (expired > 0 || replayCount > 0 || transitions.length > 0) {
+        writeOperationalEvent("review_recovery_observed", {
+          expired,
+          replay,
+          providers: transitions.map((result) => ({
+            agent: result.agent,
+            status: result.status,
+            generation: result.generation,
+            ...(result.rejoin ? { rejoin: result.rejoin } : {}),
+          })),
+        });
       }
-      const recoveredQueue = new RunStore(runtimeLease.borrow());
-      collaborationRuntime.drainDispatchOutbox(recoveredQueue, now); recoveredQueue.close();
-      await runAutomaticProviderRecovery({ now, reviews, health,
-        evidenceCapture: reviewEvidenceCapture,
-        probe: async (agent) => {
-          const probe = await runCapabilityProbes({
-            providers: capabilityProbeProviders(agent), timeoutMs: 120_000,
-            runner: capabilityProbeRunner,
-          });
-          const result = probe.results[agent];
-          const failures = new Set(result.failures);
-          const kind = failures.has("cli_missing") ? "cli_missing" as const
-            : failures.has("probe_timeout") ? "network_timeout" as const
-              : failures.has("authentication_failed") ? "auth" as const
-                : "model_unavailable" as const;
-          return result.ready ? { ready: true } : { ready: false, failure: { kind } };
-        },
-      });
-      lastRecovery = now;
-    }
-    await delay(500);
+    },
+  });
+  const stop = () => service.stop();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  const readiness = inspectReadiness();
+  writeOperationalEvent("review_worker_started", {
+    processId: process.pid,
+    workerCount: workers.length,
+    degradedOptionalProviders: readiness.degradedOptionalProviders,
+  });
+  try {
+    await service.run();
+  } catch (error) {
+    writeOperationalEvent("review_worker_failed", {
+      errorType: error instanceof Error ? error.name : "unknown",
+    });
+    throw error;
+  } finally {
+    runtimeLease.close();
+    writeOperationalEvent("review_worker_stopped", { processId: process.pid });
   }
-  await Promise.all(workerLoops);
-  for (const worker of workers) worker.close();
-  health.close(); reviews.close(); collaborationRuntime.close(); worktreeLeases.close(); effectStore.close();
-  runtimeLease.close();
-} else {
-  const service = new LocalCollabService(runtimeLease, { historyDatabase: layout.historyDatabase });
-  if (command === "index") {
-    console.log(JSON.stringify(await service.indexNow({ project: resolve(process.argv[3] ?? process.cwd()) })));
-  } else if (command === "probe") {
-    if (process.argv[3] !== "APPROVE_LIVE_CAPABILITY_PROBE") {
-      throw new Error("live capability probing may incur provider cost; pass APPROVE_LIVE_CAPABILITY_PROBE explicitly");
-    }
+} else if (command === "probe") {
+  if (process.argv[3] !== "APPROVE_LIVE_CAPABILITY_PROBE") {
+    throw new Error("live capability probing may incur provider cost; pass APPROVE_LIVE_CAPABILITY_PROBE explicitly");
+  }
+  const health = new ProviderHealthStore(runtimeLease.borrow(), { cooldownMs: 60_000 });
+  try {
     const probeAt = Date.now();
-    const probeAdmissions = Object.fromEntries(REVIEW_PROVIDERS.map((agent) =>
-      [agent, service.providers.acquireExplicitProbeAdmission(agent, probeAt)])) as
-      Record<ReviewProviderId, ReturnType<ProviderHealthStore["acquireExplicitProbeAdmission"]>>;
+    const probeAdmissions = Object.fromEntries(REVIEW_PROVIDERS.map((agent) => [
+      agent,
+      health.acquireExplicitProbeAdmission(agent, probeAt),
+    ])) as Record<ReviewProviderId, ReturnType<ProviderHealthStore["acquireExplicitProbeAdmission"]>>;
     const providerConfig = capabilityProbeProviders();
     const result = await runCapabilityProbes({ providers: {
       grok: { ...providerConfig.grok, enabled: probeAdmissions.grok.runnable },
@@ -943,35 +712,26 @@ if (command === "mcp") {
       if (!probeAdmissions[agent].runnable) continue;
       const now = Date.now();
       const claimedAt = probeAdmissions[agent].claimedAt;
-      if (result.results[agent].ready) service.providers.recordSuccess(agent, now, claimedAt);
-      else service.providers.recordFailoverFailure(agent, { kind: "model_unavailable" }, now, claimedAt);
+      if (result.results[agent].ready) health.recordSuccess(agent, now, claimedAt);
+      else health.recordFailoverFailure(agent, { kind: "model_unavailable" }, now, claimedAt);
     }
     console.log(JSON.stringify(result, null, 2));
-  } else if (command === "doctor") {
-    const binaries = Object.fromEntries(([
-      { agent: "grok", path: grokBinary },
-      { agent: "claude", path: claudeBinary },
-      { agent: "codex", path: codexBinary },
-    ]).map(({ agent, path }) => {
-      try { accessSync(path, constants.X_OK); return [agent, { path, executable: true }]; }
-      catch { return [agent, { path, executable: false }]; }
-    }));
-    console.log(JSON.stringify({ protocol: "agent-collab/v2", state: layout, binaries, liveModelProbe: "not_run" }, null, 2));
-  } else if (command === "approve") {
-    const reference = process.argv[3]; const projectInput = process.argv[4]; const scope = process.argv[5];
-    if (!reference || !projectInput || (scope !== "workspace-write" && scope !== "external")) {
-      throw new Error("usage: agent-collab approve <reference> <project> <workspace-write|external> [ttlSeconds] [maxUses]");
-    }
-    const project = new ProjectPolicy(allowedProjectRoots).resolve(projectInput);
-    const ttlSeconds = Number(process.argv[6] ?? 900); const maxUses = Number(process.argv[7] ?? 1);
-    if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 86_400) throw new Error("ttlSeconds must be 1..86400");
-    requireUserApproval(reference, project, scope);
-    service.approvals.issue({ reference, project, scope, expiresAt: Date.now() + ttlSeconds * 1_000, maxUses });
-    console.log(JSON.stringify({ reference, project, scope, ttlSeconds, maxUses }));
-  } else if (command === "status") {
-    console.log(JSON.stringify(await service.status(), null, 2));
-  } else {
-    throw new Error(`unknown command: ${command}`);
+  } finally {
+    health.close();
+    runtimeLease.close();
   }
-  service.close();
+} else if (command === "doctor") {
+  const binaries = Object.fromEntries(([
+    { agent: "grok", path: grokBinary },
+    { agent: "claude", path: claudeBinary },
+    { agent: "codex", path: codexBinary },
+  ]).map(({ agent, path }) => {
+    try { accessSync(path, constants.X_OK); return [agent, { path, executable: true }]; }
+    catch { return [agent, { path, executable: false }]; }
+  }));
+  console.log(JSON.stringify({ protocol: "agent-collab/v2", state: layout, binaries, liveModelProbe: "not_run" }, null, 2));
+  runtimeLease.close();
+} else {
+  runtimeLease.close();
+  throw new Error(`unknown command: ${command}`);
 }

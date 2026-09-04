@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 import { openStateDatabaseLease, type StateDatabaseAccess } from "../store/state-database-fence.js";
 import { HistoryIndex } from "../history/index.js";
@@ -26,7 +25,7 @@ import { defaultAllowedProjectRoots, ProjectPolicy } from "../security/project-p
 import { ProviderHealthStore } from "../runtime/provider-health-store.js";
 import { RunGateUnitOfWork } from "../runtime/run-gate-unit-of-work.js";
 import { captureWorkspaceFingerprint } from "../runtime/workspace-fingerprint.js";
-import { ReviewEvidenceCapture, type ReviewEvidenceCaptureEntryPoint } from "../runtime/review-evidence-capture.js";
+import { ReviewEvidenceCapture } from "../runtime/review-evidence-capture.js";
 import { assertReviewV3SchemaSignature } from "../migration/review-v3-schema.js";
 import { CollaborationRuntime } from "../runtime/collaboration-runtime.js";
 import { REVIEW_BARRIER_POLICY } from "../domain/review.js";
@@ -46,6 +45,8 @@ import {
   mapProfileSha256,
   type MapAdmissionProof,
 } from "../flow/map-admission.js";
+import { ReviewApplicationService } from "./review-application-service.js";
+import { denyLegacyLinearDelegation } from "../runtime/legacy-linear-quarantine.js";
 
 const walk = (root: string, suffix: string): string[] => {
   if (!existsSync(root)) return [];
@@ -155,7 +156,7 @@ export class LocalCollabService implements CollabService {
   private readonly projects: ProjectPolicy;
   private readonly sharedSkillsRoot = join(homedir(), ".agents", "skills");
   private readonly agentSkillRoots: Readonly<Record<"grok" | "claude" | "codex", string>>;
-  private readonly evidenceCapture: ReviewEvidenceCapture;
+  private readonly reviewApplication: ReviewApplicationService;
   private readonly stateLease: StateDatabaseAccess;
   constructor(stateDatabase: string | StateDatabaseAccess, options?: { allowedRoots?: string[]; historyDatabase?: string;
     agentSkillRoots?: Readonly<Record<"grok" | "claude" | "codex", string>>;
@@ -176,7 +177,7 @@ export class LocalCollabService implements CollabService {
       claude: join(homedir(), ".claude", "skills"),
       codex: join(homedir(), ".codex", "skills"),
     };
-    this.evidenceCapture = options?.evidenceCapture ?? new ReviewEvidenceCapture({
+    const evidenceCapture = options?.evidenceCapture ?? new ReviewEvidenceCapture({
       captureSource: ({ project }) => {
         const source = captureWorkspaceFingerprint(project);
         return { sourceFingerprint: source.fingerprint, valid: true };
@@ -207,6 +208,13 @@ export class LocalCollabService implements CollabService {
     this.runtime = new CollaborationRuntime(this.stateLease.borrow());
     rollback.push(() => this.runtime.close());
     this.projects = new ProjectPolicy(options?.allowedRoots ?? defaultAllowedProjectRoots());
+    this.reviewApplication = new ReviewApplicationService({
+      runs: this.runs,
+      reviews: this.reviews,
+      providers: this.providers,
+      projects: this.projects,
+      evidenceCapture,
+    });
     } catch (error) {
       for (const close of rollback.reverse()) {
         try { close(); } catch { /* preserve the construction error */ }
@@ -293,96 +301,6 @@ export class LocalCollabService implements CollabService {
       skillReady,
     };
   }
-  private captureAdmission(
-    entryPoint: Extract<ReviewEvidenceCaptureEntryPoint, "request_review" | "map_admission">,
-    project: string,
-    reviewId: string,
-  ): { health: ReviewProviderHealthSnapshot; sourceFingerprint: string;
-    admissionReceipts: Array<{ agent: ReviewProviderId; role: "auditor" | "critic";
-      activationNonce: string; sourceReceiptId: string; readinessReceiptId: string }> } {
-    const outcomes = new Map<string, ReturnType<ReviewEvidenceCapture["capture"]>>();
-    const unavailableForThisAdmission = new Set<ReviewProviderId>();
-    for (const agent of ["grok", "claude", "codex"] as const) {
-      for (const role of ["auditor", "critic"] as const) {
-        const outcome = this.evidenceCapture.capture({ entryPoint, phase: "admission",
-          project, agent, role });
-        outcomes.set(`${agent}:${role}`, outcome);
-      }
-      const auditor = outcomes.get(`${agent}:auditor`)!;
-      const critic = outcomes.get(`${agent}:critic`)!;
-      const pairIsEquivalent = auditor.kind === critic.kind &&
-          auditor.kind !== "infrastructure_failure" &&
-          critic.kind !== "infrastructure_failure" &&
-          JSON.stringify(auditor.source) === JSON.stringify(critic.source) &&
-          JSON.stringify(auditor.readiness) === JSON.stringify(critic.readiness);
-      const pairIsReady = pairIsEquivalent && auditor.kind === "ready" && critic.kind === "ready";
-      if (!pairIsReady) {
-        if (agent === "codex") {
-          throw new Error("mandatory Codex auditor/critic pair is unavailable or divergent");
-        }
-        unavailableForThisAdmission.add(agent);
-        const unavailable = [auditor, critic].find(
-          (outcome) => outcome.kind === "provider_unavailable",
-        );
-        if (unavailable?.kind === "provider_unavailable") {
-          this.providers.applyCaptureOutcome(unavailable);
-        }
-        continue;
-      }
-    }
-    const persistedHealth = reviewHealth(this.providers.snapshot());
-    const health: ReviewProviderHealthSnapshot = {
-      ...persistedHealth,
-      ...Object.fromEntries([...unavailableForThisAdmission].map((agent) => [agent, "unavailable"])),
-    } as ReviewProviderHealthSnapshot;
-    const codexSource = outcomes.get("codex:auditor")!;
-    if (codexSource.kind !== "ready") throw new Error("mandatory Codex evidence capture failed");
-    const admissionReceipts: Array<{ agent: ReviewProviderId; role: "auditor" | "critic";
-      activationNonce: string; sourceReceiptId: string; readinessReceiptId: string }> = [];
-    for (const agent of ["grok", "claude", "codex"] as const) {
-      if (health[agent] !== "healthy" || unavailableForThisAdmission.has(agent)) continue;
-      for (const role of ["auditor", "critic"] as const) {
-        const outcome = outcomes.get(`${agent}:${role}`)!;
-        if (outcome.kind !== "ready") {
-          throw new Error(`healthy review provider lacks ready evidence: ${agent}/${role}`);
-        }
-        const sourceScope = `review/${reviewId}/${agent}/${role}/source`;
-        const readinessScope = `review/${reviewId}/${agent}/${role}/readiness`;
-        const cursor = this.reviews.receiptPairCursor({ sourceScope, readinessScope });
-        const activationNonce = randomUUID();
-        const sourceReceiptId = randomUUID();
-        const readinessReceiptId = randomUUID();
-        const captured = this.reviews.captureReviewReceiptPair({
-          pairId: randomUUID(), phase: "admission", activationNonce,
-          scopeRevision: cursor.scopeRevision, recoveryGeneration: null,
-          expectedTuple: { laneRevision: 0, latestOrdinal: null, latestEvidenceHash: null },
-          predecessorReceiptIds: cursor.predecessorReceiptIds,
-          receipts: {
-            source: { receiptId: sourceReceiptId, scope: sourceScope, observation: outcome.source },
-            readiness: { receiptId: readinessReceiptId, scope: readinessScope,
-              observation: outcome.readiness },
-          },
-          createdAt: outcome.observedAt,
-        });
-        if (captured.lifecycle !== "pending") {
-          throw new Error(`admission receipt pair lost current head: ${agent}/${role}`);
-        }
-        admissionReceipts.push({ agent, role, activationNonce, sourceReceiptId, readinessReceiptId });
-      }
-    }
-    return { health, sourceFingerprint: codexSource.source.sourceFingerprint, admissionReceipts };
-  }
-  private reviewRuns(reviewId: string, requester: "grok" | "codex") {
-    return this.reviews.enqueueDescriptors(reviewId)
-      .map((lane) => {
-        if (lane.requester !== requester) {
-          throw new Error("review requester changed before durable enqueue");
-        }
-        const run = this.runs.getByIdempotencyKey(lane.idempotencyKey);
-        if (!run) throw new Error("atomic review run is missing");
-        return run;
-      });
-  }
   closeMapLearning(input: MapLearningBytesInput) {
     return this.mapControl.closeLearning(input);
   }
@@ -419,16 +337,23 @@ export class LocalCollabService implements CollabService {
         sourceFingerprint: source.fingerprint,
         changedFiles: source.changedFiles.length,
       });
-      const admission = this.captureAdmission("map_admission", project, expectation.reviewId);
-      this.reviews.create({
-        ...expectation,
-        health: admission.health,
-        sourceFingerprint: admission.sourceFingerprint,
-        admissionReceipts: admission.admissionReceipts,
-        createdAt: Date.now(),
-      });
+      if (!this.reviews.findExact(expectation)) {
+        const admission = this.reviewApplication.captureAdmission(
+          "map_admission",
+          project,
+          expectation.reviewId,
+          expectation.sourceFingerprint,
+        );
+        const created = this.reviews.createWithResult({
+          ...expectation,
+          health: admission.health,
+          admissionEvidence: admission.admissionEvidence,
+          createdAt: Date.now(),
+        });
+        if (created.created) this.reviewApplication.applyAdmissionFailures(admission);
+      }
       const { reviewId } = expectation;
-      const runs = this.reviewRuns(reviewId, "codex");
+      const runs = this.reviewApplication.reviewRuns(reviewId, "codex");
       return { name: gate.name, reviewId, barrier: this.reviews.barrier(reviewId), runIds: runs.map((run) => run.id) };
     });
     return {
@@ -449,111 +374,14 @@ export class LocalCollabService implements CollabService {
       } satisfies MapAdmissionProof,
     };
   }
-  async delegate(input: DelegateInput) {
-    const providerSnapshot = this.providers.snapshot();
-    const sharedSkills = this.assertSharedSkills(reviewHealth(providerSnapshot));
-    if (stageRequiresReadOnly(input.stage) && input.approvalScope !== "workspace-read") {
-      throw new Error(`${input.stage} is a read-only stage and cannot receive mutation authority`);
-    }
-    const project = this.projects.resolve(input.project);
-    const artifact = Buffer.from(input.artifactContent, "utf8");
-    if (createHash("sha256").update(artifact).digest("hex") !== input.artifactHash) {
-      throw new Error("delegated artifact hash mismatch");
-    }
-    if (redactSensitive(input.artifactContent) !== input.artifactContent) {
-      throw new Error("delegated artifact contains credential material and cannot be persisted exactly");
-    }
-    if (redactSensitive(input.prompt) !== input.prompt) {
-      throw new Error("delegated prompt contains credential material and cannot be persisted exactly");
-    }
-    const policyOwner = preferredAgentForStage(input.stage);
-    if (input.preferredAgent && input.preferredAgent !== policyOwner) {
-      throw new Error(`routing policy requires ${policyOwner} for ${input.stage}`);
-    }
-    const persistedInputKey = scopedIdempotencyKey(project, input.idempotencyKey);
-    const existingWorkflow = this.runtime.workflows.get(persistedInputKey);
-    const workspace = captureWorkspaceFingerprint(project);
-    const mapLearning = createCurrentMapLearningLaunchBinding("codex");
-    const workflowPrompt = `${input.stage === "planning" ? "MAP control plane: use the installed map-plan contract before proposing implementation.\n\n" : ""}${formatMapLearningLaunchBindingContext(mapLearning)}\n\n${input.prompt}\n\nImmutable artifact (${input.artifactHash}):\n${input.artifactContent}`;
-    const taskId = input.taskId ?? input.idempotencyKey.split(":")[0] ?? input.idempotencyKey;
-    const workflowTaskId = scopedIdempotencyKey(project, taskId);
-    const health = routingHealth(providerSnapshot);
-    const targetStage: StageDefinition = { id: input.idempotencyKey, kind: input.stage,
-      role: input.stage === "coordination" ? "coordinator" as const : "stage-owner" as const,
-      artifactRef: `artifact:${input.artifactHash}`, artifactHash: input.artifactHash,
-      artifactBytes: artifact.length, changedFiles: workspace.changedFiles.length,
-      approvalScope: input.approvalScope, idempotencyKey: persistedInputKey,
-      project, prompt: workflowPrompt, requester: input.requester,
-      sourceFingerprint: workspace.fingerprint, mapLearning };
-    if (input.approvalScope !== "workspace-read") {
-      targetStage.authorizationConsumerKey = executionAuthorityConsumerKey(persistedInputKey, targetStage);
-    }
-    const workflow = createCollaborationRun({
-      taskId: workflowTaskId, origin: input.requester, health,
-      stages: [targetStage],
-    });
-    const candidate = this.runtime.prepareCandidate(persistedInputKey, workflow);
-    if (!existingWorkflow) {
-      this.assertAuthorized(project, input.approvalScope, input.approvalReference,
-        targetStage.authorizationConsumerKey);
-    }
-    const mapAdmission = this.ensureMapAdmission(
-      input,
-      project,
-      candidate,
-      sharedSkills.health,
-    );
-    if (!mapAdmission.satisfied) {
-      return {
-        runId: persistedInputKey,
-        assignedAgent: "codex",
-        status: "blocked_map_admission",
-        mapAdmission,
-      };
-    }
-    const state = this.runtime.createAndStart(
-      persistedInputKey,
-      candidate,
-      mapAdmission.proof === undefined ? [] : [mapAdmission.proof],
-      Date.now(),
-      input.approvalReference,
-    );
-    this.runtime.drainDispatchOutbox(this.runs);
-    const requestedStage = state.stages.find((stage) => stage.id === input.idempotencyKey)!;
-    let assignedAgent = state.activeStage?.id === requestedStage.id
-      ? state.activeStage.assignment.agent : preferredAgentForStage(requestedStage.kind);
-    try { assignedAgent = routeStage({ stage: requestedStage.kind, origin: input.requester, health: state.health,
-      role: requestedStage.role, artifactRef: requestedStage.artifactRef, artifactHash: requestedStage.artifactHash,
-      approvalScope: requestedStage.approvalScope, idempotencyKey: requestedStage.idempotencyKey,
-      trustedInputs: { artifactBytes: requestedStage.artifactBytes, changedFiles: requestedStage.changedFiles,
-        attemptOrdinal: 0, approvalScope: requestedStage.approvalScope } }).assignedAgent; } catch { /* blocked */ }
-    return { runId: persistedInputKey, assignedAgent, status: state.status };
+  async delegate(_input: DelegateInput): Promise<never> {
+    return denyLegacyLinearDelegation();
   }
   async requestReview(input: ReviewInput) {
-    if (input.requester !== "codex") {
-      throw new Error("only Codex may mint a review grant at the local stdio boundary");
-    }
-    const project = this.projects.resolveReviewWorkspace(input.workspaceRoot);
-    if (input.approvalScope !== "workspace-read") throw new Error("review lanes are immutable read-only operations");
-    if (redactSensitive(input.artifactContent) !== input.artifactContent) {
-      throw new Error("review artifact contains credential material and cannot preserve its exact hash safely");
-    }
-    const artifact = Buffer.from(input.artifactContent, "utf8");
-    const actualHash = createHash("sha256").update(artifact).digest("hex");
-    if (actualHash !== input.artifactHash) throw new Error("review artifact hash mismatch");
-    const reviewId = scopedIdempotencyKey(project, input.idempotencyKey);
-    const safePrompt = redactSensitive(input.prompt);
-    const source = captureWorkspaceFingerprint(project);
-    const admission = this.captureAdmission("request_review", project, reviewId);
-    const review = this.reviews.create({ reviewId, stageId: input.stageId ?? "independent-review", artifact,
-      health: admission.health,
-      approvalScope: "workspace-read", idempotencyKey: reviewId,
-      prompts: { auditor: `AUDITOR independent lane. ${safePrompt}`, critic: `CRITIC independent lane. ${safePrompt}` },
-      createdAt: Date.now(), project, requester: input.requester,
-      sourceFingerprint: admission.sourceFingerprint, changedFiles: source.changedFiles.length,
-      admissionReceipts: admission.admissionReceipts });
-    const runs = this.reviewRuns(reviewId, input.requester);
-    return { reviewId, laneCount: 6, activeLaneCount: runs.length, runState: review.runState, runIds: runs.map((lane) => lane.id) };
+    return this.reviewApplication.requestReview(input);
+  }
+  async reviewStatus(input: { reviewId: string }) {
+    return this.reviewApplication.reviewStatus(input);
   }
   async runStatus(input: { runId: string }) {
     const run = this.runs.get(input.runId); if (run) return run;

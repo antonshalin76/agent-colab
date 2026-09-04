@@ -40,7 +40,7 @@ coordinate work without exposing a network listener.
 - Node.js 24 or newer
 - npm
 - SQLite support through `better-sqlite3`
-- Grok CLI, Claude Code CLI, and Codex CLI installed locally
+- Codex CLI installed locally; Grok and Claude Code CLIs are optional reviewers
 - A client that can register a stdio MCP command
 
 ## Install
@@ -50,13 +50,16 @@ git clone <repository-url> agent-collab
 cd agent-collab
 npm ci
 npm run build
-npm start -- doctor
+npm start -- review-skills-link
+npm start -- review-readiness
+npm start -- review-initialize
 ```
 
 The project does not require a server port. Runtime communication with agents
 uses stdio MCP.
 
-The operating contract is
+The production setup, migration, MCP and recovery procedure is
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md). The operating contract is
 [`docs/evidence-gated-flow-v1/WORKFLOW.md`](docs/evidence-gated-flow-v1/WORKFLOW.md).
 
 ## Configuration
@@ -86,14 +89,26 @@ state with restrictive permissions where supported by the operating system.
 
 ## MCP command
 
-Register the built CLI as a stdio MCP command in Grok, Claude Code, and Codex:
+Register the mutating review-only profile only in Codex:
 
 ```text
-node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs mcp
+node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs review-mcp-codex
 ```
 
-Use the absolute path for your checkout. Restart the three harnesses after
-changing the MCP registration or shared skills.
+Register the read-only status profile in Grok and Claude Code:
+
+```text
+node /absolute/path/to/agent-collab/scripts/agent-collab-launcher.mjs review-mcp-status
+```
+
+Use the absolute path for your checkout. Remove old `review-mcp`, `mcp`, and
+`worker` registrations. Restart each harness after changing MCP registration
+or shared skills. Helpers expose only `collab_status`; they cannot submit or
+mutate reviews.
+
+The mutating profile also rejects MCP handshakes whose client name is not
+Codex CLI's `codex-mcp-client`. This prevents configuration mistakes, not a
+hostile process running as the same OS user.
 
 `collab_request_review` requires `workspaceRoot`: the exact checkout or linked
 worktree top-level that every review provider must inspect. A Git subdirectory,
@@ -103,15 +118,20 @@ directories remain supported.
 
 ## Worker
 
-For durable background processing, run the worker:
+For durable review processing, run the review-only worker:
 
 ```bash
-npm start -- worker
+npm start -- review-worker
 ```
 
 On Linux with systemd user services, adapt `systemd/agent-collab.service` to
 your checkout path, Node path, CLI paths, and state directory, then install it
-as a user unit.
+as the `agent-collab-reviewed.service` user unit.
+
+The legacy `mcp`, `worker`, `start-normal`, and `prove-normal` runtime routes are
+permanently quarantined. They cannot be enabled through the stable dispatcher or
+by selecting an older runtime snapshot. Linear workflow execution is likewise
+disabled at its persistence boundary.
 
 ## Commands
 
@@ -119,17 +139,29 @@ as a user unit.
 npm run typecheck
 npm test
 npm run build
+npm start -- review-skills-link
+npm start -- review-readiness
+npm start -- review-initialize
 npm start -- doctor
 npm start -- doctor-v1
 npm start -- migrate-v2
 npm start -- migrate-v3
+npm start -- reviewed-source-promote <auditor.json> <critic.json> <output.json> <expires-at> <promotion-id>
+npm start -- reviewed-source-adopt <promotion.json>
+npm start -- review-service-stage </absolute/nonexistent/backup-directory>
+npm start -- stg04-close-preflight <source-adoption-sha256>
+npm start -- stg04-close-prepare <source-adoption-sha256>
+npm start -- stg04-close-status <source-adoption-sha256>
+npm start -- review-service-activate <source-adoption-sha256>
 npm start -- verify-bundle /absolute/rollback/bundle
 npm start -- restore-v1 /absolute/rollback/bundle
 npm start -- reconcile-run <run-id> <completed|failed>
-npm start -- index /absolute/project/root
 npm start -- status
-npm start -- approve <reference> /absolute/project/root workspace-write 900 1
 ```
+
+`status` is read-only and requires an existing state. `doctor` is an alias for
+the no-state review readiness check. The reviewed-v4 commands and their trust
+environment are documented in the production runbook.
 
 ## Local paired benchmark
 

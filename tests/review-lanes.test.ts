@@ -116,11 +116,28 @@ describe("BDD-C1 six-lane review policy", () => {
     }
   });
 
-  it("fails closed when mandatory Codex is not verified yet", () => {
-    expect(() => createReviewPlan({
+  it("durably defers mandatory Codex while capability verification is pending", () => {
+    const plan = createReviewPlan({
       ...common,
       health: { grok: "unavailable", claude: "disabled", codex: "probing" },
-    })).toThrow(/mandatory Codex auditor\/critic pair is unavailable/i);
+    });
+    expect(plan.runState).toBe("DEGRADED_REVIEW_SET");
+    expect(plan.activeLanes).toEqual([]);
+    expect(plan.deferredLanes.map(({ agent, role }) => `${agent}:${role}`)).toEqual([
+      "grok:auditor",
+      "grok:critic",
+      "claude:auditor",
+      "claude:critic",
+      "codex:auditor",
+      "codex:critic",
+    ]);
+  });
+
+  it("rejects a disabled mandatory Codex before creating review demand", () => {
+    expect(() => createReviewPlan({
+      ...common,
+      health: { grok: "healthy", claude: "healthy", codex: "disabled" },
+    })).toThrow(/mandatory Codex auditor\/critic pair is disabled/i);
   });
 
   it("rejects review creation when every provider is disabled", () => {

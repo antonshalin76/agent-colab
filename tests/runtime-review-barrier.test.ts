@@ -434,12 +434,37 @@ describe("runtime durable review barrier", () => {
     store.close();
   });
 
-  it("does not let helper PASS substitute for unavailable Codex", () => {
+  it.each(["unavailable", "probing"] as const)(
+    "keeps %s Codex as durable deferred demand after every helper passes", (codexHealth) => {
+      const path = database();
+      const store = new RunGateUnitOfWork(path);
+      createV3(store, { ...input,
+        health: { grok: "healthy", claude: "healthy", codex: codexHealth } });
+      for (const agent of ["grok", "claude"] as const) {
+        for (const role of ["auditor", "critic"] as const) {
+          completeLaneWithEvidence(path, store, agent, role);
+        }
+      }
+      expect(store.deferredReviewIds("codex")).toEqual([input.reviewId]);
+      expect(store.get(input.reviewId)?.lanes.filter(({ agent }) => agent === "codex"))
+        .toEqual(expect.arrayContaining([
+          expect.objectContaining({ role: "auditor", status: "deferred", attempts: [] }),
+          expect.objectContaining({ role: "critic", status: "deferred", attempts: [] }),
+        ]));
+      expect(store.barrier(input.reviewId).satisfied).toBe(false);
+      store.close();
+    });
+
+  it("rejects a disabled mandatory Codex provider before persisting review work", () => {
     const path = database();
     const store = new RunGateUnitOfWork(path);
     expect(() => createV3(store, { ...input,
-      health: { grok: "healthy", claude: "healthy", codex: "unavailable" } }))
-      .toThrow(/mandatory Codex auditor\/critic pair is unavailable/i);
+      health: { grok: "healthy", claude: "healthy", codex: "disabled" } }))
+      .toThrow(/mandatory Codex auditor\/critic pair is disabled/i);
+    expect(store.get(input.reviewId)).toBeNull();
+    const runs = new RunStore(path);
+    expect(runs.list()).toEqual([]);
+    runs.close();
     store.close();
   });
 
