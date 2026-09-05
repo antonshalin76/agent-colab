@@ -172,6 +172,12 @@ npm start -- status
 является псевдонимом no-state проверки `review-readiness`. Trust environment и
 точный порядок reviewed-v4 операций описаны в production runbook.
 
+`reviewed-source-adopt` сам выполняет offline SQLite WAL checkpoint и
+нормализацию журналов для точной пары БД v3/v2. Удалять sidecar-файлы вручную
+нельзя. До публикации acceptance receipt команда отклоняет активные сервисы,
+открытые дескрипторы, алиасы файлов, некорректные sidecar, drift integrity/version
+или исходного кода. После прерванной нормализации повторите ту же команду.
+
 ## Локальный парный benchmark
 
 Репозиторий содержит защищенный хешами evaluation corpus Grok/Codex для Punto

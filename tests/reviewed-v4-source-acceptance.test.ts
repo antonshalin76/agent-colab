@@ -18,9 +18,11 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { canonicalJson } from "../src/domain/canonical-json.js";
 import {
+  adoptVerifiedReviewedV4SourceAcceptance,
   adoptReviewedV4SourceAcceptance,
   createSignedReviewedV4Promotion,
   requireReviewedV4SourceAcceptance,
+  verifyReviewedV4PromotionSource,
 } from "../src/migration/reviewed-v4-source-acceptance.js";
 import { buildReviewedV4Promotion } from "../src/migration/reviewed-v4-promotion-builder.js";
 import {
@@ -142,7 +144,6 @@ describe("reviewed v4 signed source promotion and target adoption", () => {
       stateRoot: state.stateRoot,
       externalPromotionPath: packet.promotionPath,
       trust: packet.trust,
-      adoptedAt: "2026-09-02T00:00:00.000Z",
     });
     const before = readFileSync(first.receiptPath);
     const identity = statSync(first.receiptPath);
@@ -150,7 +151,6 @@ describe("reviewed v4 signed source promotion and target adoption", () => {
       stateRoot: state.stateRoot,
       externalPromotionPath: packet.promotionPath,
       trust: packet.trust,
-      adoptedAt: "2026-09-02T00:00:00.000Z",
     });
 
     expect(first).toMatchObject({ status: "accepted", created: true });
@@ -158,6 +158,28 @@ describe("reviewed v4 signed source promotion and target adoption", () => {
     expect(readFileSync(first.receiptPath)).toEqual(before);
     expect(statSync(first.receiptPath).ino).toBe(identity.ino);
     expect(readdirSync(dirname(first.receiptPath)).sort()).toEqual(["reviewed-source-adoption-v2.json"]);
+  }, 120_000);
+
+  it("adopts the one verified promotion snapshot even if its pathname changes afterward", () => {
+    const state = fixture();
+    const packet = createTestReviewedV4Promotion();
+    scratch.push(packet.directory);
+    const verified = verifyReviewedV4PromotionSource({
+      externalPromotionPath: packet.promotionPath,
+      trust: packet.trust,
+    });
+    writeFileSync(packet.promotionPath, "{}\n");
+
+    const adopted = adoptVerifiedReviewedV4SourceAcceptance({
+      stateRoot: state.stateRoot,
+      verifiedPromotion: verified,
+    });
+    const receipt = JSON.parse(readFileSync(adopted.receiptPath, "utf8")) as {
+      promotionSha256: string;
+    };
+
+    expect(adopted.promotionSha256).toBe(verified.promotionSha256);
+    expect(receipt.promotionSha256).toBe(verified.promotionSha256);
   }, 120_000);
 
   it.each([
@@ -179,6 +201,9 @@ describe("reviewed v4 signed source promotion and target adoption", () => {
     }, true],
     ["future-issued promotion", (draft: Record<string, unknown>) => {
       draft.issuedAt = "2029-09-05T00:00:00.000Z";
+    }, true],
+    ["expired promotion", (draft: Record<string, unknown>) => {
+      draft.expiresAt = "2026-09-03T00:00:00.000Z";
     }, true],
   ] as const)("rejects %s before creating adoption", (_name, mutateDraft, resign) => {
     const state = fixture();
@@ -238,6 +263,20 @@ describe("reviewed v4 signed source promotion and target adoption", () => {
       trust: packet.trust,
     })).toThrow(/canonical|no-follow|regular|path/i);
   });
+
+  it("rejects a dangling SQLite sidecar instead of binding an incomplete target", () => {
+    const state = fixture();
+    const packet = createTestReviewedV4Promotion();
+    scratch.push(packet.directory);
+    symlinkSync(join(state.root, "missing-wal-target"), `${state.databasePath}-wal`);
+
+    expect(() => adoptReviewedV4SourceAcceptance({
+      stateRoot: state.stateRoot,
+      externalPromotionPath: packet.promotionPath,
+      trust: packet.trust,
+    })).toThrow(/sidecar/i);
+    expect(existsSync(join(state.stateRoot, ADOPTION_PATH))).toBe(false);
+  }, 120_000);
 
   it("binds adoption to one canonical root and database inode generation", () => {
     const firstState = fixture();

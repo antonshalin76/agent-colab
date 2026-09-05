@@ -189,7 +189,6 @@ export function adoptTestReviewedV4SourceAcceptance(stateRoot: string): string {
       stateRoot,
       externalPromotionPath: packet.promotionPath,
       trust: packet.trust,
-      adoptedAt: "2026-09-02T00:00:00.000Z",
     }).receiptSha256;
     adoptedByStateRoot.set(stateRoot, adoptionSha256);
     return adoptionSha256;

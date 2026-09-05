@@ -1,4 +1,15 @@
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
@@ -59,10 +70,18 @@ const fixture = () => {
 };
 
 const statePath = (root: string) => join(root, "collaboration.db");
+const hasDatabaseSidecars = (root: string): boolean =>
+  ["collaboration.db-wal", "collaboration.db-shm", "history.db-wal", "history.db-shm"]
+    .some((name) => existsSync(join(root, name)));
 
 const version = (path: string): number => {
   const db = new Database(path, { readonly: true });
   try { return Number(db.pragma("user_version", { simple: true })); } finally { db.close(); }
+};
+
+const journalMode = (path: string): string => {
+  const db = new Database(path, { readonly: true });
+  try { return String(db.pragma("journal_mode", { simple: true })); } finally { db.close(); }
 };
 
 const schemaSnapshot = (path: string): unknown[] => {
@@ -130,18 +149,6 @@ const downgradeEmptyFixtureToV3 = (path: string): void => {
       ALTER TABLE runtime_review_barriers DROP COLUMN launch_authority_version;
       PRAGMA user_version = 3;
     `);
-    db.pragma("wal_checkpoint(TRUNCATE)");
-    db.pragma("journal_mode = DELETE");
-    db.exec("VACUUM");
-  } finally { db.close(); }
-};
-
-const stabilizeDatabaseFile = (path: string): void => {
-  const db = new Database(path);
-  try {
-    db.pragma("wal_checkpoint(TRUNCATE)");
-    db.pragma("journal_mode = DELETE");
-    db.exec("VACUUM");
   } finally { db.close(); }
 };
 
@@ -242,7 +249,7 @@ describe("CLI v4 startup and offline authority extension", () => {
     const fx = fixture();
     fx.initialize();
     downgradeEmptyFixtureToV3(statePath(fx.state));
-    stabilizeDatabaseFile(join(fx.state, "history.db"));
+    expect(hasDatabaseSidecars(fx.state)).toBe(true);
     const packet = createTestReviewedV4Promotion();
     const publicKey = join(fx.root, "reviewed-source-public.pem");
     writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
@@ -254,6 +261,7 @@ describe("CLI v4 startup and offline authority extension", () => {
     try {
       const adopted = fx.runWith("reviewed-source-adopt", [packet.promotionPath], trustEnv);
       expect(adopted.status, adopted.stderr).toBe(0);
+      expect(hasDatabaseSidecars(fx.state)).toBe(false);
       const adoptionSha = (JSON.parse(adopted.stdout) as { receiptSha256: string }).receiptSha256;
 
       const preflight = fx.runWith("stg04-close-preflight", [adoptionSha], trustEnv);
@@ -273,6 +281,173 @@ describe("CLI v4 startup and offline authority extension", () => {
       });
       expect(durableTreeSnapshot(fx.state)).toEqual(beforeStatus);
     } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("verifies the signed source before changing SQLite journal state", () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const before = durableTreeSnapshot(fx.state);
+    expect(hasDatabaseSidecars(fx.state)).toBe(true);
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    writeFileSync(packet.promotionPath, Buffer.concat([readFileSync(packet.promotionPath), Buffer.from(" ")]));
+    try {
+      const rejected = fx.runWith("reviewed-source-adopt", [packet.promotionPath], {
+        AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+      });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toMatch(/promotion.*(invalid|noncanonical)/i);
+      expect(hasDatabaseSidecars(fx.state)).toBe(true);
+      expect(durableTreeSnapshot(fx.state)).toEqual(before);
+    } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("refuses journal stabilization while a managed service is active", () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const before = durableTreeSnapshot(fx.state);
+    expect(hasDatabaseSidecars(fx.state)).toBe(true);
+    writeFileSync(fx.systemctl, "#!/bin/sh\nprintf 'active\\n'\nexit 0\n");
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    try {
+      const rejected = fx.runWith("reviewed-source-adopt", [packet.promotionPath], {
+        AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+      });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toMatch(/service.*inactive|active.*service/i);
+      expect(hasDatabaseSidecars(fx.state)).toBe(true);
+      expect(durableTreeSnapshot(fx.state)).toEqual(before);
+    } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("rejects a hard-linked database before changing SQLite journal state", () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const before = durableTreeSnapshot(fx.state);
+    linkSync(statePath(fx.state), join(fx.root, "external-database-alias.db"));
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    try {
+      const rejected = fx.runWith("reviewed-source-adopt", [packet.promotionPath], {
+        AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+      });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toMatch(/database.*(aliases|hard-link|canonical)/i);
+      expect(hasDatabaseSidecars(fx.state)).toBe(true);
+      expect(durableTreeSnapshot(fx.state)).toEqual(before);
+    } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("rejects a dangling symlink SQLite sidecar before opening the database", () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const sidecar = ["collaboration.db-wal", "collaboration.db-shm", "history.db-wal", "history.db-shm"]
+      .map((name) => join(fx.state, name)).find(existsSync);
+    expect(sidecar).toBeDefined();
+    rmSync(sidecar!);
+    symlinkSync(join(fx.root, "missing-external-sidecar"), sidecar!);
+    const before = durableTreeSnapshot(fx.state);
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    try {
+      const rejected = fx.runWith("reviewed-source-adopt", [packet.promotionPath], {
+        AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+      });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toMatch(/sidecar.*(canonical|regular|aliases)/i);
+      expect(durableTreeSnapshot(fx.state)).toEqual(before);
+    } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("rejects an ineligible database pair before changing SQLite journal state", () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const history = new Database(join(fx.state, "history.db"));
+    try { history.pragma("user_version = 1"); } finally { history.close(); }
+    const before = durableTreeSnapshot(fx.state);
+    const modes = [journalMode(statePath(fx.state)), journalMode(join(fx.state, "history.db"))];
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    try {
+      const rejected = fx.runWith("reviewed-source-adopt", [packet.promotionPath], {
+        AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+        AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+      });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stderr).toMatch(/exact pre-v4 database pair/i);
+      expect([journalMode(statePath(fx.state)), journalMode(join(fx.state, "history.db"))]).toEqual(modes);
+      expect(durableTreeSnapshot(fx.state)).toEqual(before);
+    } finally {
+      rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("recovers by retry after normalization stops between the database pair", () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const historyPath = join(fx.state, "history.db");
+    const stateSchema = schemaSnapshot(statePath(fx.state));
+    const historySchema = schemaSnapshot(historyPath);
+    chmodSync(historyPath, 0o400);
+    const packet = createTestReviewedV4Promotion();
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, packet.trust.publicKeyPem, { mode: 0o600 });
+    const trustEnv = {
+      AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+      AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: packet.trust.remote.url,
+      AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: packet.trust.remote.ref,
+    };
+    try {
+      const interrupted = fx.runWith("reviewed-source-adopt", [packet.promotionPath], trustEnv);
+      expect(interrupted.status).not.toBe(0);
+      expect(interrupted.stderr).toMatch(/readonly|read-only|write|sqlite/i);
+      expect(existsSync(join(
+        fx.state,
+        "migration-v4/source-acceptance/reviewed-source-adoption-v2.json",
+      ))).toBe(false);
+      expect(version(statePath(fx.state))).toBe(3);
+      expect(version(historyPath)).toBe(2);
+      expect(schemaSnapshot(statePath(fx.state))).toEqual(stateSchema);
+      expect(schemaSnapshot(historyPath)).toEqual(historySchema);
+
+      chmodSync(historyPath, 0o600);
+      const retried = fx.runWith("reviewed-source-adopt", [packet.promotionPath], trustEnv);
+      expect(retried.status, retried.stderr).toBe(0);
+      expect(JSON.parse(retried.stdout)).toMatchObject({ status: "accepted", created: true });
+      expect(hasDatabaseSidecars(fx.state)).toBe(false);
+    } finally {
+      chmodSync(historyPath, 0o600);
       rmSync(packet.directory, { recursive: true, force: true });
     }
   }, 120_000);

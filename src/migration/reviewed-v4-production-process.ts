@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import Database from "better-sqlite3";
 import {
   closeSync,
   constants,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   openSync,
   readlinkSync,
@@ -33,14 +35,16 @@ import {
   type MigrationAuthorityInspection,
 } from "./reviewed-v4-migration-authority.js";
 import { acquireStateOpenAdmission } from "../store/state-open-admission.js";
+import { canonicalStateDatabaseIdentity } from "../store/state-database-fence.js";
 import { openExistingStateLayout } from "../store/state-layout.js";
 import {
   inspectReviewedV4ExecutionSource,
   verifyReviewedV4Source,
 } from "../flow/reviewed-v4-source.js";
 import {
-  adoptReviewedV4SourceAcceptance,
+  adoptVerifiedReviewedV4SourceAcceptance,
   consumeReviewedV4SourceAcceptance,
+  verifyReviewedV4PromotionSource,
   type ReviewedV4PromotionTrust,
   type ReviewedV4SourceAcceptanceResult,
 } from "./reviewed-v4-source-acceptance.js";
@@ -105,11 +109,28 @@ export function adoptProductionReviewedV4Source(input: {
     throw new Error("unknown production source adoption input is not permitted");
   }
   const repositoryRoot = resolveReviewedV4ProductionSourceRoot();
-  return adoptReviewedV4SourceAcceptance({
-    stateRoot: input.stateRoot,
+  const trust = configuredPromotionTrust(repositoryRoot);
+  const verifiedPromotion = verifyReviewedV4PromotionSource({
     externalPromotionPath: input.externalPromotionPath,
-    trust: configuredPromotionTrust(repositoryRoot),
+    trust,
   });
+  const layout = openExistingStateLayout(input.stateRoot);
+  const pair = { stateDatabase: layout.database, historyDatabase: layout.historyDatabase };
+  const quiescence = productionQuiescence(layout);
+  quiescence.assertServiceInactive(pair);
+  quiescence.assertNoOpenDatabaseFds(pair);
+  const fence = quiescence.acquireExclusiveWriteFence(pair);
+  try {
+    const versions = preflightProductionAdoptionDatabases(layout, fence);
+    const result = adoptVerifiedReviewedV4SourceAcceptance({
+      stateRoot: layout.root,
+      verifiedPromotion,
+      beforeTargetIdentity: () => stabilizeProductionAdoptionDatabases(layout, fence, versions),
+    });
+    fence.assertCurrent();
+    assertNoDatabaseSidecars(layout);
+    return result;
+  } finally { fence.release(); }
 }
 
 function managedServiceState(): "active" | "inactive" | "unknown" {
@@ -186,6 +207,124 @@ function scanSameUidOpenFiles(targetPaths: readonly string[]): OfflineProcessSca
   return { files, unreadableSameUidPids: [...new Set(unreadableSameUidPids)] };
 }
 
+const productionQuiescence = (layout: ReturnType<typeof openExistingStateLayout>) =>
+  createOfflineMigrationQuiescence({
+    serviceState: managedServiceState,
+    scanSameUidOpenFiles: () => scanSameUidOpenFiles([
+      layout.database,
+      `${layout.database}-wal`,
+      `${layout.database}-shm`,
+      `${layout.database}-journal`,
+      layout.historyDatabase,
+      `${layout.historyDatabase}-wal`,
+      `${layout.historyDatabase}-shm`,
+      `${layout.historyDatabase}-journal`,
+    ]),
+    stat: (path) => {
+      const identity = statSync(path);
+      return { dev: identity.dev, ino: identity.ino };
+    },
+    acquireFence: () => acquireStateOpenAdmission(layout.root, "exclusive"),
+  });
+
+type ProductionLayout = ReturnType<typeof openExistingStateLayout>;
+
+const databasePaths = (layout: ProductionLayout): readonly [string, string] =>
+  [layout.database, layout.historyDatabase];
+
+const pathEntryExists = (path: string): boolean => {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+};
+
+const assertDirectOwnedFile = (path: string, label: string): void => {
+  const link = lstatSync(path);
+  const expectedUid = process.getuid?.();
+  if (!link.isFile() || link.isSymbolicLink() || link.nlink !== 1 ||
+      realpathSync(path) !== path || (expectedUid !== undefined && link.uid !== expectedUid)) {
+    throw new Error(`${label} must be a canonical owned regular file without aliases`);
+  }
+};
+
+const assertProductionDatabaseFiles = (layout: ProductionLayout): void => {
+  for (const path of databasePaths(layout)) {
+    canonicalStateDatabaseIdentity(path);
+    assertDirectOwnedFile(path, "production SQLite database");
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      const sidecar = `${path}${suffix}`;
+      if (pathEntryExists(sidecar)) assertDirectOwnedFile(sidecar, "production SQLite sidecar");
+    }
+  }
+};
+
+const assertNoDatabaseSidecars = (layout: ProductionLayout): void => {
+  for (const path of databasePaths(layout)) {
+    if (["-wal", "-shm", "-journal"].some((suffix) => pathEntryExists(`${path}${suffix}`))) {
+      throw new Error("SQLite adoption stabilization left unbound sidecar state");
+    }
+  }
+};
+
+const inspectDatabase = (path: string): number => {
+  const database = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    const version = Number(database.pragma("user_version", { simple: true }));
+    if (String(database.pragma("integrity_check", { simple: true })) !== "ok") {
+      throw new Error("SQLite adoption preflight integrity check failed");
+    }
+    return version;
+  } finally { database.close(); }
+};
+
+const preflightProductionAdoptionDatabases = (
+  layout: ProductionLayout,
+  fence: { assertCurrent(): void },
+): readonly [number, number] => {
+  fence.assertCurrent();
+  assertProductionDatabaseFiles(layout);
+  const paths = databasePaths(layout);
+  const versions: [number, number] = [inspectDatabase(paths[0]), inspectDatabase(paths[1])];
+  if (versions[0] !== 3 || versions[1] !== 2) {
+    throw new Error("reviewed v4 source adoption requires the exact pre-v4 database pair");
+  }
+  fence.assertCurrent();
+  assertProductionDatabaseFiles(layout);
+  return versions;
+};
+
+const stabilizeProductionAdoptionDatabases = (
+  layout: ProductionLayout,
+  fence: { assertCurrent(): void },
+  versions: readonly [number, number],
+): void => {
+  fence.assertCurrent();
+  assertProductionDatabaseFiles(layout);
+  const paths = databasePaths(layout);
+  for (const [index, path] of paths.entries()) {
+    const database = new Database(path, { fileMustExist: true });
+    try {
+      const checkpoint = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+      if (checkpoint.some(({ busy }) => busy !== 0)) throw new Error("SQLite checkpoint remained busy");
+      const mode = String(database.pragma("journal_mode = DELETE", { simple: true })).toLowerCase();
+      if (mode !== "delete") throw new Error("SQLite journal mode did not stabilize to DELETE");
+      if (String(database.pragma("integrity_check", { simple: true })) !== "ok" ||
+          Number(database.pragma("user_version", { simple: true })) !== versions[index]) {
+        throw new Error("SQLite adoption stabilization changed database identity or integrity");
+      }
+    } finally { database.close(); }
+    const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+  }
+  const directory = openSync(layout.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+  fence.assertCurrent();
+  assertProductionDatabaseFiles(layout);
+  assertNoDatabaseSidecars(layout);
+};
+
 const receiptForProcess = (result: MigrationResult): Record<string, unknown> => {
   if (result.status === "migrated" && result.toVersion === 4) return { ...result };
   if (result.status === "already_current" && result.toVersion === 4) return { ...result };
@@ -256,24 +395,7 @@ export function createProductionReviewedV4MigrationProcess(input: {
     stateDatabase: layout.database,
     historyDatabase: layout.historyDatabase,
   });
-  const quiescence = createOfflineMigrationQuiescence({
-    serviceState: managedServiceState,
-    scanSameUidOpenFiles: () => scanSameUidOpenFiles([
-      layout.database,
-      `${layout.database}-wal`,
-      `${layout.database}-shm`,
-      `${layout.database}-journal`,
-      layout.historyDatabase,
-      `${layout.historyDatabase}-wal`,
-      `${layout.historyDatabase}-shm`,
-      `${layout.historyDatabase}-journal`,
-    ]),
-    stat: (path) => {
-      const identity = statSync(path);
-      return { dev: identity.dev, ino: identity.ino };
-    },
-    acquireFence: () => acquireStateOpenAdmission(layout.root, "exclusive"),
-  });
+  const quiescence = productionQuiescence(layout);
 
   return Object.freeze({
     inspectExactOperation(): MigrationAuthorityInspection {

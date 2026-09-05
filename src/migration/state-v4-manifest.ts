@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { canonicalJson } from "../domain/canonical-json.js";
 import { GRAPH_V4_TABLES } from "./graph-v4-schema.js";
@@ -18,6 +18,14 @@ export interface LegacyDatabaseObservation {
 }
 
 const sha256 = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
+
+const pathEntryExists = (path: string): boolean => {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+};
 
 const sqliteValue = (value: unknown): unknown => {
   if (value === null || typeof value === "string") return { type: value === null ? "null" : "text", value };
@@ -116,7 +124,7 @@ export function observeLegacyDatabase(
   label: "state" | "history",
   expected?: LegacyTableManifest,
 ): LegacyDatabaseObservation {
-  if (["-wal", "-shm", "-journal"].some((suffix) => existsSync(`${path}${suffix}`))) {
+  if (["-wal", "-shm", "-journal"].some((suffix) => pathEntryExists(`${path}${suffix}`))) {
     throw new Error(`${label} database has unbound SQLite sidecar state`);
   }
   const bytesSha256 = sha256(readFileSync(path));
@@ -139,7 +147,7 @@ export function observeLegacyDatabase(
     db.close();
   }
   if (sha256(readFileSync(path)) !== bytesSha256 ||
-      ["-wal", "-shm", "-journal"].some((suffix) => existsSync(`${path}${suffix}`))) {
+      ["-wal", "-shm", "-journal"].some((suffix) => pathEntryExists(`${path}${suffix}`))) {
     throw new Error(`${label} database bytes changed during observation`);
   }
   return observation;

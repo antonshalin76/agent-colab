@@ -165,6 +165,13 @@ npm start -- status
 the no-state review readiness check. The reviewed-v4 commands and their trust
 environment are documented in the production runbook.
 
+`reviewed-source-adopt` owns the offline SQLite WAL checkpoint and journal
+normalization for the exact v3/v2 database pair. Do not remove sidecar files
+manually. The command rejects active services, open descriptors, aliased files,
+invalid sidecars, integrity/version drift, or source drift before publishing an
+acceptance receipt; rerun the same command after correcting an interrupted
+normalization.
+
 ## Local paired benchmark
 
 The repository includes a hash-locked Grok/Codex evaluation corpus for Punto

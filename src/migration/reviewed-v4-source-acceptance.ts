@@ -9,6 +9,7 @@ import {
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   lstatSync,
   openSync,
@@ -130,6 +131,18 @@ const adoptionSchema = adoptionDraftSchema.extend({
 type Promotion = z.infer<typeof promotionSchema>;
 type Adoption = z.infer<typeof adoptionSchema>;
 
+export interface VerifiedReviewedV4Promotion {
+  readonly promotionSha256: string;
+  readonly sourceIdentity: ReviewedV4SourceIdentity;
+}
+
+interface VerifiedPromotionData {
+  readonly promotion: Promotion;
+  readonly trust: ReviewedV4PromotionTrust;
+}
+
+const verifiedPromotions = new WeakMap<object, VerifiedPromotionData>();
+
 export interface SignedReviewedV4PromotionInput {
   readonly promotionId: string;
   readonly issuedAt: string;
@@ -158,6 +171,33 @@ export interface ReviewedV4SourceAcceptanceResult {
   readonly planIdentity: { readonly planId: string; readonly planLockSha256: string };
   readonly target: z.infer<typeof targetSchema>;
   readonly remote: ReviewedV4RemoteTrust;
+}
+
+export function verifyReviewedV4PromotionSource(input: {
+  readonly externalPromotionPath: string;
+  readonly trust: ReviewedV4PromotionTrust;
+}): VerifiedReviewedV4Promotion {
+  const promotionBytes = readDirectRegularFile(input.externalPromotionPath, "external reviewed v4 promotion");
+  const trust = Object.freeze({
+    publicKeyPem: Buffer.isBuffer(input.trust.publicKeyPem)
+      ? Buffer.from(input.trust.publicKeyPem)
+      : input.trust.publicKeyPem,
+    repositoryRoot: input.trust.repositoryRoot,
+    remote: Object.freeze({ ...input.trust.remote }),
+  });
+  const promotion = validatePromotion(promotionBytes, trust);
+  const source = inspectReviewedV4ExecutionSource({
+    repositoryRoot: trust.repositoryRoot,
+    expected: promotion.source,
+    remote: trust.remote,
+  });
+  verifyReviewedV4Source(source, promotion.source);
+  const capability = Object.freeze({
+    promotionSha256: promotion.promotionSha256,
+    sourceIdentity: Object.freeze({ ...promotion.source }),
+  });
+  verifiedPromotions.set(capability, Object.freeze({ promotion, trust }));
+  return capability;
 }
 
 const sha256 = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
@@ -247,7 +287,7 @@ function trustedKey(trust: ReviewedV4PromotionTrust): { readonly key: KeyObject;
   return { key, keyId: sha256(der) };
 }
 
-function validatePromotion(bytes: Buffer, trust: ReviewedV4PromotionTrust, observedAt = Date.now()): Promotion {
+function validatePromotion(bytes: Buffer, trust: ReviewedV4PromotionTrust, observedAt?: number): Promotion {
   const promotion = parseCanonical(bytes, promotionSchema, "reviewed v4 promotion");
   const { promotionSha256, signatureBase64, ...draft } = promotion;
   const signed = canonicalJson({ ...draft, promotionSha256 });
@@ -259,7 +299,7 @@ function validatePromotion(bytes: Buffer, trust: ReviewedV4PromotionTrust, obser
   const issuedAt = Date.parse(promotion.issuedAt);
   const expiresAt = Date.parse(promotion.expiresAt);
   if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt) || expiresAt < issuedAt ||
-      observedAt < issuedAt || observedAt > expiresAt) {
+      (observedAt !== undefined && (observedAt < issuedAt || observedAt > expiresAt))) {
     throw new Error("reviewed v4 promotion lifetime is invalid or expired");
   }
   if (promotion.remote.canonicalUrl !== trust.remote.url || promotion.remote.refName !== trust.remote.ref ||
@@ -285,6 +325,21 @@ function validatePromotion(bytes: Buffer, trust: ReviewedV4PromotionTrust, obser
     }
   }
   return promotion;
+}
+
+function verifiedPromotionData(capability: VerifiedReviewedV4Promotion): VerifiedPromotionData {
+  const data = verifiedPromotions.get(capability as object);
+  if (data === undefined) throw new Error("reviewed v4 promotion capability is not authentic");
+  return data;
+}
+
+function assertVerifiedPromotionSourceCurrent(data: VerifiedPromotionData): void {
+  const source = inspectReviewedV4ExecutionSource({
+    repositoryRoot: data.trust.repositoryRoot,
+    expected: data.promotion.source,
+    remote: data.trust.remote,
+  });
+  verifyReviewedV4Source(source, data.promotion.source);
 }
 
 function targetIdentity(stateRoot: string) {
@@ -352,49 +407,59 @@ function result(adoption: Adoption, receiptPath: string, created: boolean): Revi
   });
 }
 
-export function adoptReviewedV4SourceAcceptance(input: {
+export function adoptVerifiedReviewedV4SourceAcceptance(input: {
   readonly stateRoot: string;
-  readonly externalPromotionPath: string;
-  readonly trust: ReviewedV4PromotionTrust;
-  readonly adoptedAt?: string;
+  readonly verifiedPromotion: VerifiedReviewedV4Promotion;
+  readonly beforeTargetIdentity?: () => void;
 }): ReviewedV4SourceAcceptanceResult {
-  const promotionBytes = readDirectRegularFile(input.externalPromotionPath, "external reviewed v4 promotion");
-  const promotion = validatePromotion(promotionBytes, input.trust);
-  const source = inspectReviewedV4ExecutionSource({
-    repositoryRoot: input.trust.repositoryRoot,
-    expected: promotion.source,
-    remote: input.trust.remote,
-  });
-  verifyReviewedV4Source(source, promotion.source);
-  const target = targetIdentity(input.stateRoot);
-  if (target.state.userVersion !== 3 || target.history.userVersion !== 2) {
-    throw new Error("reviewed v4 source adoption requires the exact pre-v4 database pair");
-  }
-  const timestamp = input.adoptedAt ?? new Date().toISOString();
-  const adoptionTime = Date.parse(timestamp);
-  if (!Number.isFinite(adoptionTime) || adoptionTime > Date.now() ||
-      adoptionTime < Date.parse(promotion.issuedAt) || adoptionTime > Date.parse(promotion.expiresAt)) {
-    throw new Error("reviewed v4 source adoption timestamp is outside the current promotion lifetime");
-  }
-  const draft = {
-    schemaVersion: "reviewed-v4-source-adoption/v2" as const,
-    operationId: promotion.operationId,
-    promotionSha256: promotion.promotionSha256,
-    promotion,
-    target,
-    remoteObservation: {
-      canonicalUrl: promotion.remote.canonicalUrl,
-      refName: promotion.remote.refName,
-      advertisedCommitOid: promotion.source.commitOid,
-      observedAt: timestamp,
-    },
-    adoptedAt: timestamp,
-  };
-  const adoption = adoptionSchema.parse({ ...draft, adoptionSha256: sha256(canonicalJson(draft)) });
-  const bytes = Buffer.from(`${canonicalJson(adoption)}\n`);
+  const data = verifiedPromotionData(input.verifiedPromotion);
+  const { promotion, trust } = data;
   const durability = new StateFileDurability({ stateRoot: input.stateRoot });
   try {
     return durability.withExclusiveLock({ lockBasename: "reviewed-v4-source-acceptance.lock" }, () => {
+      const receiptPath = resolve(input.stateRoot, ADOPTION_PATH);
+      if (existsSync(receiptPath)) {
+        const pinned = durability.openPinned(ADOPTION_PATH);
+        try {
+          const adoption = validateAdoption(pinned.read(), trust, input.stateRoot);
+          if (adoption.promotionSha256 !== promotion.promotionSha256 ||
+              canonicalJson(adoption.promotion) !== canonicalJson(promotion)) {
+            throw new Error("immutable reviewed v4 source adoption conflicts with the verified promotion");
+          }
+          assertVerifiedPromotionSourceCurrent(data);
+          pinned.assertCurrent();
+          return result(adoption, pinned.absolutePath, false);
+        } finally { pinned.close(); }
+      }
+
+      const timestamp = new Date().toISOString();
+      const adoptionTime = Date.parse(timestamp);
+      if (!Number.isFinite(adoptionTime) || adoptionTime > Date.now()) {
+        throw new Error("reviewed v4 source adoption timestamp is outside the current promotion lifetime");
+      }
+      validatePromotion(Buffer.from(`${canonicalJson(promotion)}\n`), trust, adoptionTime);
+      input.beforeTargetIdentity?.();
+      assertVerifiedPromotionSourceCurrent(data);
+      const target = targetIdentity(input.stateRoot);
+      if (target.state.userVersion !== 3 || target.history.userVersion !== 2) {
+        throw new Error("reviewed v4 source adoption requires the exact pre-v4 database pair");
+      }
+      const draft = {
+        schemaVersion: "reviewed-v4-source-adoption/v2" as const,
+        operationId: promotion.operationId,
+        promotionSha256: promotion.promotionSha256,
+        promotion,
+        target,
+        remoteObservation: {
+          canonicalUrl: promotion.remote.canonicalUrl,
+          refName: promotion.remote.refName,
+          advertisedCommitOid: promotion.source.commitOid,
+          observedAt: timestamp,
+        },
+        adoptedAt: timestamp,
+      };
+      const adoption = adoptionSchema.parse({ ...draft, adoptionSha256: sha256(canonicalJson(draft)) });
+      const bytes = Buffer.from(`${canonicalJson(adoption)}\n`);
       const published = durability.publishImmutable({ relativePath: ADOPTION_PATH, bytes });
       try {
         if (!published.file.read().equals(bytes)) {
@@ -406,6 +471,17 @@ export function adoptReviewedV4SourceAcceptance(input: {
   } finally {
     durability.close();
   }
+}
+
+export function adoptReviewedV4SourceAcceptance(input: {
+  readonly stateRoot: string;
+  readonly externalPromotionPath: string;
+  readonly trust: ReviewedV4PromotionTrust;
+}): ReviewedV4SourceAcceptanceResult {
+  return adoptVerifiedReviewedV4SourceAcceptance({
+    stateRoot: input.stateRoot,
+    verifiedPromotion: verifyReviewedV4PromotionSource(input),
+  });
 }
 
 export function requireReviewedV4SourceAcceptance(input: {

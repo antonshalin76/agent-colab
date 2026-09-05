@@ -150,6 +150,15 @@ npm start -- stg04-close-prepare "$ADOPTION_SHA"
 npm start -- stg04-close-status "$ADOPTION_SHA"
 ```
 
+`reviewed-source-adopt` is the sole owner of pre-migration SQLite journal
+stabilization. Under one exclusive state-open fence it validates both database
+identities, all present sidecars, exact v3/v2 versions and integrity; checkpoints
+both WALs; switches both journals to `DELETE`; fsyncs the databases and state
+directory; binds the resulting target; and durably publishes the immutable
+receipt before releasing the fence. Never delete `-wal`, `-shm`, or `-journal`
+files manually. If the command stops between the two databases, no receipt is
+published and rerunning the same command safely converges the pair.
+
 `stg04-close-prepare` repeats service, open-file, source, remote and database
 identity checks before and after the migration kernel. It writes a retained
 backup and durable one-shot authorization/completion records. A crash is
