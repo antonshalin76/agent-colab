@@ -131,6 +131,14 @@ const adoptionSchema = adoptionDraftSchema.extend({
 type Promotion = z.infer<typeof promotionSchema>;
 type Adoption = z.infer<typeof adoptionSchema>;
 
+export interface ReviewedV4PromotionEvidence {
+  readonly document: Readonly<Record<string, unknown>>;
+  readonly promotionSha256: string;
+  readonly sourceIdentity: ReviewedV4SourceIdentity;
+  readonly planIdentity: { readonly planId: string; readonly planLockSha256: string };
+  readonly remote: ReviewedV4RemoteTrust;
+}
+
 export interface VerifiedReviewedV4Promotion {
   readonly promotionSha256: string;
   readonly sourceIdentity: ReviewedV4SourceIdentity;
@@ -142,6 +150,14 @@ interface VerifiedPromotionData {
 }
 
 const verifiedPromotions = new WeakMap<object, VerifiedPromotionData>();
+
+const promotionEvidence = (promotion: Promotion): ReviewedV4PromotionEvidence => Object.freeze({
+  document: Object.freeze(structuredClone(promotion)) as Readonly<Record<string, unknown>>,
+  promotionSha256: promotion.promotionSha256,
+  sourceIdentity: Object.freeze({ ...promotion.source }),
+  planIdentity: Object.freeze({ ...promotion.plan }),
+  remote: Object.freeze({ url: promotion.remote.canonicalUrl, ref: promotion.remote.refName }),
+});
 
 export interface SignedReviewedV4PromotionInput {
   readonly promotionId: string;
@@ -198,6 +214,34 @@ export function verifyReviewedV4PromotionSource(input: {
   });
   verifiedPromotions.set(capability, Object.freeze({ promotion, trust }));
   return capability;
+}
+
+export function consumeVerifiedReviewedV4Promotion(
+  capability: VerifiedReviewedV4Promotion,
+): ReviewedV4PromotionEvidence {
+  const data = verifiedPromotions.get(capability as object);
+  if (data === undefined) throw new Error("reviewed v4 promotion capability is not authentic");
+  assertVerifiedPromotionSourceCurrent(data);
+  return promotionEvidence(data.promotion);
+}
+
+export function verifyEmbeddedReviewedV4Promotion(input: {
+  readonly document: unknown;
+  readonly trust: ReviewedV4PromotionTrust;
+  readonly observedAt: number;
+  readonly requireCurrentSource?: boolean;
+}): ReviewedV4PromotionEvidence {
+  const bytes = Buffer.from(`${canonicalJson(input.document)}\n`);
+  const promotion = validatePromotion(bytes, input.trust, input.observedAt);
+  if (input.requireCurrentSource !== false) {
+    const source = inspectReviewedV4ExecutionSource({
+      repositoryRoot: input.trust.repositoryRoot,
+      expected: promotion.source,
+      remote: input.trust.remote,
+    });
+    verifyReviewedV4Source(source, promotion.source);
+  }
+  return promotionEvidence(promotion);
 }
 
 const sha256 = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");

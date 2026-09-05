@@ -22,6 +22,7 @@ import { doctorV1, doctorV1Databases, initializeCurrentExecutionSchemaDatabase, 
 import {
   adoptProductionReviewedV4Source,
   createProductionReviewedV4MigrationProcess,
+  recoverProductionReviewedV4Source,
   resolveReviewedV4ProductionSourceRoot,
 } from "./migration/reviewed-v4-production-process.js";
 import { buildReviewedV4Promotion } from "./migration/reviewed-v4-promotion-builder.js";
@@ -75,6 +76,7 @@ const CLI_STATE_ADMISSION = {
   "migrate-v2": "exclusive_migration",
   "migrate-v3": "exclusive_migration",
   "reviewed-source-adopt": "exclusive_migration",
+  "stg04-close-recover": "exclusive_migration",
   "stg04-close-preflight": "offline_observation",
   "stg04-close-status": "offline_observation",
   "stg04-close-prepare": "exclusive_migration",
@@ -199,6 +201,7 @@ const compatibilityOnly = command === "compatibility-status";
 const existingStateOnly = compatibilityOnly || command === "doctor-v1" || command === "restore-v1" ||
   command === "reviewed-source-adopt" || command === "stg04-close-preflight" ||
   command === "stg04-close-status" || command === "stg04-close-prepare" ||
+  command === "stg04-close-recover" ||
   command === "review-service-activate" ||
   command === "review-mcp-status" || command === "status";
 const layout = existingStateOnly ? openExistingStateLayout(stateRoot) : ensureStateLayout(stateRoot);
@@ -423,6 +426,23 @@ if (command === "reviewed-source-adopt") {
   console.log(JSON.stringify(adoptProductionReviewedV4Source({
     stateRoot: layout.root,
     externalPromotionPath: resolve(process.argv[3]),
+  }), null, 2));
+  process.exit(0);
+}
+
+if (command === "stg04-close-recover") {
+  const predecessorSourceAcceptanceReceiptSha256 = process.argv[3];
+  const externalPromotionPath = process.argv[4];
+  if (!predecessorSourceAcceptanceReceiptSha256 ||
+      !/^[a-f0-9]{64}$/.test(predecessorSourceAcceptanceReceiptSha256) ||
+      !externalPromotionPath || !isAbsolute(externalPromotionPath) || process.argv.length !== 5) {
+    throw new Error("Usage: agent-collab stg04-close-recover <predecessor-source-acceptance-sha256> </absolute/path/reviewed-v4-promotion.json>");
+  }
+  assertServiceInactive();
+  console.log(JSON.stringify(await recoverProductionReviewedV4Source({
+    stateRoot: layout.root,
+    predecessorSourceAcceptanceReceiptSha256,
+    externalPromotionPath: resolve(externalPromotionPath),
   }), null, 2));
   process.exit(0);
 }

@@ -165,6 +165,27 @@ backup and durable one-shot authorization/completion records. A crash is
 recovered by rerunning the same command with the same adoption SHA; a different
 source or target is rejected.
 
+If the database is already v4, completion is absent, and the old reviewed
+post-commit verifier rejects that boundary, create a fresh signed promotion for
+the corrected source. Recover forward; never modify, replace, or roll back the
+database pair:
+
+```bash
+RECOVERY_SHA="$(npm --silent start -- stg04-close-recover \
+  "$ADOPTION_SHA" /absolute/evidence/reviewed-v4-recovery-promotion.json | node -e \
+  'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).sourceAcceptance.receiptSha256))')"
+npm start -- stg04-close-prepare "$RECOVERY_SHA"
+npm start -- stg04-close-status "$RECOVERY_SHA"
+```
+
+Recovery is a fail-closed authority protocol, not a second migration. It
+requires exact state and history bytes, the original immutable authorization,
+backup, manifest and pristine guard, a current signed source promotion, and one
+non-forking predecessor chain. Its immutable leaf completion marker covers the
+whole chain and the exact migration-completion bytes. A crash before that marker
+leaves all normal mutable and service database opens blocked; rerun the same
+recovery command to converge. A different sibling successor is rejected.
+
 `review-service-stage` never unmasks or replaces `agent-collab.service`; that
 legacy name must remain a persistent `/dev/null` mask, including across reboot.
 It disables the separate `agent-collab-reviewed.service`, atomically installs
@@ -177,7 +198,7 @@ lock. The reviewed unit is part of the signed source manifest.
 Only after status reports `PROJECTION_CURRENT`, activate through the same gate:
 
 ```bash
-npm start -- review-service-activate "$ADOPTION_SHA"
+npm start -- review-service-activate "${RECOVERY_SHA:-$ADOPTION_SHA}"
 npm start -- status
 ```
 

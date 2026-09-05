@@ -153,6 +153,7 @@ npm start -- reviewed-source-adopt <promotion.json>
 npm start -- review-service-stage </absolute/nonexistent/backup-directory>
 npm start -- stg04-close-preflight <source-adoption-sha256>
 npm start -- stg04-close-prepare <source-adoption-sha256>
+npm start -- stg04-close-recover <predecessor-source-acceptance-sha256> </absolute/recovery-promotion.json>
 npm start -- stg04-close-status <source-adoption-sha256>
 npm start -- review-service-activate <source-adoption-sha256>
 npm start -- verify-bundle /absolute/rollback/bundle
@@ -171,6 +172,15 @@ manually. The command rejects active services, open descriptors, aliased files,
 invalid sidecars, integrity/version drift, or source drift before publishing an
 acceptance receipt; rerun the same command after correcting an interrupted
 normalization.
+
+If v4 committed but completion publication was rejected by the reviewed
+post-commit verifier, do not edit or roll back the databases. Promote the
+corrected source and run `stg04-close-recover` with the last accepted source
+receipt. The command accepts only the unchanged v4 boundary, pristine restore
+guard, exact history/backup/authorization generation, and one linear reviewed
+source chain. Until its content-addressed completion marker is valid, every
+normal mutable or service database open remains blocked. Use the returned
+recovery receipt SHA for the remaining STG-04 and activation commands.
 
 ## Local paired benchmark
 

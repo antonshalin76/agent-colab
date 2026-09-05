@@ -18,6 +18,8 @@ import { join, relative, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { dropGraphV4Schema } from "./helpers/graph-schema.js";
+import { createProductionReviewedV4MigrationProcess } from
+  "../src/migration/reviewed-v4-production-process.js";
 import {
   createTestReviewedV4Promotion,
   removeTestReviewedV4RemoteRef,
@@ -282,6 +284,51 @@ describe("CLI v4 startup and offline authority extension", () => {
       expect(durableTreeSnapshot(fx.state)).toEqual(beforeStatus);
     } finally {
       rmSync(packet.directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("recovers an exact post-commit v4 generation through the reviewed CLI", async () => {
+    const fx = fixture();
+    fx.initialize();
+    downgradeEmptyFixtureToV3(statePath(fx.state));
+    const initial = createTestReviewedV4Promotion();
+    const recovery = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "cli-reviewed-v4-recovery-candidate"; },
+    });
+    const publicKey = join(fx.root, "reviewed-source-public.pem");
+    writeFileSync(publicKey, initial.trust.publicKeyPem, { mode: 0o600 });
+    const trustEnv = {
+      AGENT_COLLAB_REVIEWED_SOURCE_PUBLIC_KEY_FILE: publicKey,
+      AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_URL: initial.trust.remote.url,
+      AGENT_COLLAB_REVIEWED_SOURCE_REMOTE_REF: initial.trust.remote.ref,
+    };
+    try {
+      const adopted = fx.runWith("reviewed-source-adopt", [initial.promotionPath], trustEnv);
+      expect(adopted.status, adopted.stderr).toBe(0);
+      const adoptionSha256 = (JSON.parse(adopted.stdout) as { receiptSha256: string }).receiptSha256;
+      const interrupted = createProductionReviewedV4MigrationProcess({
+        stateRoot: fx.state,
+        sourceAcceptanceReceiptSha256: adoptionSha256,
+        promotionTrust: initial.trust,
+        faultInjector() { throw new Error("simulated post-commit CLI recovery fixture"); },
+      });
+      await expect(interrupted.migrateExactOperation()).rejects.toThrow(/CLI recovery fixture/i);
+      interrupted.close();
+
+      const recovered = fx.runWith(
+        "stg04-close-recover",
+        [adoptionSha256, recovery.promotionPath],
+        trustEnv,
+      );
+      expect(recovered.status, recovered.stderr).toBe(0);
+      expect(JSON.parse(recovered.stdout)).toMatchObject({
+        protocol: "reviewed-v4-source-recovery/v1",
+        sourceAcceptance: { receiptSha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+        migration: { status: "already_current", graphExecution: "disabled" },
+      });
+    } finally {
+      rmSync(initial.directory, { recursive: true, force: true });
+      rmSync(recovery.directory, { recursive: true, force: true });
     }
   }, 120_000);
 

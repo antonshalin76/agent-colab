@@ -43,17 +43,23 @@ import {
 } from "../flow/reviewed-v4-source.js";
 import {
   adoptVerifiedReviewedV4SourceAcceptance,
-  consumeReviewedV4SourceAcceptance,
   verifyReviewedV4PromotionSource,
   type ReviewedV4PromotionTrust,
   type ReviewedV4SourceAcceptanceResult,
 } from "./reviewed-v4-source-acceptance.js";
+import {
+  publishReviewedV4RecoverySourceAcceptance,
+  requireExistingReviewedV4RecoverySourceAcceptance,
+  resolveEffectiveReviewedV4SourceAcceptance,
+} from "./reviewed-v4-recovery-generation.js";
+import { publishReviewedV4RecoveryCompletionBarrier } from "./reviewed-v4-recovery-barrier.js";
 import { observeLegacyDatabase } from "./state-v4-manifest.js";
 import { canonicalJson } from "../domain/canonical-json.js";
 import { runUserSystemctl } from "../runtime/systemd-user.js";
 
 const OPERATION_ID = "stg04-production-close" as const;
 const SHA256 = /^[a-f0-9]{64}$/;
+const sha256 = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 
 export const resolveReviewedV4ProductionSourceRoot = (): string =>
   realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "../.."));
@@ -131,6 +137,125 @@ export function adoptProductionReviewedV4Source(input: {
     assertNoDatabaseSidecars(layout);
     return result;
   } finally { fence.release(); }
+}
+
+export async function recoverProductionReviewedV4Source(input: {
+  readonly stateRoot: string;
+  readonly predecessorSourceAcceptanceReceiptSha256: string;
+  readonly externalPromotionPath: string;
+  readonly promotionTrust?: ReviewedV4PromotionTrust;
+  readonly faultInjector?: (point: "after_recovery_acceptance") => void;
+}) {
+  assertSourceLauncherExecution();
+  const allowedKeys = new Set([
+    "stateRoot", "predecessorSourceAcceptanceReceiptSha256", "externalPromotionPath",
+    "promotionTrust", "faultInjector",
+  ]);
+  if (Object.keys(input).some((key) => !allowedKeys.has(key)) ||
+      !SHA256.test(input.predecessorSourceAcceptanceReceiptSha256)) {
+    throw new Error("reviewed v4 recovery input is invalid or contains unknown authority");
+  }
+  const repositoryRoot = resolveReviewedV4ProductionSourceRoot();
+  const trust = input.promotionTrust ?? configuredPromotionTrust(repositoryRoot);
+  if (realpathSync(resolve(trust.repositoryRoot)) !== repositoryRoot) {
+    throw new Error("reviewed v4 recovery trust repository root does not match the source launcher root");
+  }
+  const verifiedPromotion = verifyReviewedV4PromotionSource({
+    externalPromotionPath: input.externalPromotionPath,
+    trust,
+  });
+  const layout = openExistingStateLayout(input.stateRoot);
+  const predecessor = resolveEffectiveReviewedV4SourceAcceptance({
+    stateRoot: layout.root,
+    receiptSha256: input.predecessorSourceAcceptanceReceiptSha256,
+    trust,
+    requireCurrentSource: false,
+  });
+  const planLockBytes = readFileSync(join(repositoryRoot, "docs/hybrid-flow-v1-r2/PLAN_LOCK.json"));
+  const planLock = JSON.parse(planLockBytes.toString("utf8")) as { planId?: unknown };
+  const planLockSha256 = sha256(planLockBytes);
+  if (typeof planLock.planId !== "string" ||
+      predecessor.authorityAcceptance.planIdentity.planId !== planLock.planId ||
+      predecessor.authorityAcceptance.planIdentity.planLockSha256 !== planLockSha256) {
+    throw new Error("reviewed v4 recovery predecessor is outside the production plan lock");
+  }
+  const pairInput = {
+    operationId: OPERATION_ID,
+    gitRoot: repositoryRoot,
+    reviewedWorktreeParent: join(layout.root, "migration-v4", "reviewed-worktrees"),
+    sourceIdentity: predecessor.authorityAcceptance.sourceIdentity,
+    stateDatabase: layout.database,
+    historyDatabase: layout.historyDatabase,
+  };
+  const binding = authorityBindingFor(layout, predecessor.authorityAcceptance);
+  const paths = { stateDatabase: layout.database, historyDatabase: layout.historyDatabase };
+  const quiescence = productionQuiescence(layout);
+  quiescence.assertServiceInactive(paths);
+  quiescence.assertNoOpenDatabaseFds(paths);
+  const fence = quiescence.acquireExclusiveWriteFence(paths);
+  let publication;
+  let migrationAuthority: ReturnType<typeof createReviewedV4MigrationAuthority> | undefined;
+  try {
+    fence.assertCurrent();
+    migrationAuthority = createReviewedV4MigrationAuthority({ stateRoot: layout.root });
+    const inspection = migrationAuthority.inspect(binding);
+    if (inspection.authorization !== "valid" ||
+        (inspection.completion !== "absent" && inspection.completion !== "valid") ||
+        !inspection.preState || !inspection.preHistory) {
+      throw new Error("reviewed v4 recovery requires one valid migration authority generation");
+    }
+    const pair = bindDatabasePair(pairInput);
+    assertDatabasePairCurrent(pair);
+    assertHistoryUnchanged(pair, inspection.preHistory);
+    if (inspection.completion === "absent") {
+      const boundaryVerification = verifyMigratedDatabaseAtBoundary(layout.database);
+      const recoveryVerification = verifyRecoveryAuthority({
+        pair,
+        receipt: {},
+        status: "already_current",
+        preState: inspection.preState,
+        preHistory: inspection.preHistory,
+        phase: "migration_boundary",
+      });
+      fence.assertCurrent();
+      publication = publishReviewedV4RecoverySourceAcceptance({
+        stateRoot: layout.root,
+        predecessor,
+        verifiedPromotion,
+        trust,
+        boundaryVerification,
+        recoveryVerification,
+      });
+    } else {
+      publication = requireExistingReviewedV4RecoverySourceAcceptance({
+        stateRoot: layout.root,
+        predecessor,
+        verifiedPromotion,
+      });
+    }
+    fence.assertCurrent();
+    input.faultInjector?.("after_recovery_acceptance");
+  } finally {
+    migrationAuthority?.close();
+    fence.release();
+  }
+  const migration = createProductionReviewedV4MigrationProcess({
+    stateRoot: layout.root,
+    sourceAcceptanceReceiptSha256: publication.receiptSha256,
+    promotionTrust: trust,
+  });
+  try {
+    const completion = await migration.migrateExactOperation();
+    publishReviewedV4RecoveryCompletionBarrier({
+      stateRoot: layout.root,
+      recoverySha256: publication.receiptSha256,
+    });
+    return Object.freeze({
+      protocol: "reviewed-v4-source-recovery/v1" as const,
+      sourceAcceptance: publication,
+      migration: completion,
+    });
+  } finally { migration.close(); }
 }
 
 function managedServiceState(): "active" | "inactive" | "unknown" {
@@ -331,6 +456,25 @@ const receiptForProcess = (result: MigrationResult): Record<string, unknown> => 
   throw new Error("in-process reviewed migration returned an unsupported schema result");
 };
 
+const authorityBindingFor = (
+  layout: ProductionLayout,
+  acceptance: ReviewedV4SourceAcceptanceResult,
+): MigrationAuthorityBinding => ({
+  operationId: OPERATION_ID,
+  consumer: "codex:/root:state-v4-reviewed-bootstrap",
+  scope: "reviewed-state-v4-migration",
+  adoptionSha256: acceptance.receiptSha256,
+  promotionSha256: acceptance.promotionSha256,
+  sourceIdentity: acceptance.sourceIdentity,
+  targetIdentity: {
+    root: { path: acceptance.target.root.path, dev: acceptance.target.root.dev, ino: acceptance.target.root.ino },
+    state: { ...acceptance.target.state },
+    history: { ...acceptance.target.history },
+  },
+  stateDatabase: layout.database,
+  historyDatabase: layout.historyDatabase,
+});
+
 export function createProductionReviewedV4MigrationProcess(input: {
   readonly stateRoot: string;
   readonly sourceAcceptanceReceiptSha256: string;
@@ -363,38 +507,30 @@ export function createProductionReviewedV4MigrationProcess(input: {
     if (closed) throw new Error("reviewed v4 production migration process is closed");
   };
   const verifyExecutionSource = () => {
-    const acceptance = consumeReviewedV4SourceAcceptance({
+    const effective = resolveEffectiveReviewedV4SourceAcceptance({
       stateRoot: layout.root,
-      adoptionSha256: input.sourceAcceptanceReceiptSha256,
+      receiptSha256: input.sourceAcceptanceReceiptSha256,
       trust: promotionTrust,
     });
+    const acceptance = effective.authorityAcceptance;
     if (acceptance.planIdentity.planId !== planLock.planId ||
-        acceptance.planIdentity.planLockSha256 !== planLockSha256) {
+        acceptance.planIdentity.planLockSha256 !== planLockSha256 ||
+        effective.execution.planIdentity.planId !== planLock.planId ||
+        effective.execution.planIdentity.planLockSha256 !== planLockSha256) {
       throw new Error("reviewed v4 source adoption plan identity does not match the production plan lock");
     }
-    const source = inspectReviewedV4ExecutionSource({
-      repositoryRoot,
-      expected: acceptance.sourceIdentity,
-      remote: acceptance.remote,
-    });
-    verifyReviewedV4Source(source, acceptance.sourceIdentity);
+    if (!effective.recovery) {
+      const source = inspectReviewedV4ExecutionSource({
+        repositoryRoot,
+        expected: acceptance.sourceIdentity,
+        remote: acceptance.remote,
+      });
+      verifyReviewedV4Source(source, acceptance.sourceIdentity);
+    }
     return acceptance;
   };
-  const authorityBinding = (acceptance: ReviewedV4SourceAcceptanceResult): MigrationAuthorityBinding => ({
-    operationId: OPERATION_ID,
-    consumer: "codex:/root:state-v4-reviewed-bootstrap",
-    scope: "reviewed-state-v4-migration",
-    adoptionSha256: acceptance.receiptSha256,
-    promotionSha256: acceptance.promotionSha256,
-    sourceIdentity: acceptance.sourceIdentity,
-    targetIdentity: {
-      root: { path: acceptance.target.root.path, dev: acceptance.target.root.dev, ino: acceptance.target.root.ino },
-      state: { ...acceptance.target.state },
-      history: { ...acceptance.target.history },
-    },
-    stateDatabase: layout.database,
-    historyDatabase: layout.historyDatabase,
-  });
+  const authorityBinding = (acceptance: ReviewedV4SourceAcceptanceResult): MigrationAuthorityBinding =>
+    authorityBindingFor(layout, acceptance);
   const quiescence = productionQuiescence(layout);
 
   return Object.freeze({
@@ -427,6 +563,7 @@ export function createProductionReviewedV4MigrationProcess(input: {
             receipt: inspection.completedReceipt,
             status: inspection.completedReceipt.status as "migrated" | "already_current",
             preState: inspection.preState,
+            preHistory: inspection.preHistory,
             phase: "current_state",
           });
           admission.assertCurrent();
@@ -506,6 +643,7 @@ export function createProductionReviewedV4MigrationProcess(input: {
           receipt: rawReceipt,
           status,
           preState: claim.preState,
+          preHistory: claim.preHistory,
           phase: status === "migrated" ? "migration_boundary" : "current_state",
         });
         const output = Object.freeze({

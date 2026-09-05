@@ -25,7 +25,7 @@ describe("state fence dependency architecture", () => {
     for (const command of [
       "compatibility-status", "doctor-v1", "verify-bundle", "restore-v1", "migrate-v2", "migrate-v3",
       "reviewed-source-promote", "reviewed-source-adopt", "review-service-stage", "review-service-activate",
-      "stg04-close-preflight", "stg04-close-status", "stg04-close-prepare",
+      "stg04-close-preflight", "stg04-close-status", "stg04-close-prepare", "stg04-close-recover",
       "review-mcp-status", "review-initialize", "review-mcp-codex",
       "review-worker", "review-readiness", "review-skills-link", "map-learn-close", "map-evidence-record",
       "reconcile-run", "probe", "status", "doctor",

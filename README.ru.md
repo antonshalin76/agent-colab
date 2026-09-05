@@ -160,6 +160,7 @@ npm start -- reviewed-source-adopt <promotion.json>
 npm start -- review-service-stage </absolute/nonexistent/backup-directory>
 npm start -- stg04-close-preflight <source-adoption-sha256>
 npm start -- stg04-close-prepare <source-adoption-sha256>
+npm start -- stg04-close-recover <predecessor-source-acceptance-sha256> </absolute/recovery-promotion.json>
 npm start -- stg04-close-status <source-adoption-sha256>
 npm start -- review-service-activate <source-adoption-sha256>
 npm start -- verify-bundle /absolute/rollback/bundle
@@ -177,6 +178,15 @@ npm start -- status
 нельзя. До публикации acceptance receipt команда отклоняет активные сервисы,
 открытые дескрипторы, алиасы файлов, некорректные sidecar, drift integrity/version
 или исходного кода. После прерванной нормализации повторите ту же команду.
+
+Если v4 уже зафиксирована, но публикацию completion отклонил reviewed
+post-commit verifier, не редактируйте и не откатывайте БД. Выпустите promotion
+исправленного кода и запустите `stg04-close-recover` с SHA последнего принятого
+source receipt. Команда принимает только неизменённую границу v4, pristine
+restore guard, точные history/backup/authorization и одну линейную цепочку
+reviewed-источников. До появления валидного content-addressed completion marker
+любое обычное изменяющее или сервисное открытие БД блокируется. Полученный SHA
+recovery receipt используйте в оставшихся командах STG-04 и активации.
 
 ## Локальный парный benchmark
 

@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { appendStateV4GuardEvent, inspectStateV4OpenAdmission } from "../migration/state-v4-restore-authority.js";
+import {
+  appendStateV4GuardEvent,
+  inspectStateV4OpenAdmission,
+} from "../migration/state-v4-restore-authority.js";
+import { assertNoPendingReviewedV4SourceRecovery } from "../migration/reviewed-v4-recovery-barrier.js";
 import { acquireStateRootLease } from "./state-layout.js";
 import { acquireStateOpenAdmission } from "./state-open-admission.js";
 
@@ -296,6 +300,7 @@ const admitOpen = (root: string, operationRoot: string, mode: StateDatabaseAdmis
     }
     return;
   }
+  assertNoPendingReviewedV4SourceRecovery(root);
   const open = appendStateV4GuardEvent(root, "service_reopened", Date.now(), operationRoot);
   if (open === "restore_consumed") throw new Error("state database cannot reopen while physical restore consumption is incomplete");
   if (mode === "mutating_service") {

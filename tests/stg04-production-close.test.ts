@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -16,6 +17,8 @@ import Database from "better-sqlite3";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { createReviewedV4MigrationAuthority } from "../src/migration/reviewed-v4-migration-authority.js";
+import { verifyCurrentReviewedV4Database } from "../src/migration/reviewed-v4-bootstrap.js";
+import { appendStateV4GuardEvent } from "../src/migration/state-v4-restore-authority.js";
 import {
   openStateDatabaseLease,
   type StateDatabaseAccess,
@@ -40,6 +43,7 @@ import {
 } from "./helpers/implementation-progress-fixture.js";
 import {
   adoptTestReviewedV4SourceAcceptance,
+  createTestReviewedV4Promotion,
   removeTestReviewedV4RemoteRef,
   reviewedV4TestTrust,
 } from "./helpers/reviewed-v4-source-acceptance-fixture.js";
@@ -180,6 +184,20 @@ async function loadProductionMigrationFactory(): Promise<(
       readonly faultInjector?: (point: "after_v4_coordinator_return") => void;
     },
   ) => ReviewedV4MigrationProcess;
+}
+
+async function loadProductionRecovery(): Promise<(input: {
+  readonly stateRoot: string;
+  readonly predecessorSourceAcceptanceReceiptSha256: string;
+  readonly externalPromotionPath: string;
+  readonly promotionTrust: ReturnType<typeof reviewedV4TestTrust>;
+  readonly faultInjector?: (point: "after_recovery_acceptance") => void;
+}) => Promise<{
+  readonly sourceAcceptance: { readonly receiptSha256: string; readonly created: boolean };
+  readonly migration: ReviewedMigrationReceipt;
+}>> {
+  const module = await import(pathToFileURL(resolve("src/migration/reviewed-v4-production-process.ts")).href);
+  return module.recoverProductionReviewedV4Source as Awaited<ReturnType<typeof loadProductionRecovery>>;
 }
 
 async function loadCloseRuntime(): Promise<Stg04CloseRuntime> {
@@ -405,6 +423,58 @@ describe("offline migration quiescence", () => {
 });
 
 describe("reviewed v4 production migration process", () => {
+  it("preserves inert legacy runs and published dispatch evidence without treating it as activation", async () => {
+    const createProcess = await loadProductionMigrationFactory();
+    const fixture = newFixture();
+    const database = new Database(fixture.databasePath);
+    try {
+      database.exec(`
+        INSERT INTO runs(id,idempotency_key,stage,priority,status,created_at,next_attempt_at)
+        VALUES('legacy-terminal','legacy-terminal','review',1,'completed',1,1);
+        INSERT INTO collaboration_runs VALUES('legacy-workflow','{"status":"completed"}',1,2);
+        INSERT INTO collaboration_dispatch_outbox
+          (dispatch_id,workflow_id,payload_json,published_at,terminal_reason)
+        VALUES('legacy-dispatch','legacy-workflow','{}',3,NULL);
+      `);
+    } finally { database.close(); }
+    const migration = productionMigration(createProcess, fixture);
+    closeables.push(migration);
+
+    await expect(migration.migrateExactOperation()).resolves.toMatchObject({ status: "migrated" });
+    const migrated = new Database(fixture.databasePath, { readonly: true });
+    try {
+      expect(migrated.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(1);
+      expect(migrated.prepare("SELECT COUNT(*) FROM collaboration_dispatch_outbox").pluck().get()).toBe(1);
+    } finally { migrated.close(); }
+  }, 120_000);
+
+  it.each([
+    ["queued legacy run", "UPDATE runs SET status='queued' WHERE id='legacy-terminal'", /executable.*legacy runs/i],
+    ["owned legacy run", "UPDATE runs SET worker_id='worker' WHERE id='legacy-terminal'", /owned legacy runs/i],
+    ["unpublished legacy dispatch", "UPDATE collaboration_dispatch_outbox SET published_at=NULL", /unpublished legacy dispatches/i],
+  ])("rejects %s at the reviewed boundary", async (_label, sql, message) => {
+    const createProcess = await loadProductionMigrationFactory();
+    const fixture = newFixture();
+    const database = new Database(fixture.databasePath);
+    try {
+      database.exec(`
+        INSERT INTO runs(id,idempotency_key,stage,priority,status,created_at,next_attempt_at)
+        VALUES('legacy-terminal','legacy-terminal','review',1,'completed',1,1);
+        INSERT INTO collaboration_runs VALUES('legacy-workflow','{"status":"completed"}',1,2);
+        INSERT INTO collaboration_dispatch_outbox
+          (dispatch_id,workflow_id,payload_json,published_at,terminal_reason)
+        VALUES('legacy-dispatch','legacy-workflow','{}',3,NULL);
+      `);
+    } finally { database.close(); }
+    const migration = productionMigration(createProcess, fixture);
+    closeables.push(migration);
+    await migration.migrateExactOperation();
+    const mutate = new Database(fixture.databasePath);
+    try { mutate.exec(sql); } finally { mutate.close(); }
+
+    expect(() => verifyCurrentReviewedV4Database(fixture.databasePath)).toThrow(message);
+  }, 120_000);
+
   it("runs the authorized migration in-process, imports exactly events 1..3, preserves history and replays", async () => {
     const createProcess = await loadProductionMigrationFactory();
     const fixture = newFixture();
@@ -465,6 +535,308 @@ describe("reviewed v4 production migration process", () => {
       authorization: "valid",
       completion: "valid",
     }));
+  }, 120_000);
+
+  it("accepts a reviewed recovery source and completes an exact post-commit migration generation", async () => {
+    const [createProcess, recover, runtime] = await Promise.all([
+      loadProductionMigrationFactory(),
+      loadProductionRecovery(),
+      loadCloseRuntime(),
+    ]);
+    const fixture = newFixture();
+    const adoptionSha256 = adoptTestReviewedV4SourceAcceptance(fixture.stateRoot);
+    const interrupted = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: adoptionSha256,
+      promotionTrust: reviewedV4TestTrust(),
+      faultInjector(point) {
+        if (point === "after_v4_coordinator_return") throw new Error("simulated post-commit failure");
+      },
+    });
+    await expect(interrupted.migrateExactOperation()).rejects.toThrow(/post-commit failure/i);
+    interrupted.close();
+    expect(databaseVersions(fixture)).toEqual({ state: 4, history: 2 });
+
+    const packet = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "reviewed-v4-recovery-candidate"; },
+    });
+    scratchRoots.push(packet.directory);
+    const recovered = await recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+    });
+    expect(recovered).toMatchObject({
+      sourceAcceptance: { created: true, receiptSha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+      migration: { status: "already_current", graphExecution: "disabled" },
+    });
+
+    const replay = await recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+    });
+    expect(replay.sourceAcceptance).toMatchObject({
+      created: false,
+      receiptSha256: recovered.sourceAcceptance.receiptSha256,
+    });
+    expect(replay.migration).toMatchObject({ status: "already_current" });
+
+    amendmentFixture(fixture);
+    const recoveredMigration = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: recovered.sourceAcceptance.receiptSha256,
+      promotionTrust: packet.trust,
+    });
+    const close = runtime.createStg04CloseService({
+      stateRoot: fixture.stateRoot,
+      repositoryRoot: fixture.repositoryRoot,
+      migration: recoveredMigration,
+      openStateDatabaseAccess: () => openStateDatabaseLease(fixture.databasePath, "mutating_service"),
+    });
+    closeables.push(close, recoveredMigration);
+    await expect(close.prepare({ acceptedAt: AMD_ACCEPTED_AT, publishedAt: AMD_ACCEPTED_AT + 1_000 }))
+      .resolves.toEqual({ phase: "PROJECTION_CURRENT", contradictionCodes: [] });
+    expect(close.status()).toEqual({ phase: "PROJECTION_CURRENT", contradictionCodes: [] });
+  }, 120_000);
+
+  it("replays one immutable recovery generation after a crash before completion", async () => {
+    const [createProcess, recover] = await Promise.all([
+      loadProductionMigrationFactory(),
+      loadProductionRecovery(),
+    ]);
+    const fixture = newFixture();
+    const adoptionSha256 = adoptTestReviewedV4SourceAcceptance(fixture.stateRoot);
+    const interrupted = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: adoptionSha256,
+      promotionTrust: reviewedV4TestTrust(),
+      faultInjector() { throw new Error("simulated post-commit failure"); },
+    });
+    await expect(interrupted.migrateExactOperation()).rejects.toThrow(/post-commit failure/i);
+    interrupted.close();
+    const packet = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "reviewed-v4-recovery-crash-candidate"; },
+    });
+    scratchRoots.push(packet.directory);
+
+    await expect(recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+      faultInjector() { throw new Error("simulated recovery acceptance crash"); },
+    })).rejects.toThrow(/recovery acceptance crash/i);
+    expect(() => openStateDatabaseLease(fixture.databasePath, "mutating_service"))
+      .toThrow(/recovery.*pending.*completion/i);
+
+    const conflicting = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "conflicting-recovery-successor"; },
+    });
+    scratchRoots.push(conflicting.directory);
+    await expect(recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: conflicting.promotionPath,
+      promotionTrust: conflicting.trust,
+    })).rejects.toThrow(/fork.*reconciliation/i);
+
+    const recovered = await recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+    });
+    expect(recovered.sourceAcceptance.created).toBe(false);
+    expect(recovered.migration).toMatchObject({ status: "already_current" });
+  }, 120_000);
+
+  it.each([
+    ["v4 state bytes", (fixture: ProgressFixture) => {
+      const database = new Database(fixture.databasePath);
+      try { database.prepare("UPDATE plan_progress_outbox SET terminal_reason='tampered' WHERE rowid=1").run(); }
+      finally { database.close(); }
+    }],
+    ["history bytes", (fixture: ProgressFixture) => {
+      const database = new Database(fixture.historyPath);
+      try { database.pragma("application_id = 17"); }
+      finally { database.close(); }
+    }],
+    ["restore guard", (fixture: ProgressFixture) => {
+      appendStateV4GuardEvent(fixture.stateRoot, "service_reopened");
+    }],
+    ["migration authorization", (fixture: ProgressFixture) => {
+      const path = join(fixture.stateRoot,
+        "migration-v4/authority/stg04-production-close.authorization.json");
+      writeFileSync(path, Buffer.concat([readFileSync(path), Buffer.from(" ")]));
+    }],
+    ["restore descriptor", (fixture: ProgressFixture) => {
+      const path = join(fixture.stateRoot, "migration-v4/active-restore-guard.json");
+      writeFileSync(path, Buffer.concat([readFileSync(path), Buffer.from(" ")]));
+    }],
+  ] as const)("rejects post-acceptance drift in %s without publishing completion", async (_label, mutate) => {
+    const [createProcess, recover] = await Promise.all([
+      loadProductionMigrationFactory(),
+      loadProductionRecovery(),
+    ]);
+    const fixture = newFixture();
+    const adoptionSha256 = adoptTestReviewedV4SourceAcceptance(fixture.stateRoot);
+    const interrupted = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: adoptionSha256,
+      promotionTrust: reviewedV4TestTrust(),
+      faultInjector() { throw new Error("simulated post-commit failure"); },
+    });
+    await expect(interrupted.migrateExactOperation()).rejects.toThrow(/post-commit failure/i);
+    interrupted.close();
+    const packet = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = `drift-recovery-${_label}`; },
+    });
+    scratchRoots.push(packet.directory);
+    await expect(recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+      faultInjector() { throw new Error("simulated recovery acceptance crash"); },
+    })).rejects.toThrow(/recovery acceptance crash/i);
+
+    mutate(fixture);
+    await expect(recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+    })).rejects.toThrow();
+    expect(existsSync(join(fixture.stateRoot,
+      "migration-v4/authority/stg04-production-close.completion.json"))).toBe(false);
+  }, 120_000);
+
+  it("completes a linear two-generation recovery chain and releases one leaf-bound barrier", async () => {
+    const [createProcess, recover] = await Promise.all([
+      loadProductionMigrationFactory(),
+      loadProductionRecovery(),
+    ]);
+    const fixture = newFixture();
+    const adoptionSha256 = adoptTestReviewedV4SourceAcceptance(fixture.stateRoot);
+    const interrupted = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: adoptionSha256,
+      promotionTrust: reviewedV4TestTrust(),
+      faultInjector() { throw new Error("simulated post-commit failure"); },
+    });
+    await expect(interrupted.migrateExactOperation()).rejects.toThrow(/post-commit failure/i);
+    interrupted.close();
+    const first = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "recovery-source-generation-a"; },
+    });
+    scratchRoots.push(first.directory);
+    let firstRecoverySha256 = "";
+    await expect(recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: first.promotionPath,
+      promotionTrust: first.trust,
+      faultInjector() {
+        const names = readdirSync(join(fixture.stateRoot,
+          "migration-v4/source-acceptance/recoveries"));
+        firstRecoverySha256 = names[0]!.slice(0, -5);
+        throw new Error("first recovery generation interrupted");
+      },
+    })).rejects.toThrow(/first recovery generation interrupted/i);
+    const second = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "recovery-source-generation-b"; },
+    });
+    scratchRoots.push(second.directory);
+    const recovered = await recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: firstRecoverySha256,
+      externalPromotionPath: second.promotionPath,
+      promotionTrust: second.trust,
+    });
+    expect(recovered.migration.status).toBe("already_current");
+    const access = openStateDatabaseLease(fixture.databasePath, "mutating_service");
+    access.close();
+    const marker = JSON.parse(readFileSync(join(fixture.stateRoot,
+      `migration-v4/source-acceptance/recovery-completions/${recovered.sourceAcceptance.receiptSha256}.json`),
+    "utf8")) as { recoveryChainSha256: string[] };
+    expect(marker.recoveryChainSha256).toEqual([
+      firstRecoverySha256,
+      recovered.sourceAcceptance.receiptSha256,
+    ]);
+  }, 120_000);
+
+  it("does not create recovery evidence for an already completed migration generation", async () => {
+    const [createProcess, recover] = await Promise.all([
+      loadProductionMigrationFactory(),
+      loadProductionRecovery(),
+    ]);
+    const fixture = newFixture();
+    const adoptionSha256 = adoptTestReviewedV4SourceAcceptance(fixture.stateRoot);
+    const migration = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: adoptionSha256,
+      promotionTrust: reviewedV4TestTrust(),
+    });
+    await migration.migrateExactOperation();
+    migration.close();
+    const packet = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "unneeded-recovery-candidate"; },
+    });
+    scratchRoots.push(packet.directory);
+
+    await expect(recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+    })).rejects.toThrow(/no existing exact acceptance/i);
+    expect(existsSync(join(fixture.stateRoot,
+      "migration-v4/source-acceptance/recoveries"))).toBe(false);
+  }, 120_000);
+
+  it("ignores exact non-authoritative publisher temps across dead and reused PIDs", async () => {
+    const [createProcess, recover] = await Promise.all([
+      loadProductionMigrationFactory(),
+      loadProductionRecovery(),
+    ]);
+    const fixture = newFixture();
+    const adoptionSha256 = adoptTestReviewedV4SourceAcceptance(fixture.stateRoot);
+    const interrupted = createProcess({
+      stateRoot: fixture.stateRoot,
+      sourceAcceptanceReceiptSha256: adoptionSha256,
+      promotionTrust: reviewedV4TestTrust(),
+      faultInjector() { throw new Error("simulated post-commit failure"); },
+    });
+    await expect(interrupted.migrateExactOperation()).rejects.toThrow(/post-commit failure/i);
+    interrupted.close();
+    const recoveryDirectory = join(fixture.stateRoot, "migration-v4/source-acceptance/recoveries");
+    mkdirSync(recoveryDirectory, { recursive: true });
+    const tempNames = [
+      `.${"a".repeat(64)}.json.99999999.12345678-1234-4123-8123-123456789abc.tmp`,
+      `.${"b".repeat(64)}.json.${process.pid}.abcdefab-cdef-4abc-8abc-abcdefabcdef.tmp`,
+    ];
+    expect(existsSync("/proc/99999999")).toBe(false);
+    for (const name of tempNames) {
+      writeFileSync(join(recoveryDirectory, name), "interrupted unpublished bytes", { mode: 0o600 });
+    }
+    const packet = createTestReviewedV4Promotion({
+      mutateDraft(draft) { draft.promotionId = "recovery-after-orphan-temp"; },
+    });
+    scratchRoots.push(packet.directory);
+
+    const recovered = await recover({
+      stateRoot: fixture.stateRoot,
+      predecessorSourceAcceptanceReceiptSha256: adoptionSha256,
+      externalPromotionPath: packet.promotionPath,
+      promotionTrust: packet.trust,
+    });
+    expect(recovered.migration.status).toBe("already_current");
+    expect(tempNames.every((name) => existsSync(join(recoveryDirectory, name)))).toBe(true);
+    const access = openStateDatabaseLease(fixture.databasePath, "mutating_service");
+    access.close();
   }, 120_000);
 });
 

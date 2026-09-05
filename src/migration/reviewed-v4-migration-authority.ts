@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, statSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import { canonicalJson } from "../domain/canonical-json.js";
 import {
@@ -15,44 +15,18 @@ import {
   parseLegacyTableManifest,
   type LegacyDatabaseObservation,
 } from "./state-v4-manifest.js";
+import {
+  exactMigrationAuthorityBinding as exactBinding,
+  migrationAuthorityBindingSchema as migrationBindingSchema,
+  parseReviewedV4MigrationCompletion as parseCompletion,
+  type DurableMigrationCompletion as DurableCompletion,
+  type MigrationAuthorityBinding,
+} from "./reviewed-v4-migration-records.js";
+
+export type { MigrationAuthorityBinding } from "./reviewed-v4-migration-records.js";
 
 declare const migrationAuthorityBrand: unique symbol;
 export interface MigrationAuthorityCapability { readonly [migrationAuthorityBrand]: true }
-
-export interface MigrationAuthorityBinding {
-  readonly operationId: string;
-  readonly consumer: "codex:/root:state-v4-reviewed-bootstrap";
-  readonly scope: "reviewed-state-v4-migration";
-  readonly adoptionSha256: string;
-  readonly promotionSha256: string;
-  readonly sourceIdentity: {
-    readonly commitOid: string;
-    readonly treeOid: string;
-    readonly manifestSha256: string;
-    readonly lastProgressEventSha256: string;
-  };
-  readonly targetIdentity: {
-    readonly root: { readonly path: string; readonly dev: number; readonly ino: number };
-    readonly state: {
-      readonly path: string;
-      readonly dev: number;
-      readonly ino: number;
-      readonly userVersion: number;
-      readonly bytesSha256: string;
-      readonly manifestSha256: string;
-    };
-    readonly history: {
-      readonly path: string;
-      readonly dev: number;
-      readonly ino: number;
-      readonly userVersion: number;
-      readonly bytesSha256: string;
-      readonly manifestSha256: string;
-    };
-  };
-  readonly stateDatabase: string;
-  readonly historyDatabase: string;
-}
 
 export interface MigrationAuthorityClaim {
   readonly preState: LegacyDatabaseObservation;
@@ -86,28 +60,10 @@ interface DurableAuthorization {
   readonly preHistory: LegacyDatabaseObservation;
 }
 
-interface DurableCompletion {
-  readonly schemaVersion: "reviewed-v4-migration-completion/v2";
-  readonly operationId: string;
-  readonly binding: MigrationAuthorityBinding;
-  readonly receipt: Readonly<Record<string, unknown>>;
-}
-
 const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const SHA1 = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const safeInteger = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const fileIdentitySchema = z.object({ dev: safeInteger, ino: safeInteger }).strict();
-const targetFileIdentitySchema = z.object({
-  path: z.string().min(1).refine(isAbsolute),
-  dev: safeInteger,
-  ino: safeInteger,
-}).strict();
-const targetDatabaseIdentitySchema = targetFileIdentitySchema.extend({
-  userVersion: z.number().int(),
-  bytesSha256: z.string().regex(SHA256),
-  manifestSha256: z.string().regex(SHA256),
-}).strict();
 const legacyManifestSchema = z.object({
   schemaVersion: z.literal("legacy-table-digest-manifest/v1"),
   tables: z.array(z.object({
@@ -130,26 +86,16 @@ const legacyObservationSchema = (userVersion: 2 | 3) => z.object({
     context.addIssue({ code: "custom", message: "legacy manifest digest is invalid" });
   }
 });
-const migrationBindingSchema = z.object({
-  operationId: z.literal("stg04-production-close"),
-  consumer: z.literal("codex:/root:state-v4-reviewed-bootstrap"),
-  scope: z.literal("reviewed-state-v4-migration"),
-  adoptionSha256: z.string().regex(SHA256),
-  promotionSha256: z.string().regex(SHA256),
-  sourceIdentity: z.object({
-    commitOid: z.string().regex(SHA1),
-    treeOid: z.string().regex(SHA1),
-    manifestSha256: z.string().regex(SHA256),
-    lastProgressEventSha256: z.string().regex(SHA256),
-  }).strict(),
-  targetIdentity: z.object({
-    root: targetFileIdentitySchema,
-    state: targetDatabaseIdentitySchema,
-    history: targetDatabaseIdentitySchema,
-  }).strict(),
-  stateDatabase: z.string().min(1).refine(isAbsolute),
-  historyDatabase: z.string().min(1).refine(isAbsolute),
-}).strict();
+
+export const reviewedV4MigrationAuthorityArtifactPaths = (
+  operationId: string,
+): { readonly authorization: string; readonly completion: string } => {
+  if (!OPERATION_ID.test(operationId)) throw new Error("migration operation id is invalid");
+  return Object.freeze({
+    authorization: `migration-v4/authority/${operationId}.authorization.json`,
+    completion: `migration-v4/authority/${operationId}.completion.json`,
+  });
+};
 const durableAuthorizationSchema = z.object({
   schemaVersion: z.literal("reviewed-v4-migration-authorization/v2"),
   binding: migrationBindingSchema,
@@ -159,10 +105,6 @@ const durableAuthorizationSchema = z.object({
   preState: legacyObservationSchema(3),
   preHistory: legacyObservationSchema(2),
 }).strict();
-
-function exactBinding(left: MigrationAuthorityBinding, right: MigrationAuthorityBinding): boolean {
-  return canonicalJson(left) === canonicalJson(right);
-}
 
 function observeAuthorization(binding: MigrationAuthorityBinding): DurableAuthorization {
   if (!OPERATION_ID.test(binding.operationId) || binding.consumer !== "codex:/root:state-v4-reviewed-bootstrap" ||
@@ -223,41 +165,6 @@ function parseAuthorization(bytes: Buffer): DurableAuthorization {
   return result.data as DurableAuthorization;
 }
 
-function parseCompletion(bytes: Buffer, binding: MigrationAuthorityBinding): DurableCompletion {
-  let parsed: unknown;
-  try { parsed = JSON.parse(bytes.toString("utf8")); }
-  catch (error) { throw new Error("durable migration completion record is malformed", { cause: error }); }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("durable migration completion record is not an object");
-  }
-  const completion = parsed as DurableCompletion;
-  const keys = Object.keys(completion).sort();
-  if (canonicalJson(keys) !== canonicalJson(["binding", "operationId", "receipt", "schemaVersion"].sort()) ||
-      !bytes.equals(Buffer.from(`${canonicalJson(completion)}\n`)) ||
-      completion.schemaVersion !== "reviewed-v4-migration-completion/v2" ||
-      completion.operationId !== binding.operationId || !exactBinding(completion.binding, binding) ||
-      completion.receipt === null || typeof completion.receipt !== "object" || Array.isArray(completion.receipt)) {
-    throw new Error("durable migration completion record is noncanonical or conflicts with its exact operation");
-  }
-  const receiptKeys = Object.keys(completion.receipt).sort();
-  if (canonicalJson(receiptKeys) !== canonicalJson([
-    "backupPath", "graphExecution", "guardPath", "importedProgressEvents", "lastProgressEventSha256",
-    "sourceCommitOid", "sourceTreeOid", "status",
-  ].sort()) ||
-      (completion.receipt.status !== "migrated" && completion.receipt.status !== "already_current") ||
-      completion.receipt.sourceCommitOid !== binding.sourceIdentity.commitOid ||
-      completion.receipt.sourceTreeOid !== binding.sourceIdentity.treeOid ||
-      completion.receipt.importedProgressEvents !== 3 ||
-      typeof completion.receipt.lastProgressEventSha256 !== "string" ||
-      completion.receipt.lastProgressEventSha256 !== binding.sourceIdentity.lastProgressEventSha256 ||
-      completion.receipt.graphExecution !== "disabled" ||
-      typeof completion.receipt.backupPath !== "string" || !isAbsolute(completion.receipt.backupPath) ||
-      typeof completion.receipt.guardPath !== "string" || !isAbsolute(completion.receipt.guardPath)) {
-    throw new Error("durable migration completion receipt does not match the reviewed v4 contract");
-  }
-  return completion;
-}
-
 export function createReviewedV4MigrationAuthority(input: { readonly stateRoot: string }): {
   readonly issuer: { issue(binding: MigrationAuthorityBinding): MigrationAuthorityCapability };
   readonly consumer: MigrationAuthorityConsumerPort;
@@ -308,8 +215,8 @@ export function createReviewedV4MigrationAuthority(input: { readonly stateRoot: 
       throw error;
     }
   };
-  const pathFor = (operationId: string, suffix: string): string =>
-    `migration-v4/authority/${operationId}.${suffix}.json`;
+  const pathFor = (operationId: string, suffix: "authorization" | "completion"): string =>
+    reviewedV4MigrationAuthorityArtifactPaths(operationId)[suffix];
 
   const issuer = Object.freeze({
     issue(binding: MigrationAuthorityBinding): MigrationAuthorityCapability {

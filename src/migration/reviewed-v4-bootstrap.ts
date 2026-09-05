@@ -37,6 +37,55 @@ export interface BoundDatabasePair {
   readonly history: CanonicalStateDatabaseIdentity;
 }
 
+export interface ReviewedV4BoundaryVerification {
+  readonly stateDatabase: string;
+  readonly phase: "migration_boundary" | "current_state";
+  readonly bytesSha256: string;
+}
+
+export interface ReviewedV4RecoveryVerification {
+  readonly backupPath: string;
+  readonly guardPath: string;
+  readonly descriptorSha256: string;
+  readonly legacyStateManifest: LegacyDatabaseObservation["manifest"];
+  assertCurrent(): void;
+}
+
+const authenticBoundaryVerifications = new WeakSet<object>();
+const authenticRecoveryVerifications = new WeakSet<object>();
+
+const freezeLegacyManifest = (
+  manifest: LegacyDatabaseObservation["manifest"],
+): LegacyDatabaseObservation["manifest"] => {
+  const copy = structuredClone(manifest);
+  for (const table of copy.tables) {
+    Object.freeze(table.columns);
+    Object.freeze(table);
+  }
+  Object.freeze(copy.tables);
+  return Object.freeze(copy);
+};
+
+export function assertAuthenticReviewedV4BoundaryVerification(
+  verification: ReviewedV4BoundaryVerification,
+): void {
+  if (!authenticBoundaryVerifications.has(verification as object)) {
+    throw new Error("reviewed v4 boundary verification capability is not authentic");
+  }
+  if (sha256(readFileSync(verification.stateDatabase)) !== verification.bytesSha256) {
+    throw new Error("reviewed v4 boundary bytes changed after verification");
+  }
+}
+
+export function assertAuthenticReviewedV4RecoveryVerification(
+  verification: ReviewedV4RecoveryVerification,
+): void {
+  if (!authenticRecoveryVerifications.has(verification as object)) {
+    throw new Error("reviewed v4 recovery verification capability is not authentic");
+  }
+  verification.assertCurrent();
+}
+
 const sha256 = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 
 export function bindDatabasePair(input: ReviewedV4BootstrapInput): BoundDatabasePair {
@@ -87,8 +136,9 @@ export function verifyRecoveryAuthority(input: {
   readonly receipt: Record<string, unknown>;
   readonly status: "migrated" | "already_current";
   readonly preState: LegacyDatabaseObservation;
+  readonly preHistory: LegacyDatabaseObservation;
   readonly phase: "migration_boundary" | "current_state";
-}): { readonly backupPath: string; readonly guardPath: string } {
+}): ReviewedV4RecoveryVerification {
   const descriptor = readActiveStateV4GuardDescriptor(input.pair.root);
   if (!descriptor) throw new Error("reviewed migration has no active recovery authority descriptor");
   const backupRoot = resolve(input.pair.root, "migration-v4/backups");
@@ -138,6 +188,11 @@ export function verifyRecoveryAuthority(input: {
   if (migrated.manifestSha256 !== descriptor.tableDigestManifestSha256) {
     throw new Error("migrated state no longer preserves the recovery manifest");
   }
+  const history = observeLegacyDatabase(input.pair.history.path, "history", input.preHistory.manifest);
+  if (history.bytesSha256 !== input.preHistory.bytesSha256 ||
+      history.manifestSha256 !== input.preHistory.manifestSha256) {
+    throw new Error("reviewed migration history changed before recovery verification");
+  }
   let records: ReturnType<StateV4RestoreGuard["readAndVerify"]>;
   try {
     records = new StateV4RestoreGuard({
@@ -158,13 +213,36 @@ export function verifyRecoveryAuthority(input: {
       records.some(({ event }) => event === "restore_consumed")) {
     throw new Error("reviewed migration recovery guard is not an active unconsumed generation");
   }
-  return { backupPath, guardPath };
+  const stateBytesSha256 = migrated.bytesSha256;
+  const historyBytesSha256 = history.bytesSha256;
+  const backupBytesSha256 = sha256(readFileSync(backupPath));
+  const manifestBytesSha256 = sha256(readFileSync(manifestPath));
+  const guardBytesSha256 = sha256(readFileSync(guardPath));
+  const verification: ReviewedV4RecoveryVerification = Object.freeze({
+    backupPath,
+    guardPath,
+    descriptorSha256: descriptor.descriptorSha256,
+    legacyStateManifest: freezeLegacyManifest(input.preState.manifest),
+    assertCurrent() {
+      const active = readActiveStateV4GuardDescriptor(input.pair.root);
+      if (!active || active.descriptorSha256 !== descriptor.descriptorSha256 ||
+          sha256(readFileSync(input.pair.state.path)) !== stateBytesSha256 ||
+          sha256(readFileSync(input.pair.history.path)) !== historyBytesSha256 ||
+          sha256(readFileSync(backupPath)) !== backupBytesSha256 ||
+          sha256(readFileSync(manifestPath)) !== manifestBytesSha256 ||
+          sha256(readFileSync(guardPath)) !== guardBytesSha256) {
+        throw new Error("reviewed v4 recovery verification capability is no longer current");
+      }
+    },
+  });
+  authenticRecoveryVerifications.add(verification);
+  return verification;
 }
 
 const verifyMigratedDatabase = (
   stateDatabase: string,
   phase: "migration_boundary" | "current_state",
-): void => {
+): ReviewedV4BoundaryVerification => {
   const db = new Database(stateDatabase, { readonly: true, fileMustExist: true });
   try {
     db.pragma("query_only = ON");
@@ -184,23 +262,35 @@ const verifyMigratedDatabase = (
         ? "reviewed migrator did not import exactly progress events 1..3"
         : "reviewed v4 state does not preserve the imported progress prefix");
     }
-    const inactiveTables = phase === "migration_boundary"
-      ? ["graph_flows", "runs", "collaboration_dispatch_outbox"] as const
-      : ["graph_flows", "collaboration_dispatch_outbox"] as const;
-    for (const table of inactiveTables) {
-      if (Number(db.prepare(`SELECT COUNT(*) FROM ${table}`).pluck().get()) !== 0) {
-        throw new Error(`reviewed migrator unexpectedly activated ${table}`);
-      }
+    if (Number(db.prepare("SELECT COUNT(*) FROM graph_flows").pluck().get()) !== 0) {
+      throw new Error("reviewed migrator unexpectedly activated graph_flows");
+    }
+    const executableLegacyRuns = Number(db.prepare(`SELECT COUNT(*) FROM runs
+      WHERE status IN ('queued','claimed') OR lease_token IS NOT NULL OR worker_id IS NOT NULL`).pluck().get());
+    if (executableLegacyRuns !== 0) {
+      throw new Error("reviewed migrator left executable or owned legacy runs");
+    }
+    const unpublishedLegacyDispatches = Number(db.prepare(`SELECT COUNT(*)
+      FROM collaboration_dispatch_outbox WHERE published_at IS NULL`).pluck().get());
+    if (unpublishedLegacyDispatches !== 0) {
+      throw new Error("reviewed migrator left unpublished legacy dispatches");
     }
   } finally {
     db.close();
   }
+  const verification = Object.freeze({
+    stateDatabase,
+    phase,
+    bytesSha256: sha256(readFileSync(stateDatabase)),
+  });
+  authenticBoundaryVerifications.add(verification);
+  return verification;
 };
 
-export const verifyMigratedDatabaseAtBoundary = (stateDatabase: string): void =>
+export const verifyMigratedDatabaseAtBoundary = (stateDatabase: string): ReviewedV4BoundaryVerification =>
   verifyMigratedDatabase(stateDatabase, "migration_boundary");
 
-export const verifyCurrentReviewedV4Database = (stateDatabase: string): void =>
+export const verifyCurrentReviewedV4Database = (stateDatabase: string): ReviewedV4BoundaryVerification =>
   verifyMigratedDatabase(stateDatabase, "current_state");
 
 export function createReviewedV4Bootstrap(): never {
